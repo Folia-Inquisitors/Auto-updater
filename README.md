@@ -1,38 +1,20 @@
 # Auto-Updater
-This is a highly configurable, simple plugin meant to be an auto updater. 
+The other auto updaters were too confusing for me. This is meant to be a simple, auto updater that auto updates the server jar, and the plugin used.
 
 ## Directions
 
- Set the host/panel startup jar to: auto-updater.jar
+Use "auto-updater.jar" as the startup jar
 
 This is meant to be a simple standalone launcher jar for Minecraft servers. It runs first, updates configured jars, backs up anything it replaces, and then starts the real server jar.
 
-# Official Discord 
-
-https://discord.gg/aT9z7q7hX8
-
-## Building instructions
-
-On Windows:
-
-```powershell
-.\gradlew.bat build
-```
-
-On Linux/macOS:
-
-```bash
-./gradlew build
-```
-
-The jar is written to Gradle's build output and also copied to `dist/`:
-
+## First Run
+Server Root Shape
 ```text
-build/libs/auto-updater.jar
-dist/auto-updater.jar
+auto-updater.jar
+updater.yml
+folia.jar
+plugins/
 ```
-
-The older `build.ps1` script is still available as a simple fallback build on Windows.
 
 ## What It Supports
 
@@ -54,18 +36,18 @@ The older `build.ps1` script is still available as a simple fallback build on Wi
 
 ```
 
+
 ```
 
+
+## Building instructions
+
+./gradlew build
+
+# Official Discord 
+
+https://discord.gg/aT9z7q7hX8
 
 ### Folia inquisitors
 
 [<img src="https://github.com/Folia-Inquisitors.png" width=80 alt="Folia-Inquisitors">](https://github.com/orgs/Folia-Inquisitors/repositories)
-
-## First Run
-Server Root Shape
-```text
-auto-updater.jar
-updater.yml
-folia.jar
-plugins/
-```
