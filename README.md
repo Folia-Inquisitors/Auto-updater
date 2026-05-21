@@ -31,6 +31,7 @@ plugins/
 - Explicit fallback sources.
 - Fallback on prevous working version if fails to load.
 - Discovery policy reporting with trusted GitHub org/repo settings.
+- Saves discovered plugin sources back into `updater.yml`.
 
 ## Default Config
 
@@ -50,7 +51,8 @@ discovery:
   sourcePriority: github-release, hangar, modrinth, spigot
   checkAlternateSourcesWhenOutdated: true
   outdatedThresholdDays: 14
-  autoSwitchSource: false
+  autoSwitchSource: true
+  saveDiscoveredSources: true
   scanInstalledPlugins: true
 
 buildFromSource:

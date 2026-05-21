@@ -82,6 +82,7 @@ public final class VelocityAutoUpdater {
         }
 
         AppConfig config = ConfigParser.parse(configPath);
+        config.configPath = configPath;
         config.baseDir = configPath.getParent() == null ? Paths.get(".").toAbsolutePath().normalize() : configPath.getParent();
         config.validate();
 
@@ -171,6 +172,7 @@ public final class VelocityAutoUpdater {
 
     private static final class AppConfig {
         Path baseDir = Paths.get(".").toAbsolutePath().normalize();
+        Path configPath;
         String mode = "hosted-safe";
         String onFailure = "keep-current";
         String userAgent = APP_NAME + "/" + VERSION + " (contact: your-email@example.com)";
@@ -322,6 +324,7 @@ public final class VelocityAutoUpdater {
         boolean checkAlternateSourcesWhenOutdated = true;
         int outdatedThresholdDays = 14;
         boolean autoSwitchSource = true;
+        boolean saveDiscoveredSources = true;
         boolean scanInstalledPlugins = true;
     }
 
@@ -357,6 +360,7 @@ public final class VelocityAutoUpdater {
         String detectedPluginId;
         String detectedVersion;
         String detectedWebsite;
+        boolean sourceDiscoveredThisRun;
 
         TargetConfig(String name, boolean server) {
             this.name = name;
@@ -393,6 +397,7 @@ public final class VelocityAutoUpdater {
             copy.detectedPluginId = detectedPluginId;
             copy.detectedVersion = detectedVersion;
             copy.detectedWebsite = detectedWebsite;
+            copy.sourceDiscoveredThisRun = sourceDiscoveredThisRun;
             return copy;
         }
     }
@@ -617,6 +622,10 @@ public final class VelocityAutoUpdater {
                 case "auto_switch_source":
                     discovery.autoSwitchSource = parseBoolean(kv.value);
                     break;
+                case "savediscoveredsources":
+                case "save_discovered_sources":
+                    discovery.saveDiscoveredSources = parseBoolean(kv.value);
+                    break;
                 case "scaninstalledplugins":
                 case "scan_installed_plugins":
                     discovery.scanInstalledPlugins = parseBoolean(kv.value);
@@ -748,6 +757,277 @@ public final class VelocityAutoUpdater {
         }
     }
 
+    private static final class ConfigRewriter {
+        static void saveDiscoveredPluginSources(AppConfig config, List<TargetConfig> targets) throws IOException {
+            if (config.configPath == null) {
+                Log.warn("Config path is unknown; discovered sources were not saved.");
+                return;
+            }
+            List<String> lines = Files.exists(config.configPath)
+                ? Files.readAllLines(config.configPath, StandardCharsets.UTF_8)
+                : new ArrayList<>();
+            boolean changed = false;
+            int saved = 0;
+            for (TargetConfig target : targets) {
+                PluginBlock block = findPluginBlock(lines, target);
+                if (block == null) {
+                    appendPluginBlock(lines, target);
+                    changed = true;
+                    saved++;
+                } else if (updatePluginBlock(lines, block, target)) {
+                    changed = true;
+                    saved++;
+                }
+            }
+            if (!changed) {
+                return;
+            }
+
+            String newline = detectNewline(config.configPath);
+            String text = String.join(newline, lines) + newline;
+            Path temp = config.configPath.resolveSibling(config.configPath.getFileName() + ".tmp");
+            Files.writeString(temp, text, StandardCharsets.UTF_8);
+            try {
+                Files.move(temp, config.configPath, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            } catch (AtomicMoveNotSupportedException ex) {
+                Files.move(temp, config.configPath, StandardCopyOption.REPLACE_EXISTING);
+            }
+            Log.info("Saved discovered source" + (saved == 1 ? "" : "s") + " to " + config.configPath.getFileName() + ".");
+        }
+
+        private static String detectNewline(Path path) {
+            try {
+                String text = Files.readString(path, StandardCharsets.UTF_8);
+                int lf = text.indexOf('\n');
+                if (lf > 0 && text.charAt(lf - 1) == '\r') {
+                    return "\r\n";
+                }
+            } catch (IOException ignored) {
+                // Fall back to the platform newline.
+            }
+            return System.lineSeparator();
+        }
+
+        private static PluginBlock findPluginBlock(List<String> lines, TargetConfig target) {
+            int pluginsStart = findTopLevelSection(lines, "plugins");
+            if (pluginsStart < 0) {
+                return null;
+            }
+            int pluginsEnd = findNextTopLevel(lines, pluginsStart + 1);
+            for (int i = pluginsStart + 1; i < pluginsEnd; i++) {
+                String noComment = ConfigParser.stripComment(lines.get(i));
+                if (noComment.trim().isEmpty()) {
+                    continue;
+                }
+                int indent = ConfigParser.countIndent(noComment);
+                String line = noComment.trim();
+                if (!line.startsWith("- ")) {
+                    continue;
+                }
+                int end = i + 1;
+                while (end < pluginsEnd) {
+                    String candidateNoComment = ConfigParser.stripComment(lines.get(end));
+                    String candidateTrimmed = candidateNoComment.trim();
+                    if (!candidateTrimmed.isEmpty()) {
+                        int candidateIndent = ConfigParser.countIndent(candidateNoComment);
+                        if (candidateIndent <= indent && candidateTrimmed.startsWith("- ")) {
+                            break;
+                        }
+                    }
+                    end++;
+                }
+                PluginBlock block = new PluginBlock(i, end, indent, Math.max(indent + 2, 4));
+                Map<String, String> fields = parsePluginFields(lines, block);
+                if (matchesPluginBlock(fields, target)) {
+                    return block;
+                }
+                i = end - 1;
+            }
+            return null;
+        }
+
+        private static int findTopLevelSection(List<String> lines, String section) {
+            for (int i = 0; i < lines.size(); i++) {
+                String noComment = ConfigParser.stripComment(lines.get(i));
+                if (noComment.trim().isEmpty() || ConfigParser.countIndent(noComment) != 0) {
+                    continue;
+                }
+                try {
+                    KeyValue kv = ConfigParser.keyValue(noComment.trim(), 0);
+                    if (kv.value.isEmpty() && lower(kv.key).equals(section)) {
+                        return i;
+                    }
+                } catch (IllegalArgumentException ignored) {
+                    // Ignore lines that are not simple key/value entries.
+                }
+            }
+            return -1;
+        }
+
+        private static int findNextTopLevel(List<String> lines, int start) {
+            for (int i = start; i < lines.size(); i++) {
+                String noComment = ConfigParser.stripComment(lines.get(i));
+                if (!noComment.trim().isEmpty() && ConfigParser.countIndent(noComment) == 0) {
+                    return i;
+                }
+            }
+            return lines.size();
+        }
+
+        private static Map<String, String> parsePluginFields(List<String> lines, PluginBlock block) {
+            Map<String, String> fields = new HashMap<>();
+            for (int i = block.start; i < block.end; i++) {
+                String line = ConfigParser.stripComment(lines.get(i)).trim();
+                if (line.isEmpty()) {
+                    continue;
+                }
+                if (i == block.start && line.startsWith("- ")) {
+                    line = line.substring(2).trim();
+                    if (line.isEmpty()) {
+                        continue;
+                    }
+                } else if (line.startsWith("- ")) {
+                    continue;
+                }
+                try {
+                    KeyValue kv = ConfigParser.keyValue(line, 0);
+                    fields.put(normalizedKey(kv.key), kv.value);
+                } catch (IllegalArgumentException ignored) {
+                    // Ignore nested or unsupported YAML syntax.
+                }
+            }
+            return fields;
+        }
+
+        private static boolean matchesPluginBlock(Map<String, String> fields, TargetConfig target) {
+            String installAs = fields.get("installas");
+            if (installAs != null && target.installAs != null
+                && normalizedConfigPath(installAs).equals(normalizedConfigPath(target.installAs))) {
+                return true;
+            }
+            String name = fields.get("name");
+            return name != null && target.name != null && lower(name).equals(lower(target.name));
+        }
+
+        private static boolean updatePluginBlock(List<String> lines, PluginBlock block, TargetConfig target) {
+            boolean changed = false;
+            changed |= upsertPluginKey(lines, block, "source", target.source);
+            changed |= upsertPluginKey(lines, block, "type", "auto");
+            if (target.githubRepo != null && !target.githubRepo.isBlank()) {
+                changed |= upsertPluginKey(lines, block, "githubRepo", target.githubRepo);
+            }
+            if (target.platform != null && !target.platform.isBlank()) {
+                changed |= upsertPluginKey(lines, block, "platform", target.platform);
+            }
+            if (!target.fallbackSources.isEmpty()) {
+                changed |= upsertPluginKey(lines, block, "fallbackSources", String.join(", ", target.fallbackSources));
+            }
+            if (target.installAs != null && !target.installAs.isBlank()) {
+                changed |= upsertPluginKey(lines, block, "installAs", target.installAs);
+            }
+            changed |= upsertPluginKey(lines, block, "required", Boolean.toString(target.required));
+            return changed;
+        }
+
+        private static boolean upsertPluginKey(List<String> lines, PluginBlock block, String key, String value) {
+            String normalized = normalizedKey(key);
+            String rendered = spaces(block.propertyIndent) + key + ": " + quoteYaml(value);
+            for (int i = block.start; i < block.end; i++) {
+                String noComment = ConfigParser.stripComment(lines.get(i));
+                String line = noComment.trim();
+                boolean firstInlineKey = false;
+                if (i == block.start && line.startsWith("- ")) {
+                    firstInlineKey = true;
+                    line = line.substring(2).trim();
+                    if (line.isEmpty()) {
+                        continue;
+                    }
+                } else if (line.startsWith("- ")) {
+                    continue;
+                }
+                try {
+                    KeyValue kv = ConfigParser.keyValue(line, 0);
+                    if (normalizedKey(kv.key).equals(normalized)) {
+                        String replacement = firstInlineKey
+                            ? spaces(block.itemIndent) + "- " + key + ": " + quoteYaml(value)
+                            : rendered;
+                        if (lines.get(i).equals(replacement)) {
+                            return false;
+                        }
+                        lines.set(i, replacement);
+                        return true;
+                    }
+                } catch (IllegalArgumentException ignored) {
+                    // Keep looking.
+                }
+            }
+            lines.add(block.end, rendered);
+            block.end++;
+            return true;
+        }
+
+        private static void appendPluginBlock(List<String> lines, TargetConfig target) {
+            int pluginsStart = findTopLevelSection(lines, "plugins");
+            if (pluginsStart < 0) {
+                if (!lines.isEmpty() && !lines.get(lines.size() - 1).isBlank()) {
+                    lines.add("");
+                }
+                lines.add("plugins:");
+                pluginsStart = lines.size() - 1;
+            }
+            int insertAt = findNextTopLevel(lines, pluginsStart + 1);
+            List<String> entry = pluginEntryLines(target);
+            if (insertAt > 0 && !lines.get(insertAt - 1).isBlank()) {
+                entry.add(0, "");
+            }
+            if (insertAt < lines.size() && !entry.get(entry.size() - 1).isBlank()) {
+                entry.add("");
+            }
+            lines.addAll(insertAt, entry);
+        }
+
+        private static List<String> pluginEntryLines(TargetConfig target) {
+            List<String> entry = new ArrayList<>();
+            entry.add("  - name: " + quoteYaml(target.displayName()));
+            entry.add("    source: " + quoteYaml(target.source));
+            entry.add("    type: auto");
+            if (target.githubRepo != null && !target.githubRepo.isBlank()) {
+                entry.add("    githubRepo: " + quoteYaml(target.githubRepo));
+            }
+            if (target.platform != null && !target.platform.isBlank()) {
+                entry.add("    platform: " + quoteYaml(target.platform));
+            }
+            if (!target.fallbackSources.isEmpty()) {
+                entry.add("    fallbackSources: " + quoteYaml(String.join(", ", target.fallbackSources)));
+            }
+            entry.add("    installAs: " + quoteYaml(target.installAs));
+            entry.add("    required: " + target.required);
+            return entry;
+        }
+
+        private static String normalizedKey(String key) {
+            return lower(key).replace("_", "");
+        }
+
+        private static String spaces(int count) {
+            return " ".repeat(Math.max(0, count));
+        }
+
+        private static final class PluginBlock {
+            final int start;
+            int end;
+            final int itemIndent;
+            final int propertyIndent;
+
+            PluginBlock(int start, int end, int itemIndent, int propertyIndent) {
+                this.start = start;
+                this.end = end;
+                this.itemIndent = itemIndent;
+                this.propertyIndent = propertyIndent;
+            }
+        }
+    }
+
     private static final class KeyValue {
         final String key;
         final String value;
@@ -870,6 +1150,7 @@ public final class VelocityAutoUpdater {
             Log.info("Check alternate sources when outdated: " + config.discovery.checkAlternateSourcesWhenOutdated
                 + " after " + config.discovery.outdatedThresholdDays + " days");
             Log.info("Auto-switch source: " + config.discovery.autoSwitchSource);
+            Log.info("Save discovered sources: " + config.discovery.saveDiscoveredSources);
             Log.info("Scan installed plugins: " + config.discovery.scanInstalledPlugins);
             Log.info("Build from source: " + (config.buildFromSource.enabled ? "enabled" : "disabled")
                 + ", onlyTrusted=" + config.buildFromSource.onlyTrusted
@@ -910,6 +1191,16 @@ public final class VelocityAutoUpdater {
                             + " (score " + candidate.score + ", latest=" + firstNonBlank(candidate.latestVersion, "unknown") + ")");
                     }
                 }
+                boolean autoSwitched = false;
+                if (config.discovery.autoSwitchSource) {
+                    if (best != null && needsDiscoveredSource(target)) {
+                        Log.info("autoSwitchSource will use " + best.source + " for " + target.displayName() + ".");
+                        applyDiscoveredSource(target, discovered);
+                        autoSwitched = true;
+                    } else {
+                        Log.info("autoSwitchSource is enabled.");
+                    }
+                }
                 if (target.autoDiscovered || target.source == null || target.source.isBlank() || isAutoValue(target.source)) {
                     Log.info("Suggested config entry:");
                     Log.info("  - name: " + target.displayName());
@@ -940,14 +1231,11 @@ public final class VelocityAutoUpdater {
                         Log.info("Fallback source: " + plan.type + " -> " + plan.description);
                     }
                 }
-                if (config.discovery.autoSwitchSource) {
-                    if (best != null && needsDiscoveredSource(target)) {
-                        Log.info("autoSwitchSource would use " + best.source + " for " + target.displayName() + ".");
-                    } else {
-                        Log.info("autoSwitchSource is enabled.");
-                    }
+                if (autoSwitched && config.discovery.saveDiscoveredSources) {
+                    Log.info("saveDiscoveredSources will write this source back to the config.");
                 }
             }
+            saveDiscoveredSourcesIfRequested();
         }
 
         private void autoSwitchMissingPluginSources() {
@@ -966,6 +1254,7 @@ public final class VelocityAutoUpdater {
                 }
                 applyDiscoveredSource(target, discovered);
             }
+            saveDiscoveredSourcesIfRequested();
         }
 
         private boolean needsDiscoveredSource(TargetConfig target) {
@@ -979,6 +1268,7 @@ public final class VelocityAutoUpdater {
             if (best.type.equals("github-release") && !best.projectHint.isBlank()) {
                 target.githubRepo = best.projectHint;
             }
+            target.sourceDiscoveredThisRun = true;
 
             Set<String> fallbackSet = new HashSet<>(target.fallbackSources);
             for (DiscoveryCandidate candidate : discovered) {
@@ -994,6 +1284,26 @@ public final class VelocityAutoUpdater {
             }
             Log.info("Auto-switched " + target.displayName() + " source -> " + best.source
                 + (target.fallbackSources.isEmpty() ? "" : " with " + target.fallbackSources.size() + " fallback(s)"));
+        }
+
+        private void saveDiscoveredSourcesIfRequested() {
+            if (!config.discovery.saveDiscoveredSources) {
+                return;
+            }
+            List<TargetConfig> changed = new ArrayList<>();
+            for (TargetConfig target : config.plugins) {
+                if (target.sourceDiscoveredThisRun && target.source != null && !target.source.isBlank()) {
+                    changed.add(target);
+                }
+            }
+            if (changed.isEmpty()) {
+                return;
+            }
+            try {
+                ConfigRewriter.saveDiscoveredPluginSources(config, changed);
+            } catch (IOException ex) {
+                Log.warn("Could not save discovered sources to config: " + ex.getMessage());
+            }
         }
 
         private List<DiscoveryCandidate> discoverSourceCandidates(TargetConfig target) {
@@ -3580,6 +3890,7 @@ public final class VelocityAutoUpdater {
               checkAlternateSourcesWhenOutdated: true
               outdatedThresholdDays: 14
               autoSwitchSource: true
+              saveDiscoveredSources: true
               scanInstalledPlugins: true
 
             buildFromSource:
@@ -3697,6 +4008,8 @@ public final class VelocityAutoUpdater {
             # discovery.mode
             #   suggest:
             #     Report suggestions without rewriting your config.
+            #     If saveDiscoveredSources is true, confident missing plugin sources can
+            #     still be written back.
             #
             # discovery.sourcePriority
             #   Preferred order when choosing good discovered plugin sources.
@@ -3713,6 +4026,11 @@ public final class VelocityAutoUpdater {
             #   If true, plugins with no source can use the best discovered hosted source
             #   automatically for that run, with other strong matches added as fallbacks.
             #   Existing explicit sources are left alone.
+            #
+            # discovery.saveDiscoveredSources
+            #   If true, auto-switched plugin sources are written back into this config.
+            #   Existing plugin entries are patched by installAs/name. Newly scanned plugins
+            #   are appended under plugins: with the discovered source and fallbacks.
             #
             # discovery.scanInstalledPlugins
             #   If true, scans plugins/ for jars that are not already listed.

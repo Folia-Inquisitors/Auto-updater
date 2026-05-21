@@ -14,6 +14,7 @@ discovery:
   checkAlternateSourcesWhenOutdated: true
   outdatedThresholdDays: 14
   autoSwitchSource: true
+  saveDiscoveredSources: true
   scanInstalledPlugins: true
 
 buildFromSource:
@@ -131,6 +132,8 @@ restart:
 # discovery.mode
 #   suggest:
 #     Report suggestions without rewriting your config.
+#     If saveDiscoveredSources is true, confident missing plugin sources can
+#     still be written back.
 #
 # discovery.sourcePriority
 #   Preferred order when choosing good discovered plugin sources.
@@ -147,6 +150,11 @@ restart:
 #   If true, plugins with no source can use the best discovered hosted source
 #   automatically for that run, with other strong matches added as fallbacks.
 #   Existing explicit sources are left alone.
+#
+# discovery.saveDiscoveredSources
+#   If true, auto-switched plugin sources are written back into this config.
+#   Existing plugin entries are patched by installAs/name. Newly scanned plugins
+#   are appended under plugins: with the discovered source and fallbacks.
 #
 # discovery.scanInstalledPlugins
 #   If true, scans plugins/ for jars that are not already listed.
