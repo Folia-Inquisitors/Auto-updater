@@ -2,11 +2,10 @@
 This is a highly configurable, simple plugin meant to be an auto updater. 
 
 ## Directions
-```text
+
  Set the host/panel startup jar to: auto-updater.jar
 
 This is meant to be a simple standalone launcher jar for Minecraft servers. It runs first, updates configured jars, backs up anything it replaces, and then starts the real server jar.
-```
 
 # Official Discord 
 
