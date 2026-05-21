@@ -45,7 +45,7 @@ $manifestPath = Join-Path $BuildDir "MANIFEST.MF"
 $manifest = @(
     "Manifest-Version: 1.0"
     "Main-Class: dev.velocityupdater.VelocityAutoUpdater"
-    "Implementation-Version: 0.1.0"
+    "Implementation-Version: 0.2.0"
     ""
 ) -join "`r`n"
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)

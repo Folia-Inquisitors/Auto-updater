@@ -14,6 +14,7 @@ Then it updates configured jars, backs up anything it replaces, and starts the r
 
 - Hosted-safe updates by default.
 - Auto-detects PaperMC, GeyserMC, and direct jar URLs.
+- Auto-detects Modrinth project pages and installs the latest primary jar.
 - Replaces jars while keeping the same configured filename.
 - Backs up old jars into `backups/`.
 - Downloads into `cache/staging/` first.

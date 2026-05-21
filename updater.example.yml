@@ -58,6 +58,9 @@
 #     Floodgate for Velocity:
 #       https://download.geysermc.org/v2/projects/floodgate/versions/latest/builds/latest/downloads/velocity
 #
+#     Modrinth project page:
+#       https://modrinth.com/plugin/fancyholograms/versions
+#
 #     Direct jar URL:
 #       https://example.com/MyPlugin.jar
 #
@@ -69,6 +72,9 @@
 #       Recommended.
 #       The updater guesses the correct type from the source URL.
 #
+#     modrinth
+#       Force the updater to treat the source as a Modrinth project.
+#
 #     papermc
 #       Force the updater to treat the source as a PaperMC download.
 #
@@ -77,6 +83,30 @@
 #
 #     direct
 #       Treat the source as a direct jar download URL or local jar file.
+#
+# loader
+#   Optional Modrinth filter.
+#   Use this when you only want versions for a specific server/plugin loader.
+#
+#   Examples:
+#     loader: paper
+#     loader: velocity
+#
+# gameVersion
+#   Optional Modrinth filter.
+#   Use this when you only want versions for a specific Minecraft version.
+#
+#   Example:
+#     gameVersion: "1.21.8"
+#
+# versionType
+#   Optional Modrinth release-type filter.
+#   If omitted, the updater prefers release builds, then beta, then alpha.
+#
+#   Options:
+#     release
+#     beta
+#     alpha
 #
 # installAs
 #   The exact file path and filename the downloaded jar will become.
@@ -148,7 +178,7 @@
 mode: hosted-safe
 onFailure: keep-current
 # PaperMC asks automated clients to use a real User-Agent with contact info.
-userAgent: "velocity-auto-updater/0.1.0 (contact: your-email@example.com)"
+userAgent: "velocity-auto-updater/0.2.0 (contact: your-email@example.com)"
 
 server:
   name: Velocity
@@ -171,6 +201,16 @@ plugins:
   #   source: https://download.geysermc.org/v2/projects/floodgate/versions/latest/builds/latest/downloads/velocity
   #   type: auto
   #   installAs: plugins/Floodgate-Velocity.jar
+  #   required: false
+
+  # Optional Modrinth example.
+  # FancyHolograms is normally a backend server plugin, not a Velocity proxy plugin.
+  # Install it into the plugins folder for the backend server that should run it.
+  # - name: FancyHolograms
+  #   source: https://modrinth.com/plugin/fancyholograms/versions
+  #   type: auto
+  #   loader: paper
+  #   installAs: plugins/FancyHolograms.jar
   #   required: false
 
 restart:

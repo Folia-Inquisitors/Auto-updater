@@ -7,6 +7,7 @@ import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.io.PrintWriter;
 import java.net.URI;
+import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
@@ -38,7 +39,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.jar.JarFile;
 
 public final class VelocityAutoUpdater {
-    private static final String VERSION = "0.1.0";
+    private static final String VERSION = "0.2.0";
     private static final String DEFAULT_CONFIG = "updater.yml";
     private static final DateTimeFormatter BACKUP_TIME = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss");
 
@@ -215,6 +216,9 @@ public final class VelocityAutoUpdater {
         String type = "auto";
         String project;
         String platform;
+        String loader;
+        String gameVersion;
+        String versionType;
         String channel;
         String installAs;
         String java = "java";
@@ -374,6 +378,17 @@ public final class VelocityAutoUpdater {
                     break;
                 case "platform":
                     target.platform = kv.value;
+                    break;
+                case "loader":
+                    target.loader = kv.value;
+                    break;
+                case "gameversion":
+                case "game_version":
+                    target.gameVersion = kv.value;
+                    break;
+                case "versiontype":
+                case "version_type":
+                    target.versionType = kv.value;
                     break;
                 case "channel":
                     target.channel = kv.value;
@@ -616,6 +631,8 @@ public final class VelocityAutoUpdater {
                     return new SourcePlan(type, source.isBlank() ? "PaperMC downloads API" : source, new PaperMcResolver(config, client));
                 case "geysermc":
                     return new SourcePlan(type, source.isBlank() ? "GeyserMC downloads API" : source, new GeyserMcResolver(config));
+                case "modrinth":
+                    return new SourcePlan(type, source.isBlank() ? "Modrinth API" : source, new ModrinthResolver(config, client));
                 case "direct":
                     return new SourcePlan(type, source, new DirectResolver(config));
                 default:
@@ -631,6 +648,9 @@ public final class VelocityAutoUpdater {
             }
             if (lowerSource.contains("geysermc.org/download") && !lowerSource.contains("download.geysermc.org")) {
                 return "geysermc";
+            }
+            if (lowerSource.contains("modrinth.com/") || lowerSource.contains("api.modrinth.com/")) {
+                return "modrinth";
             }
             if (lowerSource.contains("github.com/")
                 && (lowerSource.contains("/releases/download/") || lowerSource.endsWith(".jar"))) {
@@ -783,6 +803,177 @@ public final class VelocityAutoUpdater {
                 return "standalone";
             }
             return "velocity";
+        }
+    }
+
+    private static final class ModrinthResolver implements DownloadResolver {
+        private final AppConfig config;
+        private final HttpClient client;
+
+        ModrinthResolver(AppConfig config, HttpClient client) {
+            this.config = config;
+            this.client = client;
+        }
+
+        @Override
+        public ResolvedDownload resolve(TargetConfig target) throws Exception {
+            String project = firstNonBlank(target.project, inferProject(target), "");
+            if (project.isBlank()) {
+                throw new IllegalArgumentException("Could not infer Modrinth project slug for " + target.displayName());
+            }
+
+            List<Map<String, Object>> versions = loadVersions(project, target);
+            if (versions.isEmpty()) {
+                throw new IOException("Modrinth returned no versions for project " + project + filterDescription(target));
+            }
+
+            Optional<ResolvedDownload> release = findDownload(project, versions, "release");
+            if (target.versionType != null && !target.versionType.isBlank()) {
+                release = findDownload(project, versions, lower(target.versionType));
+            }
+            if (release.isPresent()) {
+                return release.get();
+            }
+
+            Optional<ResolvedDownload> beta = findDownload(project, versions, "beta");
+            if (beta.isPresent()) {
+                return beta.get();
+            }
+
+            Optional<ResolvedDownload> alpha = findDownload(project, versions, "alpha");
+            if (alpha.isPresent()) {
+                return alpha.get();
+            }
+
+            Optional<ResolvedDownload> any = findDownload(project, versions, "");
+            if (any.isPresent()) {
+                return any.get();
+            }
+            throw new IOException("No downloadable jar file found on Modrinth for project " + project + filterDescription(target));
+        }
+
+        private List<Map<String, Object>> loadVersions(String project, TargetConfig target) throws Exception {
+            StringBuilder url = new StringBuilder("https://api.modrinth.com/v3/project/")
+                .append(urlEncode(project))
+                .append("/version?include_changelog=false");
+            if (target.loader != null && !target.loader.isBlank()) {
+                url.append("&loaders=").append(urlEncode(jsonArray(target.loader)));
+            }
+            if (target.gameVersion != null && !target.gameVersion.isBlank()) {
+                url.append("&game_versions=").append(urlEncode(jsonArray(target.gameVersion)));
+            }
+
+            HttpRequest request = HttpRequest.newBuilder(URI.create(url.toString()))
+                .timeout(Duration.ofSeconds(45))
+                .header("User-Agent", config.userAgent)
+                .GET()
+                .build();
+            HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            int status = response.statusCode();
+            if (status < 200 || status >= 300) {
+                throw new IOException("Modrinth API failed with HTTP " + status + " for project " + project);
+            }
+
+            Object json = new JsonParser(response.body()).parse();
+            if (!(json instanceof List<?> list)) {
+                throw new IOException("Modrinth API returned an unexpected response for project " + project);
+            }
+
+            List<Map<String, Object>> versions = new ArrayList<>();
+            for (Object item : list) {
+                Map<String, Object> version = asMap(item);
+                if (!"listed".equalsIgnoreCase(stringValue(version.get("status")))) {
+                    continue;
+                }
+                versions.add(version);
+            }
+            versions.sort((a, b) -> stringValue(b.get("date_published")).compareTo(stringValue(a.get("date_published"))));
+            return versions;
+        }
+
+        private Optional<ResolvedDownload> findDownload(String project, List<Map<String, Object>> versions, String versionType) {
+            for (Map<String, Object> version : versions) {
+                if (!versionType.isBlank() && !versionType.equalsIgnoreCase(stringValue(version.get("version_type")))) {
+                    continue;
+                }
+                Optional<Map<String, Object>> file = findFile(version);
+                if (file.isEmpty()) {
+                    continue;
+                }
+                String url = stringValue(file.get().get("url"));
+                if (url.isBlank()) {
+                    continue;
+                }
+                String versionNumber = stringValue(version.get("version_number"));
+                String filename = stringValue(file.get().get("filename"));
+                return Optional.of(new ResolvedDownload(URI.create(url), "Modrinth " + project + " " + versionNumber + " " + filename));
+            }
+            return Optional.empty();
+        }
+
+        private Optional<Map<String, Object>> findFile(Map<String, Object> version) {
+            Object filesObj = version.get("files");
+            if (!(filesObj instanceof List<?> files) || files.isEmpty()) {
+                return Optional.empty();
+            }
+
+            List<Map<String, Object>> jars = new ArrayList<>();
+            for (Object item : files) {
+                Map<String, Object> file = asMap(item);
+                String filename = lower(stringValue(file.get("filename")));
+                String fileType = lower(stringValue(file.get("file_type")));
+                if (!filename.endsWith(".jar")) {
+                    continue;
+                }
+                if (fileType.equals("sources-jar") || fileType.equals("dev-jar") || fileType.equals("javadoc-jar")) {
+                    continue;
+                }
+                jars.add(file);
+            }
+
+            for (Map<String, Object> jar : jars) {
+                if (Boolean.TRUE.equals(jar.get("primary"))) {
+                    return Optional.of(jar);
+                }
+            }
+            return jars.isEmpty() ? Optional.empty() : Optional.of(jars.get(0));
+        }
+
+        private String inferProject(TargetConfig target) {
+            String source = firstNonBlank(target.source, target.name, "");
+            if (source.contains("modrinth.com/")) {
+                URI uri = URI.create(source);
+                String[] parts = uri.getPath().split("/");
+                for (int i = 0; i < parts.length - 1; i++) {
+                    if (parts[i].equals("plugin") || parts[i].equals("mod") || parts[i].equals("datapack")) {
+                        return parts[i + 1];
+                    }
+                    if (parts[i].equals("project")) {
+                        return parts[i + 1];
+                    }
+                }
+            }
+            if (source.contains("api.modrinth.com/")) {
+                URI uri = URI.create(source);
+                String[] parts = uri.getPath().split("/");
+                for (int i = 0; i < parts.length - 1; i++) {
+                    if (parts[i].equals("project")) {
+                        return parts[i + 1];
+                    }
+                }
+            }
+            return source;
+        }
+
+        private String filterDescription(TargetConfig target) {
+            List<String> filters = new ArrayList<>();
+            if (target.loader != null && !target.loader.isBlank()) {
+                filters.add("loader=" + target.loader);
+            }
+            if (target.gameVersion != null && !target.gameVersion.isBlank()) {
+                filters.add("gameVersion=" + target.gameVersion);
+            }
+            return filters.isEmpty() ? "" : " (" + String.join(", ", filters) + ")";
         }
     }
 
@@ -1409,6 +1600,21 @@ public final class VelocityAutoUpdater {
         return config.resolve(Paths.get(source)).toUri();
     }
 
+    private static String urlEncode(String value) {
+        return URLEncoder.encode(value, StandardCharsets.UTF_8);
+    }
+
+    private static String jsonArray(String csv) {
+        List<String> values = new ArrayList<>();
+        for (String part : csv.split(",")) {
+            String trimmed = part.trim();
+            if (!trimmed.isEmpty()) {
+                values.add("\"" + trimmed.replace("\\", "\\\\").replace("\"", "\\\"") + "\"");
+            }
+        }
+        return "[" + String.join(",", values) + "]";
+    }
+
     @SuppressWarnings("unchecked")
     private static Map<String, Object> asMap(Object value) {
         if (value instanceof Map<?, ?> map) {
@@ -1520,6 +1726,9 @@ public final class VelocityAutoUpdater {
             + "#     Floodgate for Velocity:\n"
             + "#       https://download.geysermc.org/v2/projects/floodgate/versions/latest/builds/latest/downloads/velocity\n"
             + "#\n"
+            + "#     Modrinth project page:\n"
+            + "#       https://modrinth.com/plugin/fancyholograms/versions\n"
+            + "#\n"
             + "#     Direct jar URL:\n"
             + "#       https://example.com/MyPlugin.jar\n"
             + "#\n"
@@ -1531,6 +1740,9 @@ public final class VelocityAutoUpdater {
             + "#       Recommended.\n"
             + "#       The updater guesses the correct type from the source URL.\n"
             + "#\n"
+            + "#     modrinth\n"
+            + "#       Force the updater to treat the source as a Modrinth project.\n"
+            + "#\n"
             + "#     papermc\n"
             + "#       Force the updater to treat the source as a PaperMC download.\n"
             + "#\n"
@@ -1539,6 +1751,30 @@ public final class VelocityAutoUpdater {
             + "#\n"
             + "#     direct\n"
             + "#       Treat the source as a direct jar download URL or local jar file.\n"
+            + "#\n"
+            + "# loader\n"
+            + "#   Optional Modrinth filter.\n"
+            + "#   Use this when you only want versions for a specific server/plugin loader.\n"
+            + "#\n"
+            + "#   Examples:\n"
+            + "#     loader: paper\n"
+            + "#     loader: velocity\n"
+            + "#\n"
+            + "# gameVersion\n"
+            + "#   Optional Modrinth filter.\n"
+            + "#   Use this when you only want versions for a specific Minecraft version.\n"
+            + "#\n"
+            + "#   Example:\n"
+            + "#     gameVersion: \"1.21.8\"\n"
+            + "#\n"
+            + "# versionType\n"
+            + "#   Optional Modrinth release-type filter.\n"
+            + "#   If omitted, the updater prefers release builds, then beta, then alpha.\n"
+            + "#\n"
+            + "#   Options:\n"
+            + "#     release\n"
+            + "#     beta\n"
+            + "#     alpha\n"
             + "#\n"
             + "# installAs\n"
             + "#   The exact file path and filename the downloaded jar will become.\n"
@@ -1633,6 +1869,16 @@ public final class VelocityAutoUpdater {
             + "  #   source: https://download.geysermc.org/v2/projects/floodgate/versions/latest/builds/latest/downloads/velocity\n"
             + "  #   type: auto\n"
             + "  #   installAs: plugins/Floodgate-Velocity.jar\n"
+            + "  #   required: false\n"
+            + "\n"
+            + "  # Optional Modrinth example.\n"
+            + "  # FancyHolograms is normally a backend server plugin, not a Velocity proxy plugin.\n"
+            + "  # Install it into the plugins folder for the backend server that should run it.\n"
+            + "  # - name: FancyHolograms\n"
+            + "  #   source: https://modrinth.com/plugin/fancyholograms/versions\n"
+            + "  #   type: auto\n"
+            + "  #   loader: paper\n"
+            + "  #   installAs: plugins/FancyHolograms.jar\n"
             + "  #   required: false\n"
             + "\n"
             + "restart:\n"
