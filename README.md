@@ -1,74 +1,54 @@
 # Auto-Updater
+This is a highly configurable, simple plugin meant to be an auto updater. 
 
-A standalone launcher jar for Minecraft servers. It runs first, updates configured jars, backs up anything it replaces, and then starts the real server jar.
+## Directions
+```text
+ Set the host/panel startup jar to: auto-updater.jar
 
-```bash
-java -jar auto-updater.jar run
+This is meant to be a simple standalone launcher jar for Minecraft servers. It runs first, updates configured jars, backs up anything it replaces, and then starts the real server jar.
 ```
+
+# Official Discord 
+
+https://discord.gg/aT9z7q7hX8
+
+## Building instructions
+
+./gradlew build
 
 ## What It Supports
 
 - Folia, Paper, Velocity, and other PaperMC downloads.
 - `changeVersion: false` for safer server jar updates within the same configured version.
-- `installAs: auto` and `gameVersion: auto` for PaperMC server jars.
 - Hangar plugin downloads.
 - GitHub release jar downloads.
 - Modrinth plugin downloads.
-- SpigotMC free-resource downloads through Spiget.
-- GeyserMC direct download URLs.
+- SpigotMC downloads
 - Direct jar URLs and local jar paths.
-- Stable `installAs` filenames.
+- searchable stable `installAs` filenames.
 - Backup and staging folders.
 - Scheduled restarts with warning commands.
 - Explicit fallback sources.
+- Fallback on prevous working version if fails to load.
 - Discovery policy reporting with trusted GitHub org/repo settings.
 
-Build-from-source/Git mode is still not enabled. The config has trust settings for that future path, and hosted jars are preferred when they can avoid a build.
+## Default Config
 
-## Build
-
-On Windows:
-
-```powershell
-.\build.ps1
 ```
 
-The jar is written to:
-
-```text
-dist/auto-updater.jar
 ```
+
+
+### Folia inquisitors
+
+[<img src="https://github.com/Folia-Inquisitors.png" width=80 alt="Folia-Inquisitors">](https://github.com/orgs/Folia-Inquisitors/repositories)
+
 
 ## First Run
-
-Create a starter config:
-
-```bash
-java -jar auto-updater.jar init
-```
-
-Or place `updater.example.yml` next to the jar as `updater.yml`.
-
-Useful commands:
-
-```bash
-java -jar auto-updater.jar check
-java -jar auto-updater.jar discover
-java -jar auto-updater.jar update
-java -jar auto-updater.jar run
-```
-
-## Server Root Shape
-
+Server Root Shape
 ```text
 auto-updater.jar
 updater.yml
 folia.jar
 plugins/
-```
-
-Set the host/panel startup jar to:
-
-```text
-auto-updater.jar
 ```
