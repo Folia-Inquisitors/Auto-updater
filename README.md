@@ -36,13 +36,8 @@ plugins/
 ## Default Config
 
 ```
-# Auto-Updater
-# Run with: java -jar auto-updater.jar run
-# The editable config is first. Detailed notes are at the bottom.
-
 mode: hosted-safe
 onFailure: keep-current
-# PaperMC asks automated clients to use a real User-Agent with contact info.
 userAgent: "Auto-Updater/0.3.0 (contact: your-email@example.com)"
 
 discovery:
@@ -64,8 +59,6 @@ buildFromSource:
 
 server:
   name: auto
-  # source: auto detects an existing server jar. If this is a first
-  # install with no server jar yet, use a PaperMC URL from the examples above.
   source: auto
   type: auto
   installAs: auto
