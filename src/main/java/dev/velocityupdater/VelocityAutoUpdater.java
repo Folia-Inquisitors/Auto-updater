@@ -174,7 +174,7 @@ public final class VelocityAutoUpdater {
         String userAgent = APP_NAME + "/" + VERSION + " (contact: your-email@example.com)";
         Path cacheDir = Paths.get("cache");
         Path backupDir = Paths.get("backups");
-        TargetConfig server = new TargetConfig("Velocity", true);
+        TargetConfig server = new TargetConfig(null, true);
         List<TargetConfig> plugins = new ArrayList<>();
         DiscoveryConfig discovery = new DiscoveryConfig();
         BuildFromSourceConfig buildFromSource = new BuildFromSourceConfig();
@@ -189,12 +189,10 @@ public final class VelocityAutoUpdater {
             if (!onFailure.equals("keep-current") && !onFailure.equals("stop")) {
                 throw new IllegalArgumentException("onFailure must be keep-current or stop");
             }
-            if (server.installAs == null || server.installAs.isBlank()) {
-                server.installAs = "server.jar";
-            }
             if (server.changeVersion == null) {
                 server.changeVersion = false;
             }
+            applyServerAutoDefaults(server);
             if (server.source == null || server.source.isBlank()) {
                 Log.warn("No server.source configured. The updater will only launch the existing " + server.installAs + ".");
             }
@@ -211,6 +209,21 @@ public final class VelocityAutoUpdater {
                 }
             }
             restart.warnings.sort(Comparator.comparing((RestartWarning w) -> w.before).reversed());
+        }
+
+        private void applyServerAutoDefaults(TargetConfig server) {
+            String project = inferPaperMcProject(server);
+            if (server.name == null || server.name.isBlank() || lower(server.name).equals("auto")) {
+                server.name = project.isBlank() ? "Server" : title(project);
+                Log.info("Auto-detected server name: " + server.name);
+            }
+            if (server.installAs == null || server.installAs.isBlank() || lower(server.installAs).equals("auto")) {
+                server.installAs = project.isBlank() ? "server.jar" : project + ".jar";
+                Log.info("Auto-detected server jar filename: " + server.installAs);
+            }
+            if (server.gameVersion != null && lower(server.gameVersion).equals("auto")) {
+                Log.info("Server gameVersion is auto. The updater will use updater.lock.yml if present, otherwise it will lock the latest available PaperMC version on the next update.");
+            }
         }
 
         Path resolve(Path path) {
@@ -269,7 +282,7 @@ public final class VelocityAutoUpdater {
             if (name != null && !name.isBlank()) {
                 return name;
             }
-            return server ? "Velocity" : installAs;
+            return server ? "Server" : installAs;
         }
 
         TargetConfig copyWithSource(String source) {
@@ -1536,14 +1549,20 @@ public final class VelocityAutoUpdater {
 
         @Override
         public ResolvedDownload resolve(TargetConfig target) throws Exception {
-            String project = firstNonBlank(target.project, inferProject(target), "velocity");
+            String project = firstNonBlank(target.project, inferPaperMcProject(target), "paper");
             boolean allowVersionChange = target.changeVersion != null && target.changeVersion;
-            String lockedVersion = allowVersionChange ? "" : firstNonBlank(target.gameVersion, readLockValue(config, "serverGameVersion"), "");
+            String configuredVersion = lower(target.gameVersion).equals("auto") ? "" : firstNonBlank(target.gameVersion, "");
+            String lockVersion = readLockValue(config, "serverGameVersion");
+            String lockProject = readLockValue(config, "serverProject");
+            if (!lockProject.isBlank() && !lockProject.equalsIgnoreCase(project)) {
+                lockVersion = "";
+            }
+            String lockedVersion = allowVersionChange ? "" : firstNonBlank(configuredVersion, lockVersion, "");
             if (!allowVersionChange && lockedVersion.isBlank()) {
-                throw new IllegalArgumentException("changeVersion is false for " + target.displayName()
-                    + ", but no gameVersion is set and updater.lock.yml has no serverGameVersion. Set gameVersion or set changeVersion: true.");
+                Log.info("changeVersion is false and no server version is locked yet. Resolving latest " + project + " once, then writing updater.lock.yml.");
             }
             if (!lockedVersion.isBlank()) {
+                Log.info("Using locked/configured " + project + " version: " + lockedVersion);
                 Optional<ResolvedDownload> download = loadBuild(project, lockedVersion, target);
                 if (download.isPresent()) {
                     return download.get();
@@ -1568,27 +1587,7 @@ public final class VelocityAutoUpdater {
         }
 
         private String inferProject(TargetConfig target) {
-            String source = lower(firstNonBlank(target.source, target.name, target.installAs, ""));
-            if (source.contains("papermc.io/downloads/")) {
-                String[] parts = source.split("/");
-                String last = parts.length == 0 ? "" : parts[parts.length - 1];
-                if (last.equals("paper") || last.equals("folia") || last.equals("velocity") || last.equals("waterfall")) {
-                    return last;
-                }
-            }
-            if (source.contains("folia")) {
-                return "folia";
-            }
-            if (source.contains("paper")) {
-                return "paper";
-            }
-            if (source.contains("velocity")) {
-                return "velocity";
-            }
-            if (source.contains("waterfall")) {
-                return "waterfall";
-            }
-            return "paper";
+            return inferPaperMcProject(target);
         }
 
         private List<String> loadVersions(String project) throws Exception {
@@ -2186,6 +2185,37 @@ public final class VelocityAutoUpdater {
         return "";
     }
 
+    private static String inferPaperMcProject(TargetConfig target) {
+        String source = lower(firstNonBlank(target.source, target.project, target.name, target.installAs, ""));
+        if (source.contains("papermc.io/downloads/")) {
+            String[] parts = source.split("/");
+            String last = parts.length == 0 ? "" : parts[parts.length - 1];
+            if (isPaperMcProject(last)) {
+                return last;
+            }
+        }
+        for (String project : List.of("folia", "velocity", "waterfall", "paper")) {
+            if (source.contains(project)) {
+                return project;
+            }
+        }
+        return target.server ? "server" : "";
+    }
+
+    private static boolean isPaperMcProject(String value) {
+        return value.equals("paper") || value.equals("folia") || value.equals("velocity") || value.equals("waterfall");
+    }
+
+    private static String title(String value) {
+        if (value == null || value.isBlank()) {
+            return "";
+        }
+        if (value.equalsIgnoreCase("papermc")) {
+            return "PaperMC";
+        }
+        return value.substring(0, 1).toUpperCase(Locale.ROOT) + value.substring(1).toLowerCase(Locale.ROOT);
+    }
+
     private static URI sourceUri(String source, AppConfig config) {
         try {
             URI uri = URI.create(source);
@@ -2442,6 +2472,11 @@ public final class VelocityAutoUpdater {
             #   The exact file path and filename the downloaded jar will become.
             #   This controls the final jar name.
             #
+            #   For the server jar, installAs: auto uses the detected PaperMC project:
+            #     folia -> folia.jar
+            #     paper -> paper.jar
+            #     velocity -> velocity.jar
+            #
             # fallbackSources
             #   Optional comma-separated backup sources to try if the main source fails.
             #
@@ -2467,6 +2502,11 @@ public final class VelocityAutoUpdater {
             #
             # gameVersion
             #   For PaperMC server jars: the server version to stay on when changeVersion is false.
+            #   Set this to the Folia/Paper/Velocity version you intentionally want, or use auto.
+            #
+            #   With gameVersion: auto and changeVersion: false, the updater uses the newest
+            #   version on first install, writes updater.lock.yml, and then stays on that
+            #   locked version on future runs.
             #
             # platform
             #   For Hangar plugins: which platform download to use. Common: paper, velocity, waterfall.
@@ -2503,14 +2543,14 @@ public final class VelocityAutoUpdater {
               trustedGithubRepos: Inquisitors-transfers/MyCustomPlugin
 
             server:
-              name: Folia
+              name: auto
               source: https://papermc.io/downloads/folia
               type: auto
-              installAs: folia.jar
-              gameVersion: "26.1.2"
+              installAs: auto
+              gameVersion: auto
               changeVersion: false
               java: java
-              javaArgs: "-Xms512M -Xmx1G"
+              javaArgs: "-Xms16G -Xmx32G"
               args: ""
 
             plugins:

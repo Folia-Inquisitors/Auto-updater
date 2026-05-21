@@ -102,6 +102,11 @@
 #   Example:
 #     installAs: plugins/ViaVersion.jar
 #
+#   For the server jar, installAs: auto uses the detected PaperMC project:
+#     folia -> folia.jar
+#     paper -> paper.jar
+#     velocity -> velocity.jar
+#
 # fallbackSources
 #   Optional comma-separated backup sources to try if the main source fails.
 #   These are explicit sources you approved.
@@ -123,10 +128,14 @@
 #
 # gameVersion
 #   For PaperMC server jars: the server version to stay on when changeVersion is false.
-#   Set this to the Folia/Paper/Velocity version you intentionally want.
+#   Set this to the Folia/Paper/Velocity version you intentionally want, or use auto.
 #
 #   Example:
 #     gameVersion: "26.1.2"
+#
+#   With gameVersion: auto and changeVersion: false, the updater uses the newest
+#   version on first install, writes updater.lock.yml, and then stays on that
+#   locked version on future runs.
 #
 # platform
 #   For Hangar plugins: which platform download to use.
@@ -211,14 +220,14 @@ buildFromSource:
   trustedGithubRepos: Inquisitors-transfers/MyCustomPlugin
 
 server:
-  name: Folia
+  name: auto
   source: https://papermc.io/downloads/folia
   type: auto
-  installAs: folia.jar
-  gameVersion: "26.1.2"
+  installAs: auto
+  gameVersion: auto
   changeVersion: false
   java: java
-  javaArgs: "-Xms512M -Xmx1G"
+  javaArgs: "-Xms16G -Xmx32G"
   args: ""
 
 plugins:

@@ -10,6 +10,7 @@ java -jar auto-updater.jar run
 
 - Folia, Paper, Velocity, and other PaperMC downloads.
 - `changeVersion: false` for safer server jar updates within the same configured version.
+- `installAs: auto` and `gameVersion: auto` for PaperMC server jars.
 - Hangar plugin downloads.
 - GitHub release jar downloads.
 - Modrinth plugin downloads.
