@@ -332,11 +332,20 @@ public final class VelocityAutoUpdater {
     }
 
     private static final class BuildFromSourceConfig {
-        boolean enabled = false;
+        String enabled = "false";
         boolean onlyTrusted = true;
         boolean preferHostedIfSameVersion = true;
         List<String> trustedGithubOrgs = new ArrayList<>();
         List<String> trustedGithubRepos = new ArrayList<>();
+
+        boolean allowsBuild() {
+            String value = lower(enabled);
+            return value.equals("true") || value.equals("yes") || value.equals("on") || value.equals("1") || value.equals("auto");
+        }
+
+        boolean autoFallback() {
+            return lower(enabled).equals("auto");
+        }
     }
 
     private static final class FailureMemoryConfig {
@@ -656,7 +665,7 @@ public final class VelocityAutoUpdater {
         private static void applyBuildFromSource(BuildFromSourceConfig build, KeyValue kv) {
             switch (lower(kv.key)) {
                 case "enabled":
-                    build.enabled = parseBoolean(kv.value);
+                    build.enabled = kv.value;
                     break;
                 case "onlytrusted":
                 case "only_trusted":
@@ -944,7 +953,7 @@ public final class VelocityAutoUpdater {
         private static boolean updatePluginBlock(List<String> lines, PluginBlock block, TargetConfig target) {
             boolean changed = false;
             changed |= upsertPluginKey(lines, block, "source", target.source);
-            changed |= upsertPluginKey(lines, block, "type", "auto");
+            changed |= upsertPluginKey(lines, block, "type", firstNonBlank(target.type, "auto"));
             if (target.githubRepo != null && !target.githubRepo.isBlank()) {
                 changed |= upsertPluginKey(lines, block, "githubRepo", target.githubRepo);
             }
@@ -1022,7 +1031,7 @@ public final class VelocityAutoUpdater {
             List<String> entry = new ArrayList<>();
             entry.add("  - name: " + quoteYaml(target.displayName()));
             entry.add("    source: " + quoteYaml(target.source));
-            entry.add("    type: auto");
+            entry.add("    type: " + quoteYaml(firstNonBlank(target.type, "auto")));
             entry.add("    autoUpdate: " + target.autoUpdate);
             if (target.githubRepo != null && !target.githubRepo.isBlank()) {
                 entry.add("    githubRepo: " + quoteYaml(target.githubRepo));
@@ -1356,7 +1365,7 @@ public final class VelocityAutoUpdater {
             Log.info("Failure behavior: " + config.onFailure);
             Log.info("Discovery: " + (config.discovery.enabled ? "enabled (" + config.discovery.mode + ")" : "disabled"));
             Log.info("Installed plugin scan: " + (config.discovery.scanInstalledPlugins ? "enabled" : "disabled"));
-            Log.info("Build from source: " + (config.buildFromSource.enabled ? "enabled" : "disabled")
+            Log.info("Build from source: " + config.buildFromSource.enabled
                 + ", preferHostedIfSameVersion=" + config.buildFromSource.preferHostedIfSameVersion);
             Log.info("Failure memory: " + (config.failureMemory.enabled ? "enabled (retryBadAfter=" + config.failureMemory.retryBadAfter + ")" : "disabled"));
             Log.info("Server install target: " + config.resolve(Paths.get(config.server.installAs)));
@@ -1392,7 +1401,7 @@ public final class VelocityAutoUpdater {
             Log.info("Auto-switch source: " + config.discovery.autoSwitchSource);
             Log.info("Save discovered sources: " + config.discovery.saveDiscoveredSources);
             Log.info("Scan installed plugins: " + config.discovery.scanInstalledPlugins);
-            Log.info("Build from source: " + (config.buildFromSource.enabled ? "enabled" : "disabled")
+            Log.info("Build from source: " + config.buildFromSource.enabled
                 + ", onlyTrusted=" + config.buildFromSource.onlyTrusted
                 + ", preferHostedIfSameVersion=" + config.buildFromSource.preferHostedIfSameVersion);
             Log.info("Failure memory: " + (config.failureMemory.enabled ? "enabled (retryBadAfter=" + config.failureMemory.retryBadAfter + ")" : "disabled"));
@@ -1511,8 +1520,11 @@ public final class VelocityAutoUpdater {
         private void applyDiscoveredSource(TargetConfig target, List<DiscoveryCandidate> discovered) {
             DiscoveryCandidate best = discovered.get(0);
             target.source = best.source;
-            target.type = "auto";
+            target.type = best.type.equals("github-source") ? "github-source" : "auto";
             if (best.type.equals("github-release") && !best.projectHint.isBlank()) {
+                target.githubRepo = best.projectHint;
+            }
+            if (best.type.equals("github-source") && !best.projectHint.isBlank()) {
                 target.githubRepo = best.projectHint;
             }
             target.sourceDiscoveredThisRun = true;
@@ -1692,6 +1704,14 @@ public final class VelocityAutoUpdater {
                 }
             } catch (Exception ex) {
                 Log.warn("GitHub releases lookup failed for " + repo.owner + "/" + repo.name + ": " + ex.getMessage());
+            }
+            if (config.buildFromSource.allowsBuild()) {
+                String source = "https://github.com/" + repo.owner + "/" + repo.name;
+                String repoName = repo.owner + "/" + repo.name;
+                if (!config.buildFromSource.onlyTrusted || isTrustedGithubRepo(repoName)) {
+                    return Optional.of(candidateFromResolved(target, "github-source", source, repoName, "", repoName,
+                        priority + 100, reason + "; no release jar found, trusted source build fallback"));
+                }
             }
             return Optional.empty();
         }
@@ -2091,6 +2111,9 @@ public final class VelocityAutoUpdater {
 
         private Optional<InstalledUpdate> updateOne(TargetConfig target) throws Exception {
             if (target.source == null || target.source.isBlank() || isAutoValue(target.source)) {
+                if (canBuildFromSource(target)) {
+                    return updateOneFromSource(sourceBuildTarget(target));
+                }
                 Log.info("No source configured for " + target.displayName() + "; keeping existing jar.");
                 return Optional.empty();
             }
@@ -2110,7 +2133,58 @@ public final class VelocityAutoUpdater {
                     }
                 }
             }
+            if (shouldTrySourceBuildFallback(target, sources)) {
+                try {
+                    Log.warn("Hosted sources failed for " + target.displayName() + "; trying trusted Git source build.");
+                    return updateOneFromSource(sourceBuildTarget(target));
+                } catch (Exception ex) {
+                    last = ex;
+                }
+            }
             throw last == null ? new IOException("No source configured for " + target.displayName()) : last;
+        }
+
+        private boolean shouldTrySourceBuildFallback(TargetConfig target, List<String> triedSources) {
+            if (!config.buildFromSource.autoFallback() || !canBuildFromSource(target)) {
+                return false;
+            }
+            for (String source : triedSources) {
+                String type = detectType(source, target);
+                if (type.equals("git") || type.equals("github-source")) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        private boolean canBuildFromSource(TargetConfig target) {
+            if (!config.buildFromSource.allowsBuild() || target.server) {
+                return false;
+            }
+            String repo = gitRepoHint(target);
+            return !repo.isBlank() && (!config.buildFromSource.onlyTrusted || isTrustedGithubRepo(repo));
+        }
+
+        private TargetConfig sourceBuildTarget(TargetConfig target) {
+            TargetConfig copy = target.copyWithSource(firstNonBlank(target.githubRepo, target.source, ""));
+            copy.type = "github-source";
+            return copy;
+        }
+
+        private String gitRepoHint(TargetConfig target) {
+            String value = firstNonBlank(target.githubRepo, target.project, target.source, "");
+            if (value.contains("github.com/")) {
+                try {
+                    GithubRepo repo = repoFromGithubUrl(value);
+                    return repo.owner + "/" + repo.name;
+                } catch (Exception ignored) {
+                    return "";
+                }
+            }
+            if (value.matches("[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")) {
+                return value.replace(".git", "");
+            }
+            return "";
         }
 
         private Optional<InstalledUpdate> updateOneFromSource(TargetConfig target) throws Exception {
@@ -2223,7 +2297,9 @@ public final class VelocityAutoUpdater {
                 type = detectType(source, target);
             }
             if (config.mode.equals("hosted-safe") && (type.equals("git") || type.equals("github-source"))) {
-                throw new IllegalArgumentException("Hosted-safe mode will not build from source for " + target.displayName());
+                if (!config.buildFromSource.allowsBuild()) {
+                    throw new IllegalArgumentException("Source builds are disabled for " + target.displayName());
+                }
             }
             switch (type) {
                 case "papermc":
@@ -2242,6 +2318,9 @@ public final class VelocityAutoUpdater {
                     return new SourcePlan(type, source, new SpigetResolver());
                 case "direct":
                     return new SourcePlan(type, source, new DirectResolver(config));
+                case "git":
+                case "github-source":
+                    return new SourcePlan("github-source", source.isBlank() ? target.githubRepo : source, new GitSourceResolver(config));
                 default:
                     throw new IllegalArgumentException("Unsupported source type for " + target.displayName() + ": " + type);
             }
@@ -2271,6 +2350,9 @@ public final class VelocityAutoUpdater {
             }
             if (lowerSource.endsWith(".git") || lowerSource.startsWith("git@")) {
                 return "git";
+            }
+            if (target.type != null && lower(target.type).equals("github-source")) {
+                return "github-source";
             }
             if (lowerSource.contains("github.com/") || (target.githubRepo != null && !target.githubRepo.isBlank())) {
                 return "github-release";
@@ -2393,6 +2475,187 @@ public final class VelocityAutoUpdater {
                 throw new IllegalArgumentException("Direct source needs a URL for " + target.displayName());
             }
             return new ResolvedDownload(sourceUri(target.source, config), target.source);
+        }
+    }
+
+    private static final class GitSourceResolver implements DownloadResolver {
+        private final AppConfig config;
+
+        GitSourceResolver(AppConfig config) {
+            this.config = config;
+        }
+
+        @Override
+        public ResolvedDownload resolve(TargetConfig target) throws Exception {
+            if (!config.buildFromSource.allowsBuild()) {
+                throw new IllegalArgumentException("buildFromSource.enabled is not true/auto for " + target.displayName());
+            }
+            GithubRepo repo = inferRepo(target);
+            String repoName = repo.owner + "/" + repo.name;
+            if (config.buildFromSource.onlyTrusted && !isTrusted(repoName)) {
+                throw new IllegalArgumentException("Git source repo is not trusted: " + repoName);
+            }
+
+            Path sourceDir = config.resolve(config.cacheDir)
+                .resolve("source")
+                .resolve(safeName(repo.owner + "-" + repo.name));
+            syncRepo(repo, sourceDir);
+            BuildCommand command = detectBuildCommand(sourceDir);
+            Log.info("Building " + repoName + " with " + String.join(" ", command.command));
+            runProcess(command.command, sourceDir, Duration.ofMinutes(20));
+            Path builtJar = findBuiltJar(sourceDir);
+            validateBuiltJar(builtJar);
+            return new ResolvedDownload(builtJar.toUri(), "Git source " + repoName + " " + builtJar.getFileName(),
+                "github-source", repoName, "", "", "");
+        }
+
+        private void validateBuiltJar(Path path) throws IOException {
+            try (JarFile ignored = new JarFile(path.toFile(), false)) {
+                // Opening the JarFile verifies the built artifact is a readable jar.
+            }
+        }
+
+        private GithubRepo inferRepo(TargetConfig target) {
+            String value = firstNonBlank(target.githubRepo, target.project, target.source, "");
+            if (value.contains("github.com/")) {
+                List<String> parts = pathParts(URI.create(value));
+                if (parts.size() >= 2) {
+                    return new GithubRepo(parts.get(0), parts.get(1).replace(".git", ""));
+                }
+            }
+            if (value.matches("[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")) {
+                String[] parts = value.split("/", 2);
+                return new GithubRepo(parts[0], parts[1].replace(".git", ""));
+            }
+            throw new IllegalArgumentException("Git source needs githubRepo: Owner/Repo or a GitHub URL for " + target.displayName());
+        }
+
+        private boolean isTrusted(String repo) {
+            String normalized = repo.trim();
+            if (config.buildFromSource.trustedGithubRepos.stream().anyMatch(r -> r.equalsIgnoreCase(normalized))) {
+                return true;
+            }
+            int slash = normalized.indexOf('/');
+            if (slash <= 0) {
+                return false;
+            }
+            String org = normalized.substring(0, slash);
+            return config.buildFromSource.trustedGithubOrgs.stream().anyMatch(o -> o.equalsIgnoreCase(org));
+        }
+
+        private void syncRepo(GithubRepo repo, Path sourceDir) throws Exception {
+            Files.createDirectories(sourceDir.getParent());
+            String url = "https://github.com/" + repo.owner + "/" + repo.name + ".git";
+            if (!Files.isDirectory(sourceDir.resolve(".git"))) {
+                runProcess(List.of("git", "clone", "--depth", "1", url, sourceDir.toString()), config.baseDir, Duration.ofMinutes(5));
+                return;
+            }
+            runProcess(List.of("git", "fetch", "--depth", "1", "origin"), sourceDir, Duration.ofMinutes(5));
+            runProcess(List.of("git", "reset", "--hard", "origin/HEAD"), sourceDir, Duration.ofMinutes(2));
+        }
+
+        private BuildCommand detectBuildCommand(Path sourceDir) {
+            boolean windows = System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("win");
+            Path gradlew = sourceDir.resolve(windows ? "gradlew.bat" : "gradlew");
+            if (Files.isRegularFile(gradlew)) {
+                return new BuildCommand(List.of(gradlew.toString(), "build", "-x", "test"));
+            }
+            if (Files.isRegularFile(sourceDir.resolve("pom.xml"))) {
+                return new BuildCommand(List.of("mvn", "-B", "package", "-DskipTests"));
+            }
+            if (Files.isRegularFile(sourceDir.resolve("build.gradle"))
+                || Files.isRegularFile(sourceDir.resolve("build.gradle.kts"))
+                || Files.isRegularFile(sourceDir.resolve("settings.gradle"))
+                || Files.isRegularFile(sourceDir.resolve("settings.gradle.kts"))) {
+                return new BuildCommand(List.of("gradle", "build", "-x", "test"));
+            }
+            throw new IllegalArgumentException("Could not auto-detect Gradle or Maven build files in " + sourceDir);
+        }
+
+        private void runProcess(List<String> command, Path dir, Duration timeout) throws Exception {
+            ProcessBuilder builder = new ProcessBuilder(command);
+            builder.directory(dir.toFile());
+            builder.redirectErrorStream(true);
+            Process process = builder.start();
+            StringBuilder output = new StringBuilder();
+            Thread reader = new Thread(() -> {
+                try (BufferedReader br = new BufferedReader(new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
+                    String line;
+                    while ((line = br.readLine()) != null) {
+                        output.append(line).append(System.lineSeparator());
+                    }
+                } catch (IOException ignored) {
+                    // Process ended.
+                }
+            }, "git-source-build-output");
+            reader.setDaemon(true);
+            reader.start();
+            boolean finished = process.waitFor(timeout.toSeconds(), TimeUnit.SECONDS);
+            if (!finished) {
+                process.destroy();
+                process.waitFor(15, TimeUnit.SECONDS);
+                if (process.isAlive()) {
+                    process.destroyForcibly();
+                }
+                throw new IOException("Command timed out: " + String.join(" ", command));
+            }
+            reader.join(TimeUnit.SECONDS.toMillis(5));
+            if (process.exitValue() != 0) {
+                throw new IOException("Command failed (" + process.exitValue() + "): " + String.join(" ", command)
+                    + System.lineSeparator() + tail(output.toString(), 4000));
+            }
+        }
+
+        private Path findBuiltJar(Path sourceDir) throws IOException {
+            List<Path> jars = new ArrayList<>();
+            try (var stream = Files.walk(sourceDir, 8)) {
+                stream.filter(Files::isRegularFile)
+                    .filter(path -> lower(path.getFileName().toString()).endsWith(".jar"))
+                    .filter(path -> !isRejectedBuildJar(path))
+                    .forEach(jars::add);
+            }
+            if (jars.isEmpty()) {
+                throw new IOException("Build completed but no usable jar was found under " + sourceDir);
+            }
+            jars.sort((a, b) -> {
+                try {
+                    int modified = Files.getLastModifiedTime(b).compareTo(Files.getLastModifiedTime(a));
+                    if (modified != 0) {
+                        return modified;
+                    }
+                    return Long.compare(Files.size(b), Files.size(a));
+                } catch (IOException ex) {
+                    return 0;
+                }
+            });
+            return jars.get(0);
+        }
+
+        private boolean isRejectedBuildJar(Path path) {
+            String filename = lower(path.getFileName().toString());
+            String normalized = normalizeSlashes(path.toString()).toLowerCase(Locale.ROOT);
+            return filename.contains("sources")
+                || filename.contains("javadoc")
+                || filename.contains("-plain")
+                || filename.contains("-dev")
+                || filename.startsWith("original-")
+                || normalized.contains("/build/tmp/")
+                || normalized.contains("/.gradle/");
+        }
+
+        private String tail(String text, int maxChars) {
+            if (text.length() <= maxChars) {
+                return text;
+            }
+            return text.substring(text.length() - maxChars);
+        }
+
+        private static final class BuildCommand {
+            final List<String> command;
+
+            BuildCommand(List<String> command) {
+                this.command = command;
+            }
         }
     }
 
@@ -4198,7 +4461,7 @@ public final class VelocityAutoUpdater {
               scanInstalledPlugins: true
 
             buildFromSource:
-              enabled: false
+              enabled: auto
               onlyTrusted: true
               preferHostedIfSameVersion: true
               trustedGithubOrgs: PaperMC, GeyserMC, ViaVersion
@@ -4289,8 +4552,8 @@ public final class VelocityAutoUpdater {
             # mode
             #   hosted-safe:
             #     Recommended for hosted panels and normal servers.
-            #     Downloads ready-made jars only. It will not run Git, Gradle, Maven,
-            #     or compile source code.
+            #     Downloads ready-made jars first. It will only run Git/Gradle/Maven when
+            #     buildFromSource.enabled is true/auto and the repo is trusted.
             #   auto:
             #     Allows auto-detection features. In this version, updates still use
             #     hosted/downloaded jars only.
@@ -4350,15 +4613,21 @@ public final class VelocityAutoUpdater {
             #   sources, then prints the best YAML entry it can safely suggest.
             #
             # buildFromSource.enabled
-            #   Future Git build switch. Keep false for hosted-safe behavior.
+            #   false:
+            #     Never clone or compile Git repositories.
+            #   auto:
+            #     Recommended if this machine has Git plus Gradle/Maven available.
+            #     Try hosted jars first. Only if hosted sources fail or none exist, clone
+            #     a trusted GitHub repo and auto-detect Gradle/Maven build commands.
+            #   true:
+            #     Allow configured Git source builds whenever a target source/type asks for it.
             #
             # buildFromSource.onlyTrusted
-            #   Future safety switch. If building is enabled later, only trusted GitHub
-            #   orgs/repos should be allowed to run build scripts.
+            #   If true, source builds are only allowed for trusted GitHub orgs/repos.
             #
             # buildFromSource.preferHostedIfSameVersion
-            #   Future optimization. If a trusted hosted jar matches the version that would
-            #   be built from Git, download the hosted jar and skip compiling.
+            #   If true, hosted jars are preferred before compiling. This keeps normal
+            #   updates fast and avoids build scripts when a ready-made jar exists.
             #
             # buildFromSource.trustedGithubOrgs / trustedGithubRepos
             #   GitHub orgs/repos you explicitly trust for future source builds.

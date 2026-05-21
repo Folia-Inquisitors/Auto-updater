@@ -18,7 +18,7 @@ discovery:
   scanInstalledPlugins: true
 
 buildFromSource:
-  enabled: false
+  enabled: auto
   onlyTrusted: true
   preferHostedIfSameVersion: true
   trustedGithubOrgs: PaperMC, GeyserMC, ViaVersion
@@ -109,8 +109,8 @@ restart:
 # mode
 #   hosted-safe:
 #     Recommended for hosted panels and normal servers.
-#     Downloads ready-made jars only. It will not run Git, Gradle, Maven,
-#     or compile source code.
+#     Downloads ready-made jars first. It will only run Git/Gradle/Maven when
+#     buildFromSource.enabled is true/auto and the repo is trusted.
 #   auto:
 #     Allows auto-detection features. In this version, updates still use
 #     hosted/downloaded jars only.
@@ -170,15 +170,21 @@ restart:
 #   sources, then prints the best YAML entry it can safely suggest.
 #
 # buildFromSource.enabled
-#   Future Git build switch. Keep false for hosted-safe behavior.
+#   false:
+#     Never clone or compile Git repositories.
+#   auto:
+#     Recommended if this machine has Git plus Gradle/Maven available.
+#     Try hosted jars first. Only if hosted sources fail or none exist, clone
+#     a trusted GitHub repo and auto-detect Gradle/Maven build commands.
+#   true:
+#     Allow configured Git source builds whenever a target source/type asks for it.
 #
 # buildFromSource.onlyTrusted
-#   Future safety switch. If building is enabled later, only trusted GitHub
-#   orgs/repos should be allowed to run build scripts.
+#   If true, source builds are only allowed for trusted GitHub orgs/repos.
 #
 # buildFromSource.preferHostedIfSameVersion
-#   Future optimization. If a trusted hosted jar matches the version that would
-#   be built from Git, download the hosted jar and skip compiling.
+#   If true, hosted jars are preferred before compiling. This keeps normal
+#   updates fast and avoids build scripts when a ready-made jar exists.
 #
 # buildFromSource.trustedGithubOrgs / trustedGithubRepos
 #   GitHub orgs/repos you explicitly trust for future source builds.

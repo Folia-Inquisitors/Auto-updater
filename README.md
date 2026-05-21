@@ -34,6 +34,7 @@ plugins/
 - Saves discovered plugin sources back into `updater.yml`.
 - Per-plugin `autoUpdate` opt-out.
 - Failure memory for plugin jars that fail startup.
+- Trusted Git source build fallback with Gradle/Maven auto-detection.
 
 ## Default Config
 
@@ -53,7 +54,7 @@ discovery:
   scanInstalledPlugins: true
 
 buildFromSource:
-  enabled: false
+  enabled: auto
   onlyTrusted: true
   preferHostedIfSameVersion: true
   trustedGithubOrgs: PaperMC, GeyserMC, ViaVersion
