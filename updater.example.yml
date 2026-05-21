@@ -1,0 +1,189 @@
+# Velocity Auto Updater
+# Run with: java -jar velocity-auto-updater.jar run
+#
+# ---------------------------------------------------------------------------
+# Field Guide
+# ---------------------------------------------------------------------------
+#
+# mode
+#   What the updater is allowed to do.
+#
+#   Options:
+#     hosted-safe
+#       Recommended for BisectHosting and other server hosts.
+#       The updater only downloads ready-made jar files from websites/APIs.
+#       It will NOT run Git, Gradle, Maven, or compile source code.
+#
+#     auto
+#       Allows the updater to auto-detect source types.
+#       In this version, it still only supports hosted/downloaded jars.
+#       Build-from-source is not included yet.
+#
+# onFailure
+#   What happens if a jar cannot be updated.
+#
+#   Options:
+#     keep-current
+#       Recommended.
+#       If the update fails but an old jar already exists, keep using the old jar.
+#       This lets the server still start when a download site is temporarily down.
+#
+#     stop
+#       Stop startup if an update fails.
+#
+# userAgent
+#   Text sent with download requests.
+#   PaperMC asks automated download clients to use a real User-Agent with
+#   contact info, so replace your-email@example.com with your own email or site.
+#
+# name
+#   A friendly label shown in updater logs.
+#   It has no fixed options. You can name it whatever you want.
+#   This does NOT control the jar filename.
+#
+#   Example:
+#     name: Geyser
+#
+# source
+#   Where the updater gets the new jar from.
+#   This can be a supported website, a direct jar download URL, or a local jar path.
+#
+#   Examples:
+#     PaperMC Velocity:
+#       https://papermc.io/downloads/velocity
+#
+#     Geyser for Velocity:
+#       https://download.geysermc.org/v2/projects/geyser/versions/latest/builds/latest/downloads/velocity
+#
+#     Floodgate for Velocity:
+#       https://download.geysermc.org/v2/projects/floodgate/versions/latest/builds/latest/downloads/velocity
+#
+#     Direct jar URL:
+#       https://example.com/MyPlugin.jar
+#
+# type
+#   Tells the updater how to understand the source.
+#
+#   Options:
+#     auto
+#       Recommended.
+#       The updater guesses the correct type from the source URL.
+#
+#     papermc
+#       Force the updater to treat the source as a PaperMC download.
+#
+#     geysermc
+#       Force the updater to treat the source as a GeyserMC download.
+#
+#     direct
+#       Treat the source as a direct jar download URL or local jar file.
+#
+# installAs
+#   The exact file path and filename the downloaded jar will become.
+#   This is what controls the final jar name.
+#
+#   Example:
+#     installAs: plugins/Geyser-Velocity.jar
+#
+#   That means the downloaded file will be saved as:
+#     plugins/Geyser-Velocity.jar
+#
+# required
+#   Controls what happens when this jar is missing and cannot be downloaded.
+#
+#   Options:
+#     false
+#       If the update fails and an old jar exists, keep the old jar.
+#       If no old jar exists, the server may still start without this plugin.
+#
+#     true
+#       If the update fails and an old jar exists, keep the old jar.
+#       If no old jar exists, stop startup.
+#
+# java
+#   The Java command used to start Velocity.
+#   Usually:
+#     java
+#
+# javaArgs
+#   Memory/Java options used when starting Velocity.
+#
+#   Example:
+#     javaArgs: "-Xms512M -Xmx1G"
+#
+#   If your host already controls RAM settings, use:
+#     javaArgs: ""
+#
+# args
+#   Extra arguments passed to Velocity after the jar name.
+#   Usually leave this empty:
+#     args: ""
+#
+# restart.enabled
+#   Turns scheduled restarts on or off.
+#
+#   Options:
+#     true
+#     false
+#
+# restart.interval
+#   How often to restart.
+#
+#   Examples:
+#     7d  = every 7 days
+#     12h = every 12 hours
+#     30m = every 30 minutes
+#
+# restart.stopCommand
+#   Console command sent when it is time to stop Velocity.
+#   Usually:
+#     shutdown
+#
+# restart.warnings
+#   Warning commands sent before the restart.
+#   These are sent into the Velocity console.
+#
+# ---------------------------------------------------------------------------
+
+mode: hosted-safe
+onFailure: keep-current
+# PaperMC asks automated clients to use a real User-Agent with contact info.
+userAgent: "velocity-auto-updater/0.1.0 (contact: your-email@example.com)"
+
+server:
+  name: Velocity
+  source: https://papermc.io/downloads/velocity
+  type: auto
+  installAs: velocity.jar
+  java: java
+  javaArgs: "-Xms512M -Xmx1G"
+  args: ""
+
+plugins:
+  - name: Geyser
+    source: https://download.geysermc.org/v2/projects/geyser/versions/latest/builds/latest/downloads/velocity
+    type: auto
+    installAs: plugins/Geyser-Velocity.jar
+    required: false
+
+  # Optional Floodgate example:
+  # - name: Floodgate
+  #   source: https://download.geysermc.org/v2/projects/floodgate/versions/latest/builds/latest/downloads/velocity
+  #   type: auto
+  #   installAs: plugins/Floodgate-Velocity.jar
+  #   required: false
+
+restart:
+  enabled: true
+  interval: 7d
+  stopCommand: shutdown
+  gracefulStopSeconds: 60
+  warnings:
+    - before: 2h
+      command: "alert Proxy restart in 2 hours for updates."
+    - before: 30m
+      command: "alert Proxy restart in 30 minutes for updates."
+    - before: 5m
+      command: "alert Proxy restart in 5 minutes for updates."
+    - before: 1m
+      command: "alert Proxy restart in 1 minute for updates."

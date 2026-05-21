@@ -1,0 +1,6 @@
+build/
+backups/
+cache/
+smoke-output/
+*.log
+updater.yml
