@@ -126,11 +126,12 @@ restart:
 #     Report suggestions without rewriting your config.
 #
 # discovery.sourcePriority
-#   Preferred order when comparing possible update sources.
+#   Preferred order when choosing good discovered plugin sources.
 #   Supported source families: github-release, hangar, modrinth, spigot.
 #
 # discovery.checkAlternateSourcesWhenOutdated
-#   If true, discovery can warn when a configured source appears stale.
+#   If true, discovery compares version strings where APIs expose them and
+#   rejects sources that look clearly older than the installed plugin jar.
 #
 # discovery.outdatedThresholdDays
 #   How old a source can look before discovery treats it as stale.
@@ -142,7 +143,8 @@ restart:
 # discovery.scanInstalledPlugins
 #   If true, scans plugins/ for jars that are not already listed.
 #   It can fill name, installAs, platform, and required.
-#   It does not guess the official source URL for those plugins.
+#   It also searches GitHub, Hangar, Modrinth, and Spigot for likely update
+#   sources, then prints the best YAML entry it can safely suggest.
 #
 # buildFromSource.enabled
 #   Future Git build switch. Keep false for hosted-safe behavior.

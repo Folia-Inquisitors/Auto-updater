@@ -210,6 +210,7 @@ public final class VelocityAutoUpdater {
                         throw new IllegalArgumentException("Each plugin needs installAs when name is missing");
                     }
                 }
+                enrichPluginFromInstalledJar(plugin);
             }
             restart.warnings.sort(Comparator.comparing((RestartWarning w) -> w.before).reversed());
         }
@@ -274,9 +275,35 @@ public final class VelocityAutoUpdater {
                 plugin.required = false;
                 plugin.platform = inferredPluginPlatform(server);
                 plugin.autoDiscovered = true;
+                plugin.detectedPluginId = info.id;
+                plugin.detectedVersion = info.version;
+                plugin.detectedWebsite = info.website;
                 plugins.add(plugin);
                 configured.add(normalizedConfigPath(installAs));
                 Log.info("Auto-discovered installed plugin: " + plugin.name + " -> " + plugin.installAs);
+            }
+        }
+
+        private void enrichPluginFromInstalledJar(TargetConfig plugin) {
+            if (plugin.installAs == null || plugin.installAs.isBlank()) {
+                return;
+            }
+            Path jar = resolve(Paths.get(plugin.installAs));
+            if (!Files.isRegularFile(jar)) {
+                return;
+            }
+            PluginJarInfo info = readPluginJarInfo(jar);
+            if ((plugin.name == null || plugin.name.isBlank() || isAutoValue(plugin.name)) && !info.name.isBlank()) {
+                plugin.name = info.name;
+            }
+            if (plugin.detectedPluginId == null || plugin.detectedPluginId.isBlank()) {
+                plugin.detectedPluginId = info.id;
+            }
+            if (plugin.detectedVersion == null || plugin.detectedVersion.isBlank()) {
+                plugin.detectedVersion = info.version;
+            }
+            if (plugin.detectedWebsite == null || plugin.detectedWebsite.isBlank()) {
+                plugin.detectedWebsite = info.website;
             }
         }
 
@@ -327,6 +354,9 @@ public final class VelocityAutoUpdater {
         String javaArgs = "";
         String args = "";
         boolean autoDiscovered;
+        String detectedPluginId;
+        String detectedVersion;
+        String detectedWebsite;
 
         TargetConfig(String name, boolean server) {
             this.name = name;
@@ -360,6 +390,9 @@ public final class VelocityAutoUpdater {
             copy.javaArgs = javaArgs;
             copy.args = args;
             copy.autoDiscovered = autoDiscovered;
+            copy.detectedPluginId = detectedPluginId;
+            copy.detectedVersion = detectedVersion;
+            copy.detectedWebsite = detectedWebsite;
             return copy;
         }
     }
@@ -740,10 +773,38 @@ public final class VelocityAutoUpdater {
     }
 
     private static final class PluginJarInfo {
+        final String id;
         final String name;
+        final String version;
+        final String website;
 
-        PluginJarInfo(String name) {
-            this.name = firstNonBlank(name, "UnknownPlugin");
+        PluginJarInfo(String id, String name, String version, String website) {
+            this.id = firstNonBlank(id, "");
+            this.name = firstNonBlank(name, "");
+            this.version = firstNonBlank(version, "");
+            this.website = firstNonBlank(website, "");
+        }
+    }
+
+    private static final class DiscoveryCandidate {
+        final String type;
+        final String source;
+        final String projectHint;
+        final String latestVersion;
+        final String label;
+        final String reason;
+        final int score;
+        final int priority;
+
+        DiscoveryCandidate(String type, String source, String projectHint, String latestVersion, String label, String reason, int score, int priority) {
+            this.type = type;
+            this.source = source;
+            this.projectHint = projectHint;
+            this.latestVersion = latestVersion;
+            this.label = label;
+            this.reason = reason;
+            this.score = score;
+            this.priority = priority;
         }
     }
 
@@ -816,11 +877,31 @@ public final class VelocityAutoUpdater {
                 } else {
                     Log.info("Current source: none");
                 }
-                if (target.autoDiscovered) {
+                List<DiscoveryCandidate> discovered = discoverSourceCandidates(target);
+                DiscoveryCandidate best = discovered.isEmpty() ? null : discovered.get(0);
+                if (best != null) {
+                    Log.info("Best discovered source: " + best.type + " -> " + best.source
+                        + " (score " + best.score + ", latest=" + firstNonBlank(best.latestVersion, "unknown") + ")");
+                    Log.info("Why: " + best.reason);
+                } else if (target.source == null || target.source.isBlank() || isAutoValue(target.source)) {
+                    Log.warn("No reliable hosted source found. Keeping source empty until you set one manually.");
+                }
+                if (discovered.size() > 1) {
+                    int shown = Math.min(3, discovered.size());
+                    for (int i = 1; i < shown; i++) {
+                        DiscoveryCandidate candidate = discovered.get(i);
+                        Log.info("Alternate source: " + candidate.type + " -> " + candidate.source
+                            + " (score " + candidate.score + ", latest=" + firstNonBlank(candidate.latestVersion, "unknown") + ")");
+                    }
+                }
+                if (target.autoDiscovered || target.source == null || target.source.isBlank() || isAutoValue(target.source)) {
                     Log.info("Suggested config entry:");
                     Log.info("  - name: " + target.displayName());
-                    Log.info("    source: \"\"");
+                    Log.info("    source: " + quoteYaml(best == null ? "" : best.source));
                     Log.info("    type: auto");
+                    if (best != null && best.type.equals("github-release") && !best.projectHint.isBlank()) {
+                        Log.info("    githubRepo: " + best.projectHint);
+                    }
                     if (target.platform != null && !target.platform.isBlank()) {
                         Log.info("    platform: " + target.platform);
                     }
@@ -847,6 +928,497 @@ public final class VelocityAutoUpdater {
                     Log.warn("autoSwitchSource is enabled. This jar still only auto-switches among explicitly configured fallbackSources.");
                 }
             }
+        }
+
+        private List<DiscoveryCandidate> discoverSourceCandidates(TargetConfig target) {
+            List<DiscoveryCandidate> candidates = new ArrayList<>();
+            Set<String> seen = new HashSet<>();
+            if (target.detectedWebsite != null && !target.detectedWebsite.isBlank()) {
+                addWebsiteCandidate(target, target.detectedWebsite, candidates, seen, 0);
+            }
+            List<String> priority = config.discovery.sourcePriority.isEmpty()
+                ? List.of("github-release", "hangar", "modrinth", "spigot")
+                : config.discovery.sourcePriority;
+            for (int i = 0; i < priority.size(); i++) {
+                String type = lower(priority.get(i));
+                try {
+                    switch (type) {
+                        case "github":
+                        case "github-release":
+                            addCandidates(discoverGithubSources(target, i), candidates, seen);
+                            break;
+                        case "hangar":
+                            addCandidates(discoverHangarSources(target, i), candidates, seen);
+                            break;
+                        case "modrinth":
+                            addCandidates(discoverModrinthSources(target, i), candidates, seen);
+                            break;
+                        case "spigot":
+                        case "spiget":
+                            addCandidates(discoverSpigotSources(target, i), candidates, seen);
+                            break;
+                        default:
+                            Log.warn("Unknown discovery source priority entry: " + type);
+                            break;
+                    }
+                } catch (Exception ex) {
+                    Log.warn("Discovery provider " + type + " failed for " + target.displayName() + ": " + ex.getMessage());
+                }
+            }
+            candidates.sort(Comparator
+                .comparingInt((DiscoveryCandidate c) -> c.priority)
+                .thenComparing(Comparator.comparingInt((DiscoveryCandidate c) -> c.score).reversed())
+                .thenComparing(c -> c.type));
+            return candidates;
+        }
+
+        private void addCandidates(List<DiscoveryCandidate> source, List<DiscoveryCandidate> candidates, Set<String> seen) {
+            for (DiscoveryCandidate candidate : source) {
+                if (candidate.score < 50) {
+                    Log.info("Ignoring weak/stale " + candidate.type + " candidate for " + candidate.label + " (" + candidate.reason + ")");
+                    continue;
+                }
+                String key = lower(candidate.type + "|" + candidate.source);
+                if (seen.add(key)) {
+                    candidates.add(candidate);
+                }
+            }
+        }
+
+        private void addWebsiteCandidate(TargetConfig target, String website, List<DiscoveryCandidate> candidates, Set<String> seen, int priority) {
+            String lowerWebsite = lower(website);
+            try {
+                if (lowerWebsite.contains("github.com/")) {
+                    GithubRepo repo = repoFromGithubUrl(website);
+                    latestGithubCandidate(target, repo, priority, "plugin metadata website").ifPresent(candidate -> addCandidates(List.of(candidate), candidates, seen));
+                } else if (lowerWebsite.contains("hangar.papermc.io/")) {
+                    TargetConfig candidateTarget = target.copyWithSource(website);
+                    ResolvedDownload download = new HangarResolver(config, client).resolve(candidateTarget);
+                    addCandidates(List.of(candidateFromResolved(target, "hangar", website, "", latestFromLabel(download.label), download.label, priority, "plugin metadata website")), candidates, seen);
+                } else if (lowerWebsite.contains("modrinth.com/")) {
+                    TargetConfig candidateTarget = target.copyWithSource(website);
+                    ResolvedDownload download = new ModrinthResolver(config, client).resolve(candidateTarget);
+                    addCandidates(List.of(candidateFromResolved(target, "modrinth", website, "", latestFromLabel(download.label), download.label, priority, "plugin metadata website")), candidates, seen);
+                } else if (lowerWebsite.contains("spigotmc.org/resources") || lowerWebsite.contains("api.spiget.org/")) {
+                    addCandidates(List.of(spigotCandidateFromSource(target, website, priority, "plugin metadata website")), candidates, seen);
+                }
+            } catch (Exception ex) {
+                Log.warn("Metadata website did not resolve for " + target.displayName() + ": " + website + " (" + ex.getMessage() + ")");
+            }
+        }
+
+        private List<DiscoveryCandidate> discoverGithubSources(TargetConfig target, int priority) throws Exception {
+            List<DiscoveryCandidate> candidates = new ArrayList<>();
+            if (target.githubRepo != null && !target.githubRepo.isBlank()) {
+                latestGithubCandidate(target, repoFromGithubValue(target.githubRepo), priority, "configured githubRepo").ifPresent(candidates::add);
+            }
+            for (String term : discoverySearchTerms(target)) {
+                URI uri = URI.create("https://api.github.com/search/repositories?q="
+                    + urlEncode(term + " minecraft plugin")
+                    + "&per_page=8");
+                Object json = getJson(uri, "GitHub repository search");
+                Object itemsObj = asMap(json).get("items");
+                if (!(itemsObj instanceof List<?> items)) {
+                    continue;
+                }
+                for (Object item : items) {
+                    Map<String, Object> repoMap = asMap(item);
+                    if (Boolean.TRUE.equals(repoMap.get("archived")) || Boolean.TRUE.equals(repoMap.get("disabled"))) {
+                        continue;
+                    }
+                    String fullName = stringValue(repoMap.get("full_name"));
+                    if (!fullName.contains("/")) {
+                        continue;
+                    }
+                    String name = stringValue(repoMap.get("name"));
+                    int match = nameMatchScore(target, name, fullName);
+                    if (match < 35) {
+                        continue;
+                    }
+                    latestGithubCandidate(target, repoFromGithubValue(fullName), priority, "GitHub search match: " + name).ifPresent(candidates::add);
+                }
+            }
+            return candidates;
+        }
+
+        private Optional<DiscoveryCandidate> latestGithubCandidate(TargetConfig target, GithubRepo repo, int priority, String reason) {
+            try {
+                URI uri = URI.create("https://api.github.com/repos/" + urlEncode(repo.owner) + "/" + urlEncode(repo.name) + "/releases?per_page=10");
+                Object json = getJson(uri, "GitHub releases");
+                if (!(json instanceof List<?> releases)) {
+                    return Optional.empty();
+                }
+                for (Object item : releases) {
+                    Map<String, Object> release = asMap(item);
+                    if (Boolean.TRUE.equals(release.get("draft"))) {
+                        continue;
+                    }
+                    if (target.versionType == null || target.versionType.isBlank()) {
+                        if (Boolean.TRUE.equals(release.get("prerelease"))) {
+                            continue;
+                        }
+                    }
+                    Optional<Map<String, Object>> asset = githubJarAsset(release);
+                    if (asset.isEmpty()) {
+                        continue;
+                    }
+                    String version = firstNonBlank(stringValue(release.get("tag_name")), stringValue(release.get("name")));
+                    String source = "https://github.com/" + repo.owner + "/" + repo.name;
+                    String label = repo.owner + "/" + repo.name + " " + version + " " + stringValue(asset.get().get("name"));
+                    return Optional.of(candidateFromResolved(target, "github-release", source, repo.owner + "/" + repo.name, version, label, priority, reason));
+                }
+            } catch (Exception ex) {
+                Log.warn("GitHub releases lookup failed for " + repo.owner + "/" + repo.name + ": " + ex.getMessage());
+            }
+            return Optional.empty();
+        }
+
+        private Optional<Map<String, Object>> githubJarAsset(Map<String, Object> release) {
+            Object assetsObj = release.get("assets");
+            if (!(assetsObj instanceof List<?> assets)) {
+                return Optional.empty();
+            }
+            List<Map<String, Object>> jars = new ArrayList<>();
+            for (Object item : assets) {
+                Map<String, Object> asset = asMap(item);
+                String name = lower(stringValue(asset.get("name")));
+                if (!name.endsWith(".jar")) {
+                    continue;
+                }
+                if (name.contains("sources") || name.contains("javadoc") || name.contains("-dev") || name.contains("-plain")) {
+                    continue;
+                }
+                jars.add(asset);
+            }
+            return jars.isEmpty() ? Optional.empty() : Optional.of(jars.get(0));
+        }
+
+        private List<DiscoveryCandidate> discoverModrinthSources(TargetConfig target, int priority) throws Exception {
+            List<DiscoveryCandidate> candidates = new ArrayList<>();
+            for (String term : discoverySearchTerms(target)) {
+                URI uri = URI.create("https://api.modrinth.com/v2/search?query="
+                    + urlEncode(term)
+                    + "&facets=" + urlEncode("[[\"project_type:plugin\"]]")
+                    + "&index=relevance&limit=8");
+                Object json = getJson(uri, "Modrinth search");
+                Object hitsObj = asMap(json).get("hits");
+                if (!(hitsObj instanceof List<?> hits)) {
+                    continue;
+                }
+                for (Object item : hits) {
+                    Map<String, Object> hit = asMap(item);
+                    String slug = stringValue(hit.get("slug"));
+                    String title = stringValue(hit.get("title"));
+                    String projectId = stringValue(hit.get("project_id"));
+                    if (slug.isBlank()) {
+                        continue;
+                    }
+                    int match = nameMatchScore(target, title, slug, projectId);
+                    if (match < 35) {
+                        continue;
+                    }
+                    TargetConfig candidateTarget = target.copyWithSource("https://modrinth.com/plugin/" + slug + "/versions");
+                    candidateTarget.project = slug;
+                    if (candidateTarget.loader == null || candidateTarget.loader.isBlank()) {
+                        candidateTarget.loader = target.platform;
+                    }
+                    try {
+                        ResolvedDownload download = new ModrinthResolver(config, client).resolve(candidateTarget);
+                        String latest = latestFromLabel(download.label);
+                        candidates.add(candidateFromResolved(target, "modrinth", candidateTarget.source, slug, latest, title, priority, "Modrinth search match: " + title));
+                    } catch (Exception ex) {
+                        Log.warn("Modrinth candidate did not resolve for " + slug + ": " + ex.getMessage());
+                    }
+                }
+            }
+            return candidates;
+        }
+
+        private List<DiscoveryCandidate> discoverHangarSources(TargetConfig target, int priority) throws Exception {
+            List<DiscoveryCandidate> candidates = new ArrayList<>();
+            for (String term : discoverySearchTerms(target)) {
+                URI uri = URI.create("https://hangar.papermc.io/api/v1/projects?limit=8&offset=0&q=" + urlEncode(term));
+                Object json = getJson(uri, "Hangar search");
+                Object resultObj = asMap(json).get("result");
+                if (!(resultObj instanceof List<?> results)) {
+                    continue;
+                }
+                for (Object item : results) {
+                    Map<String, Object> project = asMap(item);
+                    HangarProject hangarProject = hangarProjectFromSearch(project);
+                    if (hangarProject == null) {
+                        continue;
+                    }
+                    String name = firstNonBlank(stringValue(project.get("name")), hangarProject.slug);
+                    int match = nameMatchScore(target, name, hangarProject.slug, hangarProject.owner + "/" + hangarProject.slug);
+                    if (match < 35) {
+                        continue;
+                    }
+                    String source = "https://hangar.papermc.io/" + hangarProject.owner + "/" + hangarProject.slug + "/versions";
+                    TargetConfig candidateTarget = target.copyWithSource(source);
+                    candidateTarget.project = hangarProject.owner + "/" + hangarProject.slug;
+                    try {
+                        ResolvedDownload download = new HangarResolver(config, client).resolve(candidateTarget);
+                        String latest = latestFromLabel(download.label);
+                        candidates.add(candidateFromResolved(target, "hangar", source, candidateTarget.project, latest, name, priority, "Hangar search match: " + name));
+                    } catch (Exception ex) {
+                        Log.warn("Hangar candidate did not resolve for " + hangarProject.owner + "/" + hangarProject.slug + ": " + ex.getMessage());
+                    }
+                }
+            }
+            return candidates;
+        }
+
+        private List<DiscoveryCandidate> discoverSpigotSources(TargetConfig target, int priority) throws Exception {
+            List<DiscoveryCandidate> candidates = new ArrayList<>();
+            for (String term : discoverySearchTerms(target)) {
+                URI uri = URI.create("https://api.spiget.org/v2/search/resources/" + urlEncode(term) + "?field=name&size=8");
+                Object json = getJson(uri, "Spiget search");
+                if (!(json instanceof List<?> resources)) {
+                    continue;
+                }
+                for (Object item : resources) {
+                    Map<String, Object> resource = asMap(item);
+                    String id = normalizeNumericId(stringValue(resource.get("id")));
+                    String name = stringValue(resource.get("name"));
+                    if (id.isBlank()) {
+                        continue;
+                    }
+                    int match = nameMatchScore(target, name, id);
+                    if (match < 35) {
+                        continue;
+                    }
+                    String source = "https://www.spigotmc.org/resources/" + safeName(name).toLowerCase(Locale.ROOT) + "." + id + "/";
+                    candidates.add(spigotCandidateFromSource(target, source, priority, "Spigot search match: " + name));
+                }
+            }
+            return candidates;
+        }
+
+        private DiscoveryCandidate spigotCandidateFromSource(TargetConfig target, String source, int priority, String reason) throws Exception {
+            String id = normalizeNumericId(new SpigetResolver().inferResourceId(source));
+            String latest = "";
+            String label = "Spigot resource " + id;
+            if (!id.isBlank()) {
+                try {
+                    Object resource = getJson(URI.create("https://api.spiget.org/v2/resources/" + urlEncode(id)), "Spiget resource");
+                    if (resource instanceof Map<?, ?> map) {
+                        Map<String, Object> resourceMap = castStringMap(map);
+                        latest = stringValue(resourceMap.get("version"));
+                        label = firstNonBlank(stringValue(resourceMap.get("name")), label);
+                    }
+                } catch (Exception ignored) {
+                    // The download URL may still work even if the metadata lookup does not.
+                }
+                if (latest.isBlank()) {
+                    try {
+                        Object version = getJson(URI.create("https://api.spiget.org/v2/resources/" + urlEncode(id) + "/versions/latest"), "Spiget latest version");
+                        if (version instanceof Map<?, ?> map) {
+                            latest = stringValue(castStringMap(map).get("name"));
+                        }
+                    } catch (Exception ignored) {
+                        // Latest version is optional for scoring.
+                    }
+                }
+            }
+            return candidateFromResolved(target, "spigot", source, id, latest, label, priority, reason);
+        }
+
+        private DiscoveryCandidate candidateFromResolved(TargetConfig target, String type, String source, String projectHint, String latestVersion, String label, int priority, String reason) {
+            int match = nameMatchScore(target, label, source, projectHint);
+            int score = 35 + match - (priority * 3);
+            String localVersion = target.detectedVersion == null ? "" : target.detectedVersion;
+            String versionReason = "";
+            if (!localVersion.isBlank() && !latestVersion.isBlank()) {
+                if (isClearlyOlderVersion(latestVersion, localVersion)) {
+                    score -= 100;
+                    versionReason = "; rejected-looking version: latest " + latestVersion + " appears older than local " + localVersion;
+                } else {
+                    int cmp = compareVersionValues(cleanVersion(latestVersion), cleanVersion(localVersion));
+                    if (cmp == 0) {
+                        score += 25;
+                        versionReason = "; version matches local " + localVersion;
+                    } else if (cmp > 0) {
+                        score += 15;
+                        versionReason = "; latest " + latestVersion + " appears newer than local " + localVersion;
+                    } else {
+                        versionReason = "; latest " + latestVersion + " is not clearly newer than local " + localVersion;
+                    }
+                }
+            } else if (!localVersion.isBlank()) {
+                score -= 25;
+                versionReason = "; no comparable latest version found while local version is " + localVersion;
+            }
+            String fullReason = reason + "; name match score " + match + versionReason;
+            return new DiscoveryCandidate(type, source, projectHint, latestVersion, label, fullReason, score, priority);
+        }
+
+        private Object getJson(URI uri, String apiName) throws Exception {
+            HttpRequest request = HttpRequest.newBuilder(uri)
+                .timeout(Duration.ofSeconds(45))
+                .header("User-Agent", config.userAgent)
+                .header("Accept", "application/json")
+                .GET()
+                .build();
+            HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            int status = response.statusCode();
+            if (status < 200 || status >= 300) {
+                throw new IOException(apiName + " failed with HTTP " + status + " for " + uri);
+            }
+            return new JsonParser(response.body()).parse();
+        }
+
+        private GithubRepo repoFromGithubUrl(String value) {
+            List<String> parts = pathParts(URI.create(value));
+            if (parts.size() < 2) {
+                throw new IllegalArgumentException("GitHub URL needs owner/repo: " + value);
+            }
+            return new GithubRepo(parts.get(0), parts.get(1).replace(".git", ""));
+        }
+
+        private GithubRepo repoFromGithubValue(String value) {
+            if (value.contains("github.com/")) {
+                return repoFromGithubUrl(value);
+            }
+            String[] parts = value.split("/", 2);
+            if (parts.length != 2) {
+                throw new IllegalArgumentException("GitHub repo needs Owner/Repo: " + value);
+            }
+            return new GithubRepo(parts[0], parts[1].replace(".git", ""));
+        }
+
+        private HangarProject hangarProjectFromSearch(Map<String, Object> project) {
+            Object namespaceObj = project.get("namespace");
+            if (namespaceObj instanceof Map<?, ?> rawNamespace) {
+                Map<String, Object> namespace = castStringMap(rawNamespace);
+                String owner = firstNonBlank(stringValue(namespace.get("owner")), stringValue(namespace.get("ownerName")), stringValue(namespace.get("author")));
+                String slug = firstNonBlank(stringValue(namespace.get("slug")), stringValue(namespace.get("project")), stringValue(project.get("slug")), stringValue(project.get("name")));
+                if (!owner.isBlank() && !slug.isBlank()) {
+                    return new HangarProject(owner, slug);
+                }
+            } else if (namespaceObj != null) {
+                String namespace = stringValue(namespaceObj);
+                if (namespace.contains("/")) {
+                    String[] parts = namespace.split("/", 2);
+                    return new HangarProject(parts[0], parts[1]);
+                }
+            }
+            String owner = firstNonBlank(stringValue(project.get("owner")), stringValue(project.get("ownerName")), stringValue(project.get("author")));
+            String slug = firstNonBlank(stringValue(project.get("slug")), stringValue(project.get("name")));
+            if (!owner.isBlank() && !slug.isBlank()) {
+                return new HangarProject(owner, slug);
+            }
+            return null;
+        }
+
+        private List<String> discoverySearchTerms(TargetConfig target) {
+            List<String> terms = new ArrayList<>();
+            addSearchTerm(terms, target.detectedPluginId);
+            addSearchTerm(terms, target.name);
+            addSearchTerm(terms, target.installAs == null ? "" : stripJarName(target.installAs));
+            return terms;
+        }
+
+        private void addSearchTerm(List<String> terms, String value) {
+            String cleaned = cleanSearchTerm(value);
+            if (cleaned.isBlank()) {
+                return;
+            }
+            if (terms.stream().noneMatch(existing -> existing.equalsIgnoreCase(cleaned))) {
+                terms.add(cleaned);
+            }
+        }
+
+        private String cleanSearchTerm(String value) {
+            String cleaned = value == null ? "" : value;
+            cleaned = cleaned.replace('\\', '/');
+            int slash = cleaned.lastIndexOf('/');
+            if (slash >= 0) {
+                cleaned = cleaned.substring(slash + 1);
+            }
+            if (cleaned.toLowerCase(Locale.ROOT).endsWith(".jar")) {
+                cleaned = cleaned.substring(0, cleaned.length() - 4);
+            }
+            cleaned = cleaned.replaceAll("(?i)[-_ ]?(bukkit|paper|spigot|folia|velocity|plugin)$", "");
+            cleaned = cleaned.replaceAll("(?i)[-_ ]?v?\\d+(\\.\\d+){0,4}.*$", "");
+            return cleaned.trim();
+        }
+
+        private String stripJarName(String value) {
+            return cleanSearchTerm(value);
+        }
+
+        private int nameMatchScore(TargetConfig target, String... candidateValues) {
+            List<String> needles = new ArrayList<>();
+            addNormalizedName(needles, target.detectedPluginId);
+            addNormalizedName(needles, target.name);
+            addNormalizedName(needles, stripJarName(target.installAs));
+            int best = 0;
+            for (String needle : needles) {
+                if (needle.length() < 3) {
+                    continue;
+                }
+                for (String value : candidateValues) {
+                    String haystack = normalizeName(value);
+                    if (haystack.isBlank()) {
+                        continue;
+                    }
+                    if (haystack.equals(needle)) {
+                        best = Math.max(best, 60);
+                    } else if (haystack.contains(needle) || needle.contains(haystack)) {
+                        best = Math.max(best, Math.min(45, 20 + Math.min(needle.length(), haystack.length())));
+                    }
+                }
+            }
+            return best;
+        }
+
+        private void addNormalizedName(List<String> names, String value) {
+            String normalized = normalizeName(cleanSearchTerm(value));
+            if (!normalized.isBlank() && names.stream().noneMatch(existing -> existing.equals(normalized))) {
+                names.add(normalized);
+            }
+        }
+
+        private String normalizeName(String value) {
+            return value == null ? "" : value.toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]+", "");
+        }
+
+        private String normalizeNumericId(String value) {
+            if (value == null) {
+                return "";
+            }
+            String trimmed = value.trim();
+            if (trimmed.matches("\\d+\\.0+")) {
+                return trimmed.substring(0, trimmed.indexOf('.'));
+            }
+            return trimmed;
+        }
+
+        private String latestFromLabel(String label) {
+            if (label == null || label.isBlank()) {
+                return "";
+            }
+            List<String> tokens = List.of(label.split("\\s+"));
+            for (String token : tokens) {
+                String cleaned = cleanVersion(token);
+                if (!cleaned.isBlank() && cleaned.matches(".*\\d.*")) {
+                    return cleaned;
+                }
+            }
+            return "";
+        }
+
+        private boolean isClearlyOlderVersion(String candidate, String local) {
+            String cleanedCandidate = cleanVersion(candidate);
+            String cleanedLocal = cleanVersion(local);
+            if (cleanedCandidate.isBlank() || cleanedLocal.isBlank()) {
+                return false;
+            }
+            if (!cleanedCandidate.matches(".*\\d.*") || !cleanedLocal.matches(".*\\d.*")) {
+                return false;
+            }
+            return compareVersionValues(cleanedCandidate, cleanedLocal) < 0;
         }
 
         void updateAll() throws Exception {
@@ -2268,6 +2840,28 @@ public final class VelocityAutoUpdater {
         return cleaned;
     }
 
+    private static String cleanVersion(String value) {
+        if (value == null) {
+            return "";
+        }
+        String cleaned = value.trim();
+        cleaned = cleaned.replaceFirst("(?i)^version[:=]", "");
+        cleaned = cleaned.replaceFirst("(?i)^release[-_ ]?", "");
+        cleaned = cleaned.replaceFirst("(?i)^v(?=\\d)", "");
+        cleaned = cleaned.replaceAll("[^A-Za-z0-9._+-]+", "");
+        return cleaned;
+    }
+
+    private static String quoteYaml(String value) {
+        if (value == null || value.isBlank()) {
+            return "\"\"";
+        }
+        if (value.matches("[A-Za-z0-9_./:@?=&%+,-]+")) {
+            return value;
+        }
+        return "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
+    }
+
     private static String lower(String value) {
         return value == null ? "" : value.toLowerCase(Locale.ROOT);
     }
@@ -2392,32 +2986,38 @@ public final class VelocityAutoUpdater {
         String filename = jar.getFileName().toString();
         String fallbackName = filename.substring(0, filename.length() - ".jar".length());
         try (JarFile file = new JarFile(jar.toFile())) {
-            String velocityName = readVelocityPluginName(file);
-            if (!velocityName.isBlank()) {
-                return new PluginJarInfo(velocityName);
+            PluginJarInfo velocityInfo = readVelocityPluginInfo(file);
+            if (!velocityInfo.name.isBlank() || !velocityInfo.id.isBlank()) {
+                return new PluginJarInfo(velocityInfo.id, firstNonBlank(velocityInfo.name, velocityInfo.id), velocityInfo.version, velocityInfo.website);
             }
             for (String entry : List.of("paper-plugin.yml", "plugin.yml", "bungee.yml")) {
                 String name = readYamlEntryValue(file, entry, "name");
                 if (!name.isBlank()) {
-                    return new PluginJarInfo(name);
+                    String version = readYamlEntryValue(file, entry, "version");
+                    String website = readYamlEntryValue(file, entry, "website");
+                    return new PluginJarInfo(name, name, version, website);
                 }
             }
         } catch (IOException ex) {
             Log.warn("Could not inspect plugin jar " + jar.getFileName() + ": " + ex.getMessage());
         }
-        return new PluginJarInfo(fallbackName);
+        return new PluginJarInfo(fallbackName, fallbackName, "", "");
     }
 
-    private static String readVelocityPluginName(JarFile file) throws IOException {
+    private static PluginJarInfo readVelocityPluginInfo(JarFile file) throws IOException {
         String text = readJarEntry(file, "velocity-plugin.json");
         if (text.isBlank()) {
-            return "";
+            return new PluginJarInfo("", "", "", "");
         }
         try {
             Map<String, Object> json = asMap(new JsonParser(text).parse());
-            return firstNonBlank(stringValue(json.get("name")), stringValue(json.get("id")));
+            String id = stringValue(json.get("id"));
+            String name = stringValue(json.get("name"));
+            String version = stringValue(json.get("version"));
+            String website = firstNonBlank(stringValue(json.get("url")), stringValue(json.get("website")));
+            return new PluginJarInfo(id, name, version, website);
         } catch (RuntimeException ex) {
-            return "";
+            return new PluginJarInfo("", "", "", "");
         }
     }
 
@@ -2820,11 +3420,12 @@ public final class VelocityAutoUpdater {
             #     Report suggestions without rewriting your config.
             #
             # discovery.sourcePriority
-            #   Preferred order when comparing possible update sources.
+            #   Preferred order when choosing good discovered plugin sources.
             #   Supported source families: github-release, hangar, modrinth, spigot.
             #
             # discovery.checkAlternateSourcesWhenOutdated
-            #   If true, discovery can warn when a configured source appears stale.
+            #   If true, discovery compares version strings where APIs expose them and
+            #   rejects sources that look clearly older than the installed plugin jar.
             #
             # discovery.outdatedThresholdDays
             #   How old a source can look before discovery treats it as stale.
@@ -2836,7 +3437,8 @@ public final class VelocityAutoUpdater {
             # discovery.scanInstalledPlugins
             #   If true, scans plugins/ for jars that are not already listed.
             #   It can fill name, installAs, platform, and required.
-            #   It does not guess the official source URL for those plugins.
+            #   It also searches GitHub, Hangar, Modrinth, and Spigot for likely update
+            #   sources, then prints the best YAML entry it can safely suggest.
             #
             # buildFromSource.enabled
             #   Future Git build switch. Keep false for hosted-safe behavior.
