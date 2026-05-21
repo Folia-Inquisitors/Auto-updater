@@ -26,6 +26,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.Enumeration;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -36,6 +37,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
 
 public final class VelocityAutoUpdater {
@@ -196,6 +198,7 @@ public final class VelocityAutoUpdater {
             if (server.source == null || server.source.isBlank()) {
                 Log.warn("No server.source configured. The updater will only launch the existing " + server.installAs + ".");
             }
+            autoAddInstalledPlugins();
             for (TargetConfig plugin : plugins) {
                 if (plugin.changeVersion == null) {
                     plugin.changeVersion = true;
@@ -212,17 +215,68 @@ public final class VelocityAutoUpdater {
         }
 
         private void applyServerAutoDefaults(TargetConfig server) {
+            ServerJarDetection detected = detectExistingServerJar(baseDir, server);
+            boolean sourceWasAuto = isAutoValue(server.source);
+            if ((server.project == null || server.project.isBlank()) && sourceWasAuto && detected.hasProject()) {
+                server.project = detected.project;
+            }
+            if (sourceWasAuto) {
+                if (detected.hasProject()) {
+                    server.source = paperMcDownloadSource(detected.project);
+                    Log.info("Auto-detected server source: " + server.source);
+                } else {
+                    server.source = "";
+                    Log.warn("server.source is auto, but no Paper/Folia/Velocity jar filename was detected. Set server.source manually to enable server jar updates.");
+                }
+            }
             String project = inferPaperMcProject(server);
+            if (project.isBlank() && detected.hasProject()) {
+                project = detected.project;
+            }
             if (server.name == null || server.name.isBlank() || lower(server.name).equals("auto")) {
                 server.name = project.isBlank() ? "Server" : title(project);
                 Log.info("Auto-detected server name: " + server.name);
             }
             if (server.installAs == null || server.installAs.isBlank() || lower(server.installAs).equals("auto")) {
-                server.installAs = project.isBlank() ? "server.jar" : project + ".jar";
+                server.installAs = sourceWasAuto && detected.path != null ? relativeConfigPath(baseDir, detected.path) : (project.isBlank() ? "server.jar" : project + ".jar");
                 Log.info("Auto-detected server jar filename: " + server.installAs);
             }
             if (server.gameVersion != null && lower(server.gameVersion).equals("auto")) {
                 Log.info("Server gameVersion is auto. The updater will use updater.lock.yml if present, otherwise it will lock the latest available PaperMC version on the next update.");
+            }
+        }
+
+        private void autoAddInstalledPlugins() {
+            if (!discovery.scanInstalledPlugins) {
+                return;
+            }
+            Path pluginDir = resolve(Paths.get("plugins"));
+            if (!Files.isDirectory(pluginDir)) {
+                return;
+            }
+            Set<String> configured = new HashSet<>();
+            for (TargetConfig plugin : plugins) {
+                if (plugin.installAs != null && !plugin.installAs.isBlank()) {
+                    configured.add(normalizedConfigPath(plugin.installAs));
+                }
+            }
+            List<Path> jars = listJarFiles(pluginDir);
+            for (Path jar : jars) {
+                String installAs = relativeConfigPath(baseDir, jar);
+                if (configured.contains(normalizedConfigPath(installAs))) {
+                    continue;
+                }
+                PluginJarInfo info = readPluginJarInfo(jar);
+                TargetConfig plugin = new TargetConfig(info.name, false);
+                plugin.installAs = installAs;
+                plugin.source = "";
+                plugin.type = "auto";
+                plugin.required = false;
+                plugin.platform = inferredPluginPlatform(server);
+                plugin.autoDiscovered = true;
+                plugins.add(plugin);
+                configured.add(normalizedConfigPath(installAs));
+                Log.info("Auto-discovered installed plugin: " + plugin.name + " -> " + plugin.installAs);
             }
         }
 
@@ -241,6 +295,7 @@ public final class VelocityAutoUpdater {
         boolean checkAlternateSourcesWhenOutdated = true;
         int outdatedThresholdDays = 14;
         boolean autoSwitchSource = false;
+        boolean scanInstalledPlugins = true;
     }
 
     private static final class BuildFromSourceConfig {
@@ -271,6 +326,7 @@ public final class VelocityAutoUpdater {
         String java = "java";
         String javaArgs = "";
         String args = "";
+        boolean autoDiscovered;
 
         TargetConfig(String name, boolean server) {
             this.name = name;
@@ -303,6 +359,7 @@ public final class VelocityAutoUpdater {
             copy.java = java;
             copy.javaArgs = javaArgs;
             copy.args = args;
+            copy.autoDiscovered = autoDiscovered;
             return copy;
         }
     }
@@ -527,6 +584,10 @@ public final class VelocityAutoUpdater {
                 case "auto_switch_source":
                     discovery.autoSwitchSource = parseBoolean(kv.value);
                     break;
+                case "scaninstalledplugins":
+                case "scan_installed_plugins":
+                    discovery.scanInstalledPlugins = parseBoolean(kv.value);
+                    break;
                 default:
                     throw new IllegalArgumentException("Unknown discovery key: " + kv.key);
             }
@@ -664,6 +725,28 @@ public final class VelocityAutoUpdater {
         }
     }
 
+    private static final class ServerJarDetection {
+        final Path path;
+        final String project;
+
+        ServerJarDetection(Path path, String project) {
+            this.path = path;
+            this.project = project == null ? "" : project;
+        }
+
+        boolean hasProject() {
+            return !project.isBlank();
+        }
+    }
+
+    private static final class PluginJarInfo {
+        final String name;
+
+        PluginJarInfo(String name) {
+            this.name = firstNonBlank(name, "UnknownPlugin");
+        }
+    }
+
     private static final class Updater {
         private final AppConfig config;
         private final HttpClient client;
@@ -680,6 +763,7 @@ public final class VelocityAutoUpdater {
             Log.info("Mode: " + config.mode);
             Log.info("Failure behavior: " + config.onFailure);
             Log.info("Discovery: " + (config.discovery.enabled ? "enabled (" + config.discovery.mode + ")" : "disabled"));
+            Log.info("Installed plugin scan: " + (config.discovery.scanInstalledPlugins ? "enabled" : "disabled"));
             Log.info("Build from source: " + (config.buildFromSource.enabled ? "enabled" : "disabled")
                 + ", preferHostedIfSameVersion=" + config.buildFromSource.preferHostedIfSameVersion);
             Log.info("Server install target: " + config.resolve(Paths.get(config.server.installAs)));
@@ -688,7 +772,7 @@ public final class VelocityAutoUpdater {
                     Log.info("Skipping disabled target: " + target.displayName());
                     continue;
                 }
-                if (target.source == null || target.source.isBlank()) {
+                if (target.source == null || target.source.isBlank() || isAutoValue(target.source)) {
                     Log.info(target.displayName() + ": no source configured, installAs=" + target.installAs);
                     continue;
                 }
@@ -709,6 +793,7 @@ public final class VelocityAutoUpdater {
             Log.info("Check alternate sources when outdated: " + config.discovery.checkAlternateSourcesWhenOutdated
                 + " after " + config.discovery.outdatedThresholdDays + " days");
             Log.info("Auto-switch source: " + config.discovery.autoSwitchSource);
+            Log.info("Scan installed plugins: " + config.discovery.scanInstalledPlugins);
             Log.info("Build from source: " + (config.buildFromSource.enabled ? "enabled" : "disabled")
                 + ", onlyTrusted=" + config.buildFromSource.onlyTrusted
                 + ", preferHostedIfSameVersion=" + config.buildFromSource.preferHostedIfSameVersion);
@@ -725,11 +810,22 @@ public final class VelocityAutoUpdater {
                 }
                 Log.info("");
                 Log.info("Discovery target: " + target.displayName());
-                if (target.source != null && !target.source.isBlank()) {
+                if (target.source != null && !target.source.isBlank() && !isAutoValue(target.source)) {
                     SourcePlan plan = resolveSource(target);
                     Log.info("Current source: " + plan.type + " -> " + plan.description);
                 } else {
                     Log.info("Current source: none");
+                }
+                if (target.autoDiscovered) {
+                    Log.info("Suggested config entry:");
+                    Log.info("  - name: " + target.displayName());
+                    Log.info("    source: \"\"");
+                    Log.info("    type: auto");
+                    if (target.platform != null && !target.platform.isBlank()) {
+                        Log.info("    platform: " + target.platform);
+                    }
+                    Log.info("    installAs: " + target.installAs);
+                    Log.info("    required: false");
                 }
                 if (target.githubRepo != null && !target.githubRepo.isBlank()) {
                     boolean trusted = isTrustedGithubRepo(target.githubRepo);
@@ -761,7 +857,7 @@ public final class VelocityAutoUpdater {
                     Log.info("Skipping disabled target: " + target.displayName());
                     continue;
                 }
-                if (target.source == null || target.source.isBlank()) {
+                if (target.source == null || target.source.isBlank() || isAutoValue(target.source)) {
                     Log.info("No source configured for " + target.displayName() + "; keeping existing jar.");
                     continue;
                 }
@@ -791,7 +887,7 @@ public final class VelocityAutoUpdater {
         }
 
         private void updateOne(TargetConfig target) throws Exception {
-            if (target.source == null || target.source.isBlank()) {
+            if (target.source == null || target.source.isBlank() || isAutoValue(target.source)) {
                 Log.info("No source configured for " + target.displayName() + "; keeping existing jar.");
                 return;
             }
@@ -2185,6 +2281,225 @@ public final class VelocityAutoUpdater {
         return "";
     }
 
+    private static boolean isAutoValue(String value) {
+        return value != null && value.trim().equalsIgnoreCase("auto");
+    }
+
+    private static ServerJarDetection detectExistingServerJar(Path baseDir, TargetConfig target) {
+        List<Path> candidates = new ArrayList<>();
+        Set<Path> seen = new HashSet<>();
+        if (target.installAs != null && !target.installAs.isBlank() && !isAutoValue(target.installAs)) {
+            addJarCandidate(baseDir, candidates, seen, Paths.get(target.installAs));
+        }
+        for (String filename : List.of("folia.jar", "paper.jar", "velocity.jar", "waterfall.jar", "server.jar")) {
+            addJarCandidate(baseDir, candidates, seen, Paths.get(filename));
+        }
+        for (Path jar : listJarFiles(baseDir)) {
+            String filename = lower(jar.getFileName().toString());
+            if (filename.equals("auto-updater.jar") || filename.equals("velocity-auto-updater.jar")) {
+                continue;
+            }
+            if (inferPaperMcProjectFromText(filename).isBlank() && !filename.equals("server.jar")) {
+                continue;
+            }
+            addJarCandidate(baseDir, candidates, seen, jar);
+        }
+
+        Path firstExisting = null;
+        for (Path candidate : candidates) {
+            if (!Files.isRegularFile(candidate)) {
+                continue;
+            }
+            if (firstExisting == null) {
+                firstExisting = candidate;
+            }
+            String project = inferPaperMcProjectFromText(candidate.getFileName().toString());
+            if (!project.isBlank()) {
+                return new ServerJarDetection(candidate, project);
+            }
+        }
+        for (Path candidate : candidates) {
+            if (!Files.isRegularFile(candidate)) {
+                continue;
+            }
+            String project = readServerProjectFromJar(candidate);
+            if (!project.isBlank()) {
+                return new ServerJarDetection(candidate, project);
+            }
+        }
+        return new ServerJarDetection(firstExisting, "");
+    }
+
+    private static void addJarCandidate(Path baseDir, List<Path> candidates, Set<Path> seen, Path path) {
+        Path candidate = path.isAbsolute() ? path.normalize() : baseDir.resolve(path).normalize();
+        if (seen.add(candidate)) {
+            candidates.add(candidate);
+        }
+    }
+
+    private static List<Path> listJarFiles(Path dir) {
+        if (!Files.isDirectory(dir)) {
+            return Collections.emptyList();
+        }
+        try (var stream = Files.list(dir)) {
+            return stream
+                .filter(Files::isRegularFile)
+                .filter(path -> lower(path.getFileName().toString()).endsWith(".jar"))
+                .sorted(Comparator.comparing(path -> lower(path.getFileName().toString())))
+                .toList();
+        } catch (IOException ex) {
+            Log.warn("Could not scan jar directory " + dir + ": " + ex.getMessage());
+            return Collections.emptyList();
+        }
+    }
+
+    private static String readServerProjectFromJar(Path jar) {
+        try (JarFile file = new JarFile(jar.toFile())) {
+            if (file.getManifest() != null) {
+                String mainClass = lower(file.getManifest().getMainAttributes().getValue("Main-Class"));
+                String title = lower(file.getManifest().getMainAttributes().getValue("Implementation-Title"));
+                String manifestText = mainClass + " " + title;
+                if (manifestText.contains("velocity")) {
+                    return "velocity";
+                }
+                if (manifestText.contains("folia")) {
+                    return "folia";
+                }
+                if (manifestText.contains("paper")) {
+                    return "paper";
+                }
+            }
+            Enumeration<JarEntry> entries = file.entries();
+            while (entries.hasMoreElements()) {
+                String name = lower(entries.nextElement().getName());
+                if (name.contains("com/velocitypowered/proxy/")) {
+                    return "velocity";
+                }
+                if (name.contains("io/papermc/folia/")) {
+                    return "folia";
+                }
+                if (name.contains("io/papermc/paperclip/") || name.contains("io/papermc/paper/")) {
+                    return "paper";
+                }
+            }
+        } catch (IOException ex) {
+            Log.warn("Could not inspect server jar " + jar.getFileName() + ": " + ex.getMessage());
+        }
+        return "";
+    }
+
+    private static PluginJarInfo readPluginJarInfo(Path jar) {
+        String filename = jar.getFileName().toString();
+        String fallbackName = filename.substring(0, filename.length() - ".jar".length());
+        try (JarFile file = new JarFile(jar.toFile())) {
+            String velocityName = readVelocityPluginName(file);
+            if (!velocityName.isBlank()) {
+                return new PluginJarInfo(velocityName);
+            }
+            for (String entry : List.of("paper-plugin.yml", "plugin.yml", "bungee.yml")) {
+                String name = readYamlEntryValue(file, entry, "name");
+                if (!name.isBlank()) {
+                    return new PluginJarInfo(name);
+                }
+            }
+        } catch (IOException ex) {
+            Log.warn("Could not inspect plugin jar " + jar.getFileName() + ": " + ex.getMessage());
+        }
+        return new PluginJarInfo(fallbackName);
+    }
+
+    private static String readVelocityPluginName(JarFile file) throws IOException {
+        String text = readJarEntry(file, "velocity-plugin.json");
+        if (text.isBlank()) {
+            return "";
+        }
+        try {
+            Map<String, Object> json = asMap(new JsonParser(text).parse());
+            return firstNonBlank(stringValue(json.get("name")), stringValue(json.get("id")));
+        } catch (RuntimeException ex) {
+            return "";
+        }
+    }
+
+    private static String readYamlEntryValue(JarFile file, String entryName, String key) throws IOException {
+        String text = readJarEntry(file, entryName);
+        if (text.isBlank()) {
+            return "";
+        }
+        for (String raw : text.split("\\R")) {
+            String line = ConfigParser.stripComment(raw).trim();
+            if (line.isEmpty()) {
+                continue;
+            }
+            int colon = ConfigParser.findColon(line);
+            if (colon < 0) {
+                continue;
+            }
+            String foundKey = line.substring(0, colon).trim();
+            if (foundKey.equalsIgnoreCase(key)) {
+                return ConfigParser.unquote(line.substring(colon + 1).trim());
+            }
+        }
+        return "";
+    }
+
+    private static String readJarEntry(JarFile file, String entryName) throws IOException {
+        JarEntry entry = file.getJarEntry(entryName);
+        if (entry == null || entry.isDirectory()) {
+            return "";
+        }
+        try (InputStream in = file.getInputStream(entry)) {
+            return new String(in.readAllBytes(), StandardCharsets.UTF_8);
+        }
+    }
+
+    private static String relativeConfigPath(Path baseDir, Path path) {
+        Path absoluteBase = baseDir.toAbsolutePath().normalize();
+        Path absolutePath = path.toAbsolutePath().normalize();
+        try {
+            return normalizeSlashes(absoluteBase.relativize(absolutePath).toString());
+        } catch (IllegalArgumentException ex) {
+            return normalizeSlashes(absolutePath.toString());
+        }
+    }
+
+    private static String normalizedConfigPath(String path) {
+        String normalized = normalizeSlashes(path).trim();
+        while (normalized.startsWith("./")) {
+            normalized = normalized.substring(2);
+        }
+        return lower(normalized);
+    }
+
+    private static String normalizeSlashes(String value) {
+        return value.replace('\\', '/');
+    }
+
+    private static String inferredPluginPlatform(TargetConfig server) {
+        String project = inferPaperMcProject(server);
+        if (project.equals("velocity") || project.equals("waterfall")) {
+            return project;
+        }
+        if (project.equals("paper") || project.equals("folia")) {
+            return "paper";
+        }
+        return "";
+    }
+
+    private static String paperMcDownloadSource(String project) {
+        return "https://papermc.io/downloads/" + project;
+    }
+
+    private static String inferPaperMcProjectFromText(String text) {
+        String source = lower(text);
+        for (String project : List.of("folia", "velocity", "waterfall", "paper")) {
+            if (source.contains(project)) {
+                return project;
+            }
+        }
+        return "";
+    }
+
     private static String inferPaperMcProject(TargetConfig target) {
         String source = lower(firstNonBlank(target.source, target.project, target.name, target.installAs, ""));
         if (source.contains("papermc.io/downloads/")) {
@@ -2194,12 +2509,7 @@ public final class VelocityAutoUpdater {
                 return last;
             }
         }
-        for (String project : List.of("folia", "velocity", "waterfall", "paper")) {
-            if (source.contains(project)) {
-                return project;
-            }
-        }
-        return target.server ? "server" : "";
+        return inferPaperMcProjectFromText(source);
     }
 
     private static boolean isPaperMcProject(String value) {
@@ -2385,143 +2695,7 @@ public final class VelocityAutoUpdater {
         private static final String TEXT = """
             # Auto-Updater
             # Run with: java -jar auto-updater.jar run
-            #
-            # ---------------------------------------------------------------------------
-            # Field Guide
-            # ---------------------------------------------------------------------------
-            #
-            # mode
-            #   What the updater is allowed to do.
-            #
-            #   Options:
-            #     hosted-safe
-            #       Recommended for hosted panels and normal servers.
-            #       Only downloads ready-made jar files from websites/APIs.
-            #       It will NOT run Git, Gradle, Maven, or compile source code.
-            #
-            #     auto
-            #       Allows source auto-detection.
-            #       In this version, auto still only supports hosted/downloaded jars.
-            #
-            # onFailure
-            #   What happens if a jar cannot be updated.
-            #
-            #   Options:
-            #     keep-current
-            #       Recommended.
-            #       If the update fails but an old jar already exists, keep using the old jar.
-            #       This lets the server still start when a download site is temporarily down.
-            #
-            #     stop
-            #       Stop startup if an update fails.
-            #
-            # source
-            #   Where the updater gets the new jar from.
-            #
-            #   Examples:
-            #     PaperMC server jar:
-            #       https://papermc.io/downloads/folia
-            #       https://papermc.io/downloads/paper
-            #       https://papermc.io/downloads/velocity
-            #
-            #     Hangar plugin:
-            #       https://hangar.papermc.io/ViaVersion/ViaVersion/versions
-            #
-            #     GitHub release:
-            #       https://github.com/ViaVersion/ViaVersion
-            #
-            #     Modrinth plugin:
-            #       https://modrinth.com/plugin/fancyholograms/versions
-            #
-            #     SpigotMC resource:
-            #       https://www.spigotmc.org/resources/epichomes-26-1-x-support.109590/
-            #
-            #     Direct jar URL:
-            #       https://example.com/MyPlugin.jar
-            #
-            # type
-            #   Tells the updater how to understand the source.
-            #
-            #   Options:
-            #     auto
-            #       Recommended. Guesses the source type from the URL.
-            #
-            #     papermc
-            #       Treat source as PaperMC server software: Folia, Paper, Velocity, etc.
-            #
-            #     github-release
-            #       Treat source as a GitHub repo and download the latest release jar.
-            #
-            #     hangar
-            #       Treat source as a Hangar plugin page/API source.
-            #
-            #     modrinth
-            #       Treat source as a Modrinth project.
-            #
-            #     spigot
-            #       Treat source as a SpigotMC resource through the Spiget API.
-            #       This only works for resources Spiget can download without a login.
-            #
-            #     geysermc
-            #       Treat source as a GeyserMC download.
-            #
-            #     direct
-            #       Treat source as a direct jar download URL or local jar file.
-            #
-            # installAs
-            #   The exact file path and filename the downloaded jar will become.
-            #   This controls the final jar name.
-            #
-            #   For the server jar, installAs: auto uses the detected PaperMC project:
-            #     folia -> folia.jar
-            #     paper -> paper.jar
-            #     velocity -> velocity.jar
-            #
-            # fallbackSources
-            #   Optional comma-separated backup sources to try if the main source fails.
-            #
-            # discovery
-            #   Suggests source choices and reports fallback/trust policy.
-            #   This version only auto-tries sources explicitly listed in fallbackSources.
-            #
-            # buildFromSource
-            #   Safety settings for future Git build support.
-            #   Trusted means a GitHub org/repo you explicitly allow the updater to build.
-            #
-            # changeVersion
-            #   Server jar safety switch.
-            #
-            #   Options:
-            #     false
-            #       Recommended for production.
-            #       Stay on the configured gameVersion. The updater may install newer
-            #       builds for that same version, but it will not jump to another version.
-            #
-            #     true
-            #       Allow the server jar to move to the newest available version.
-            #
-            # gameVersion
-            #   For PaperMC server jars: the server version to stay on when changeVersion is false.
-            #   Set this to the Folia/Paper/Velocity version you intentionally want, or use auto.
-            #
-            #   With gameVersion: auto and changeVersion: false, the updater uses the newest
-            #   version on first install, writes updater.lock.yml, and then stays on that
-            #   locked version on future runs.
-            #
-            # platform
-            #   For Hangar plugins: which platform download to use. Common: paper, velocity, waterfall.
-            #
-            # loader
-            #   Optional Modrinth filter. Examples: paper, velocity, fabric.
-            #
-            # required
-            #   Controls what happens when this jar is missing and cannot be downloaded.
-            #
-            # restart.stopCommand
-            #   Folia/Paper usually use: stop
-            #   Velocity usually uses: shutdown
-            #
-            # ---------------------------------------------------------------------------
+            # The editable config is first. Detailed notes are at the bottom.
 
             mode: hosted-safe
             onFailure: keep-current
@@ -2534,6 +2708,7 @@ public final class VelocityAutoUpdater {
               checkAlternateSourcesWhenOutdated: true
               outdatedThresholdDays: 14
               autoSwitchSource: false
+              scanInstalledPlugins: true
 
             buildFromSource:
               enabled: false
@@ -2544,7 +2719,9 @@ public final class VelocityAutoUpdater {
 
             server:
               name: auto
-              source: https://papermc.io/downloads/folia
+              # source: auto detects an existing server jar. If this is a first
+              # install with no server jar yet, use a PaperMC URL from the examples above.
+              source: auto
               type: auto
               installAs: auto
               gameVersion: auto
@@ -2610,6 +2787,191 @@ public final class VelocityAutoUpdater {
                   command: "say Server restart in 5 minutes for updates."
                 - before: 1m
                   command: "say Server restart in 1 minute for updates."
+
+            # ---------------------------------------------------------------------------
+            # Config Notes
+            # ---------------------------------------------------------------------------
+            #
+            # mode
+            #   hosted-safe:
+            #     Recommended for hosted panels and normal servers.
+            #     Downloads ready-made jars only. It will not run Git, Gradle, Maven,
+            #     or compile source code.
+            #   auto:
+            #     Allows auto-detection features. In this version, updates still use
+            #     hosted/downloaded jars only.
+            #
+            # onFailure
+            #   keep-current:
+            #     Recommended. If an update fails and an old jar exists, keep using it.
+            #     This helps the server still start when a download site is down.
+            #   stop:
+            #     Stop startup if a required update cannot be completed.
+            #
+            # userAgent
+            #   Sent to download APIs. PaperMC asks automated clients to include a real
+            #   contact string, so replace your-email@example.com.
+            #
+            # discovery.enabled
+            #   Turns discovery reporting on or off.
+            #
+            # discovery.mode
+            #   suggest:
+            #     Report suggestions without rewriting your config.
+            #
+            # discovery.sourcePriority
+            #   Preferred order when comparing possible update sources.
+            #   Supported source families: github-release, hangar, modrinth, spigot.
+            #
+            # discovery.checkAlternateSourcesWhenOutdated
+            #   If true, discovery can warn when a configured source appears stale.
+            #
+            # discovery.outdatedThresholdDays
+            #   How old a source can look before discovery treats it as stale.
+            #
+            # discovery.autoSwitchSource
+            #   If false, the updater will not silently switch plugin sources.
+            #   This version only auto-tries sources listed in fallbackSources.
+            #
+            # discovery.scanInstalledPlugins
+            #   If true, scans plugins/ for jars that are not already listed.
+            #   It can fill name, installAs, platform, and required.
+            #   It does not guess the official source URL for those plugins.
+            #
+            # buildFromSource.enabled
+            #   Future Git build switch. Keep false for hosted-safe behavior.
+            #
+            # buildFromSource.onlyTrusted
+            #   Future safety switch. If building is enabled later, only trusted GitHub
+            #   orgs/repos should be allowed to run build scripts.
+            #
+            # buildFromSource.preferHostedIfSameVersion
+            #   Future optimization. If a trusted hosted jar matches the version that would
+            #   be built from Git, download the hosted jar and skip compiling.
+            #
+            # buildFromSource.trustedGithubOrgs / trustedGithubRepos
+            #   GitHub orgs/repos you explicitly trust for future source builds.
+            #
+            # server.name
+            #   Display name. Use auto to derive Paper, Folia, Velocity, etc.
+            #
+            # server.source
+            #   Where the server jar comes from.
+            #   auto:
+            #     Detects an existing paper.jar, folia.jar, velocity.jar, or waterfall.jar
+            #     and maps it to the matching PaperMC download source.
+            #   PaperMC examples:
+            #     https://papermc.io/downloads/folia
+            #     https://papermc.io/downloads/paper
+            #     https://papermc.io/downloads/velocity
+            #
+            # server.type
+            #   auto:
+            #     Recommended. Detects the source type from the URL.
+            #   papermc:
+            #     Treats source as PaperMC server software.
+            #
+            # server.installAs
+            #   Final server jar path/name. installAs: auto uses the detected jar name.
+            #
+            # server.gameVersion
+            #   auto:
+            #     On first install, lock the newest available PaperMC version in
+            #     updater.lock.yml. Future runs keep that locked version when
+            #     changeVersion is false.
+            #   Exact version:
+            #     Use a specific Minecraft/server version you intentionally want.
+            #
+            # server.changeVersion
+            #   false:
+            #     Recommended. Stay on the configured or locked gameVersion.
+            #   true:
+            #     Allow the server jar to jump to the newest available version.
+            #
+            # server.java
+            #   Java command used to launch the server. Usually java.
+            #
+            # server.javaArgs
+            #   JVM options/memory for the launched server.
+            #   If your host panel controls memory, set this to "".
+            #
+            # server.args
+            #   Extra arguments after the server jar name. Usually "".
+            #
+            # plugins[].name
+            #   Friendly display name. It does not have to match the jar filename.
+            #
+            # plugins[].source
+            #   Where the plugin jar comes from.
+            #   GitHub release example: https://github.com/ViaVersion/ViaVersion
+            #   Hangar example: https://hangar.papermc.io/ViaVersion/ViaVersion/versions
+            #   Modrinth example: https://modrinth.com/plugin/fancyholograms/versions
+            #   Spigot example: https://www.spigotmc.org/resources/epichomes-26-1-x-support.109590/
+            #   Direct jar example: https://example.com/MyPlugin.jar
+            #
+            # plugins[].type
+            #   auto:
+            #     Recommended. Detects the source type from the URL.
+            #   github-release:
+            #     Download the newest release jar from a GitHub repository.
+            #   hangar:
+            #     Download from Hangar.
+            #   modrinth:
+            #     Download from Modrinth.
+            #   spigot:
+            #     Download from Spigot through Spiget when available without login.
+            #   geysermc:
+            #     Use GeyserMC download endpoints.
+            #   direct:
+            #     Use a direct jar URL or local jar path.
+            #
+            # plugins[].githubRepo
+            #   Optional repo hint like Owner/Repo. Useful for discovery and GitHub sources.
+            #
+            # plugins[].platform
+            #   Platform for Hangar/GeyserMC downloads. Common: paper, velocity, waterfall.
+            #   For Folia plugins, paper is usually the closest platform.
+            #
+            # plugins[].loader
+            #   Modrinth loader filter. Examples: paper, velocity, fabric.
+            #
+            # plugins[].versionType
+            #   Optional Modrinth release type: release, beta, or alpha.
+            #
+            # plugins[].channel
+            #   Optional Hangar channel filter. If omitted, Release builds are preferred.
+            #
+            # plugins[].fallbackSources
+            #   Comma-separated backup sources to try if the main source fails.
+            #
+            # plugins[].installAs
+            #   Final plugin jar path/name, such as plugins/ViaVersion.jar.
+            #
+            # plugins[].required
+            #   false:
+            #     If update fails and no old jar exists, the server may still start without
+            #     this plugin.
+            #   true:
+            #     If update fails and no old jar exists, stop startup.
+            #   Either way, if an old jar exists and onFailure is keep-current, the updater
+            #   keeps the previous jar.
+            #
+            # restart.enabled
+            #   Turns scheduled restarts on or off.
+            #
+            # restart.interval
+            #   How often to restart. Examples: 7d, 12h, 30m.
+            #
+            # restart.stopCommand
+            #   Console command sent when it is time to stop.
+            #   Folia/Paper usually use stop. Velocity usually uses shutdown.
+            #
+            # restart.gracefulStopSeconds
+            #   Seconds to wait after sending stopCommand before forcing the process closed.
+            #
+            # restart.warnings
+            #   Console commands sent before restart. before accepts values like 2h, 30m,
+            #   5m, or 1m.
             """.formatted(VERSION);
     }
 }
