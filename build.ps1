@@ -4,7 +4,7 @@ $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $BuildDir = Join-Path $Root "build"
 $ClassesDir = Join-Path $BuildDir "classes"
 $DistDir = Join-Path $Root "dist"
-$JarPath = Join-Path $DistDir "velocity-auto-updater.jar"
+$JarPath = Join-Path $DistDir "auto-updater.jar"
 
 function Assert-InWorkspace {
     param([string] $PathToCheck)
@@ -45,7 +45,7 @@ $manifestPath = Join-Path $BuildDir "MANIFEST.MF"
 $manifest = @(
     "Manifest-Version: 1.0"
     "Main-Class: dev.velocityupdater.VelocityAutoUpdater"
-    "Implementation-Version: 0.2.0"
+    "Implementation-Version: 0.3.0"
     ""
 ) -join "`r`n"
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)

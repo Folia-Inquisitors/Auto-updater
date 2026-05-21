@@ -1,29 +1,28 @@
-# Velocity Auto Updater
+# Auto-Updater
 
-A small standalone launcher jar for hosted Velocity servers.
-
-It is meant to be the jar your host starts first:
+A standalone launcher jar for Minecraft servers. It runs first, updates configured jars, backs up anything it replaces, and then starts the real server jar.
 
 ```bash
-java -jar velocity-auto-updater.jar run
+java -jar auto-updater.jar run
 ```
-
-Then it updates configured jars, backs up anything it replaces, and starts the real Velocity jar.
 
 ## What It Supports
 
-- Hosted-safe updates by default.
-- Auto-detects PaperMC, GeyserMC, and direct jar URLs.
-- Auto-detects Modrinth project pages and installs the latest primary jar.
-- Replaces jars while keeping the same configured filename.
-- Backs up old jars into `backups/`.
-- Downloads into `cache/staging/` first.
-- Validates that downloaded files are readable jars.
-- Starts Velocity as a child process.
-- Forwards console input/output.
-- Optional scheduled restarts with warning commands.
+- Folia, Paper, Velocity, and other PaperMC downloads.
+- `changeVersion: false` for safer server jar updates within the same configured version.
+- Hangar plugin downloads.
+- GitHub release jar downloads.
+- Modrinth plugin downloads.
+- SpigotMC free-resource downloads through Spiget.
+- GeyserMC direct download URLs.
+- Direct jar URLs and local jar paths.
+- Stable `installAs` filenames.
+- Backup and staging folders.
+- Scheduled restarts with warning commands.
+- Explicit fallback sources.
+- Discovery policy reporting with trusted GitHub org/repo settings.
 
-Build-from-source/Git mode is intentionally not enabled in this first jar. That keeps the hosted setup predictable on panels that may restrict Git, Gradle, Maven, or long-running builds.
+Build-from-source/Git mode is still not enabled. The config has trust settings for that future path, and hosted jars are preferred when they can avoid a build.
 
 ## Build
 
@@ -36,7 +35,7 @@ On Windows:
 The jar is written to:
 
 ```text
-dist/velocity-auto-updater.jar
+dist/auto-updater.jar
 ```
 
 ## First Run
@@ -44,7 +43,7 @@ dist/velocity-auto-updater.jar
 Create a starter config:
 
 ```bash
-java -jar velocity-auto-updater.jar init
+java -jar auto-updater.jar init
 ```
 
 Or place `updater.example.yml` next to the jar as `updater.yml`.
@@ -52,26 +51,23 @@ Or place `updater.example.yml` next to the jar as `updater.yml`.
 Useful commands:
 
 ```bash
-java -jar velocity-auto-updater.jar check
-java -jar velocity-auto-updater.jar update
-java -jar velocity-auto-updater.jar run
+java -jar auto-updater.jar check
+java -jar auto-updater.jar discover
+java -jar auto-updater.jar update
+java -jar auto-updater.jar run
 ```
 
-## BisectHosting Shape
-
-Put these next to each other in the server root:
+## Server Root Shape
 
 ```text
-velocity-auto-updater.jar
+auto-updater.jar
 updater.yml
-velocity.jar
+folia.jar
 plugins/
 ```
 
-Set the custom startup jar to:
+Set the host/panel startup jar to:
 
 ```text
-velocity-auto-updater.jar
+auto-updater.jar
 ```
-
-The updater will keep launching `velocity.jar` after it finishes update checks.

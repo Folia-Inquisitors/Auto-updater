@@ -39,7 +39,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.jar.JarFile;
 
 public final class VelocityAutoUpdater {
-    private static final String VERSION = "0.2.0";
+    private static final String APP_NAME = "Auto-Updater";
+    private static final String VERSION = "0.3.0";
     private static final String DEFAULT_CONFIG = "updater.yml";
     private static final DateTimeFormatter BACKUP_TIME = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss");
 
@@ -87,6 +88,9 @@ public final class VelocityAutoUpdater {
             case "check":
                 updater.printPlan();
                 return 0;
+            case "discover":
+                updater.discover();
+                return 0;
             case "update":
                 updater.updateAll();
                 return 0;
@@ -119,19 +123,21 @@ public final class VelocityAutoUpdater {
     }
 
     private static void printHelp() {
-        System.out.println("Velocity Auto Updater " + VERSION);
+        System.out.println(APP_NAME + " " + VERSION);
         System.out.println();
         System.out.println("Usage:");
-        System.out.println("  java -jar velocity-auto-updater.jar init [--config updater.yml]");
-        System.out.println("  java -jar velocity-auto-updater.jar check [--config updater.yml]");
-        System.out.println("  java -jar velocity-auto-updater.jar update [--config updater.yml]");
-        System.out.println("  java -jar velocity-auto-updater.jar run [--config updater.yml]");
+        System.out.println("  java -jar auto-updater.jar init [--config updater.yml]");
+        System.out.println("  java -jar auto-updater.jar check [--config updater.yml]");
+        System.out.println("  java -jar auto-updater.jar discover [--config updater.yml]");
+        System.out.println("  java -jar auto-updater.jar update [--config updater.yml]");
+        System.out.println("  java -jar auto-updater.jar run [--config updater.yml]");
         System.out.println();
         System.out.println("Commands:");
         System.out.println("  init    Create a starter updater.yml");
         System.out.println("  check   Parse config and show detected update sources");
+        System.out.println("  discover  Suggest/update-source discovery plan without changing jars");
         System.out.println("  update  Download/update configured jars, then exit");
-        System.out.println("  run     Update jars, start Velocity, and manage scheduled restarts");
+        System.out.println("  run     Update jars, start the configured server, and manage scheduled restarts");
     }
 
     private static final class Cli {
@@ -165,11 +171,13 @@ public final class VelocityAutoUpdater {
         Path baseDir = Paths.get(".").toAbsolutePath().normalize();
         String mode = "hosted-safe";
         String onFailure = "keep-current";
-        String userAgent = "velocity-auto-updater/" + VERSION + " (contact: your-email@example.com)";
+        String userAgent = APP_NAME + "/" + VERSION + " (contact: your-email@example.com)";
         Path cacheDir = Paths.get("cache");
         Path backupDir = Paths.get("backups");
         TargetConfig server = new TargetConfig("Velocity", true);
         List<TargetConfig> plugins = new ArrayList<>();
+        DiscoveryConfig discovery = new DiscoveryConfig();
+        BuildFromSourceConfig buildFromSource = new BuildFromSourceConfig();
         RestartConfig restart = new RestartConfig();
 
         void validate() {
@@ -182,12 +190,18 @@ public final class VelocityAutoUpdater {
                 throw new IllegalArgumentException("onFailure must be keep-current or stop");
             }
             if (server.installAs == null || server.installAs.isBlank()) {
-                server.installAs = "velocity.jar";
+                server.installAs = "server.jar";
+            }
+            if (server.changeVersion == null) {
+                server.changeVersion = false;
             }
             if (server.source == null || server.source.isBlank()) {
                 Log.warn("No server.source configured. The updater will only launch the existing " + server.installAs + ".");
             }
             for (TargetConfig plugin : plugins) {
+                if (plugin.changeVersion == null) {
+                    plugin.changeVersion = true;
+                }
                 if (plugin.installAs == null || plugin.installAs.isBlank()) {
                     if (plugin.name != null && !plugin.name.isBlank()) {
                         plugin.installAs = "plugins/" + safeName(plugin.name) + ".jar";
@@ -207,18 +221,38 @@ public final class VelocityAutoUpdater {
         }
     }
 
+    private static final class DiscoveryConfig {
+        boolean enabled = false;
+        String mode = "suggest";
+        List<String> sourcePriority = new ArrayList<>(List.of("github-release", "hangar", "modrinth", "spigot"));
+        boolean checkAlternateSourcesWhenOutdated = true;
+        int outdatedThresholdDays = 14;
+        boolean autoSwitchSource = false;
+    }
+
+    private static final class BuildFromSourceConfig {
+        boolean enabled = false;
+        boolean onlyTrusted = true;
+        boolean preferHostedIfSameVersion = true;
+        List<String> trustedGithubOrgs = new ArrayList<>();
+        List<String> trustedGithubRepos = new ArrayList<>();
+    }
+
     private static final class TargetConfig {
         String name;
         boolean server;
         boolean enabled = true;
         boolean required;
         String source;
+        List<String> fallbackSources = new ArrayList<>();
         String type = "auto";
         String project;
+        String githubRepo;
         String platform;
         String loader;
         String gameVersion;
         String versionType;
+        Boolean changeVersion;
         String channel;
         String installAs;
         String java = "java";
@@ -236,6 +270,27 @@ public final class VelocityAutoUpdater {
                 return name;
             }
             return server ? "Velocity" : installAs;
+        }
+
+        TargetConfig copyWithSource(String source) {
+            TargetConfig copy = new TargetConfig(name, server);
+            copy.enabled = enabled;
+            copy.required = required;
+            copy.source = source;
+            copy.type = "auto";
+            copy.project = project;
+            copy.githubRepo = githubRepo;
+            copy.platform = platform;
+            copy.loader = loader;
+            copy.gameVersion = gameVersion;
+            copy.versionType = versionType;
+            copy.changeVersion = changeVersion;
+            copy.channel = channel;
+            copy.installAs = installAs;
+            copy.java = java;
+            copy.javaArgs = javaArgs;
+            copy.args = args;
+            return copy;
         }
     }
 
@@ -287,6 +342,13 @@ public final class VelocityAutoUpdater {
                 switch (section) {
                     case "server":
                         applyTarget(config.server, keyValue(line, lineNo));
+                        break;
+                    case "discovery":
+                        applyDiscovery(config.discovery, keyValue(line, lineNo));
+                        break;
+                    case "buildfromsource":
+                    case "build_from_source":
+                        applyBuildFromSource(config.buildFromSource, keyValue(line, lineNo));
                         break;
                     case "plugins":
                         if (line.startsWith("- ")) {
@@ -351,6 +413,10 @@ public final class VelocityAutoUpdater {
                 case "backup_dir":
                     config.backupDir = Paths.get(kv.value);
                     break;
+                case "discoversources":
+                case "discover_sources":
+                    config.discovery.enabled = parseBoolean(kv.value);
+                    break;
                 default:
                     throw new IllegalArgumentException("Unknown config key: " + kv.key);
             }
@@ -370,11 +436,19 @@ public final class VelocityAutoUpdater {
                 case "source":
                     target.source = kv.value;
                     break;
+                case "fallbacksources":
+                case "fallback_sources":
+                    target.fallbackSources = parseList(kv.value);
+                    break;
                 case "type":
                     target.type = kv.value;
                     break;
                 case "project":
                     target.project = kv.value;
+                    break;
+                case "githubrepo":
+                case "github_repo":
+                    target.githubRepo = kv.value;
                     break;
                 case "platform":
                     target.platform = kv.value;
@@ -389,6 +463,10 @@ public final class VelocityAutoUpdater {
                 case "versiontype":
                 case "version_type":
                     target.versionType = kv.value;
+                    break;
+                case "changeversion":
+                case "change_version":
+                    target.changeVersion = parseBoolean(kv.value);
                     break;
                 case "channel":
                     target.channel = kv.value;
@@ -409,6 +487,61 @@ public final class VelocityAutoUpdater {
                     break;
                 default:
                     throw new IllegalArgumentException("Unknown target key: " + kv.key);
+            }
+        }
+
+        private static void applyDiscovery(DiscoveryConfig discovery, KeyValue kv) {
+            switch (lower(kv.key)) {
+                case "enabled":
+                    discovery.enabled = parseBoolean(kv.value);
+                    break;
+                case "mode":
+                    discovery.mode = kv.value;
+                    break;
+                case "sourcepriority":
+                case "source_priority":
+                    discovery.sourcePriority = parseList(kv.value);
+                    break;
+                case "checkalternatesourceswhenoutdated":
+                case "check_alternate_sources_when_outdated":
+                    discovery.checkAlternateSourcesWhenOutdated = parseBoolean(kv.value);
+                    break;
+                case "outdatedthresholddays":
+                case "outdated_threshold_days":
+                    discovery.outdatedThresholdDays = Integer.parseInt(kv.value);
+                    break;
+                case "autoswitchsource":
+                case "auto_switch_source":
+                    discovery.autoSwitchSource = parseBoolean(kv.value);
+                    break;
+                default:
+                    throw new IllegalArgumentException("Unknown discovery key: " + kv.key);
+            }
+        }
+
+        private static void applyBuildFromSource(BuildFromSourceConfig build, KeyValue kv) {
+            switch (lower(kv.key)) {
+                case "enabled":
+                    build.enabled = parseBoolean(kv.value);
+                    break;
+                case "onlytrusted":
+                case "only_trusted":
+                    build.onlyTrusted = parseBoolean(kv.value);
+                    break;
+                case "preferhostedifsameversion":
+                case "prefer_hosted_if_same_version":
+                    build.preferHostedIfSameVersion = parseBoolean(kv.value);
+                    break;
+                case "trustedgithuborgs":
+                case "trusted_github_orgs":
+                    build.trustedGithubOrgs = parseList(kv.value);
+                    break;
+                case "trustedgithubrepos":
+                case "trusted_github_repos":
+                    build.trustedGithubRepos = parseList(kv.value);
+                    break;
+                default:
+                    throw new IllegalArgumentException("Unknown buildFromSource key: " + kv.key);
             }
         }
 
@@ -533,19 +666,77 @@ public final class VelocityAutoUpdater {
         void printPlan() {
             Log.info("Mode: " + config.mode);
             Log.info("Failure behavior: " + config.onFailure);
+            Log.info("Discovery: " + (config.discovery.enabled ? "enabled (" + config.discovery.mode + ")" : "disabled"));
+            Log.info("Build from source: " + (config.buildFromSource.enabled ? "enabled" : "disabled")
+                + ", preferHostedIfSameVersion=" + config.buildFromSource.preferHostedIfSameVersion);
             Log.info("Server install target: " + config.resolve(Paths.get(config.server.installAs)));
             for (TargetConfig target : allTargets()) {
                 if (!target.enabled) {
                     Log.info("Skipping disabled target: " + target.displayName());
                     continue;
                 }
+                if (target.source == null || target.source.isBlank()) {
+                    Log.info(target.displayName() + ": no source configured, installAs=" + target.installAs);
+                    continue;
+                }
                 SourcePlan plan = resolveSource(target);
-                Log.info(target.displayName() + ": type=" + plan.type + ", installAs=" + target.installAs + ", source=" + plan.description);
+                String fallbacks = target.fallbackSources.isEmpty() ? "" : ", fallbacks=" + target.fallbackSources.size();
+                Log.info(target.displayName() + ": type=" + plan.type + ", installAs=" + target.installAs + ", source=" + plan.description + fallbacks);
             }
             if (config.restart.enabled) {
                 Log.info("Restart: every " + prettyDuration(config.restart.interval) + " using command '" + config.restart.stopCommand + "'");
             } else {
                 Log.info("Restart: disabled");
+            }
+        }
+
+        void discover() {
+            Log.info("Discovery mode: " + config.discovery.mode + " (" + (config.discovery.enabled ? "enabled" : "disabled in normal run") + ")");
+            Log.info("Source priority: " + String.join(" -> ", config.discovery.sourcePriority));
+            Log.info("Check alternate sources when outdated: " + config.discovery.checkAlternateSourcesWhenOutdated
+                + " after " + config.discovery.outdatedThresholdDays + " days");
+            Log.info("Auto-switch source: " + config.discovery.autoSwitchSource);
+            Log.info("Build from source: " + (config.buildFromSource.enabled ? "enabled" : "disabled")
+                + ", onlyTrusted=" + config.buildFromSource.onlyTrusted
+                + ", preferHostedIfSameVersion=" + config.buildFromSource.preferHostedIfSameVersion);
+            if (!config.buildFromSource.trustedGithubOrgs.isEmpty()) {
+                Log.info("Trusted GitHub orgs: " + String.join(", ", config.buildFromSource.trustedGithubOrgs));
+            }
+            if (!config.buildFromSource.trustedGithubRepos.isEmpty()) {
+                Log.info("Trusted GitHub repos: " + String.join(", ", config.buildFromSource.trustedGithubRepos));
+            }
+
+            for (TargetConfig target : allTargets()) {
+                if (!target.enabled || target.server) {
+                    continue;
+                }
+                Log.info("");
+                Log.info("Discovery target: " + target.displayName());
+                if (target.source != null && !target.source.isBlank()) {
+                    SourcePlan plan = resolveSource(target);
+                    Log.info("Current source: " + plan.type + " -> " + plan.description);
+                } else {
+                    Log.info("Current source: none");
+                }
+                if (target.githubRepo != null && !target.githubRepo.isBlank()) {
+                    boolean trusted = isTrustedGithubRepo(target.githubRepo);
+                    Log.info("GitHub repo hint: " + target.githubRepo + (trusted ? " (trusted)" : " (not trusted for source builds)"));
+                    if (config.buildFromSource.preferHostedIfSameVersion) {
+                        Log.info("Hosted jar preference: if a GitHub release/Hangar/Modrinth jar matches the build version, download it and skip compiling.");
+                    }
+                }
+                if (target.fallbackSources.isEmpty()) {
+                    Log.info("Fallback sources: none configured");
+                } else {
+                    for (String fallback : target.fallbackSources) {
+                        TargetConfig candidate = target.copyWithSource(fallback);
+                        SourcePlan plan = resolveSource(candidate);
+                        Log.info("Fallback source: " + plan.type + " -> " + plan.description);
+                    }
+                }
+                if (config.discovery.autoSwitchSource) {
+                    Log.warn("autoSwitchSource is enabled. This jar still only auto-switches among explicitly configured fallbackSources.");
+                }
             }
         }
 
@@ -587,6 +778,31 @@ public final class VelocityAutoUpdater {
         }
 
         private void updateOne(TargetConfig target) throws Exception {
+            if (target.source == null || target.source.isBlank()) {
+                Log.info("No source configured for " + target.displayName() + "; keeping existing jar.");
+                return;
+            }
+            List<String> sources = new ArrayList<>();
+            sources.add(target.source);
+            sources.addAll(target.fallbackSources);
+            Exception last = null;
+            for (int i = 0; i < sources.size(); i++) {
+                TargetConfig candidate = i == 0 ? target : target.copyWithSource(sources.get(i));
+                try {
+                    updateOneFromSource(candidate);
+                    return;
+                } catch (Exception ex) {
+                    last = ex;
+                    if (i + 1 < sources.size()) {
+                        Log.warn("Source failed for " + target.displayName() + ": " + ex.getMessage());
+                        Log.warn("Trying fallback source " + (i + 2) + " of " + sources.size() + ".");
+                    }
+                }
+            }
+            throw last == null ? new IOException("No source configured for " + target.displayName()) : last;
+        }
+
+        private void updateOneFromSource(TargetConfig target) throws Exception {
             SourcePlan plan = resolveSource(target);
             Log.info("Checking " + target.displayName() + " (" + plan.type + ")");
             ResolvedDownload download = plan.resolver.resolve(target);
@@ -604,6 +820,7 @@ public final class VelocityAutoUpdater {
                 if (oldHash.equalsIgnoreCase(newHash)) {
                     Files.deleteIfExists(staging);
                     Log.info(target.displayName() + " is already current (" + shortHash(newHash) + ").");
+                    updateLockIfNeeded(target, download);
                     return;
                 }
                 backup(targetPath);
@@ -615,6 +832,40 @@ public final class VelocityAutoUpdater {
             }
             moveReplace(staging, targetPath);
             Log.info("Installed " + target.displayName() + " -> " + targetPath + " (" + shortHash(newHash) + ")");
+            updateLockIfNeeded(target, download);
+        }
+
+        private boolean isTrustedGithubRepo(String repo) {
+            String normalized = repo.trim();
+            if (config.buildFromSource.trustedGithubRepos.stream().anyMatch(r -> r.equalsIgnoreCase(normalized))) {
+                return true;
+            }
+            int slash = normalized.indexOf('/');
+            if (slash <= 0) {
+                return false;
+            }
+            String org = normalized.substring(0, slash);
+            return config.buildFromSource.trustedGithubOrgs.stream().anyMatch(o -> o.equalsIgnoreCase(org));
+        }
+
+        private void updateLockIfNeeded(TargetConfig target, ResolvedDownload download) {
+            if (!target.server || !"papermc".equals(download.sourceType) || download.gameVersion == null || download.gameVersion.isBlank()) {
+                return;
+            }
+            try {
+                Path lock = config.resolve(Paths.get("updater.lock.yml"));
+                List<String> lines = List.of(
+                    "# Auto-generated by " + APP_NAME + ".",
+                    "# Keep this file if changeVersion is false and gameVersion is not set in updater.yml.",
+                    "serverProject: " + download.project,
+                    "serverGameVersion: \"" + download.gameVersion + "\"",
+                    "serverBuild: \"" + download.build + "\""
+                );
+                Files.write(lock, lines, StandardCharsets.UTF_8);
+                Log.info("Updated version lock -> " + lock.getFileName() + " (" + download.project + " " + download.gameVersion + ")");
+            } catch (IOException ex) {
+                Log.warn("Could not write updater.lock.yml: " + ex.getMessage());
+            }
         }
 
         private SourcePlan resolveSource(TargetConfig target) {
@@ -631,8 +882,16 @@ public final class VelocityAutoUpdater {
                     return new SourcePlan(type, source.isBlank() ? "PaperMC downloads API" : source, new PaperMcResolver(config, client));
                 case "geysermc":
                     return new SourcePlan(type, source.isBlank() ? "GeyserMC downloads API" : source, new GeyserMcResolver(config));
+                case "hangar":
+                    return new SourcePlan(type, source.isBlank() ? "Hangar API" : source, new HangarResolver(config, client));
+                case "github-release":
+                case "github":
+                    return new SourcePlan("github-release", source.isBlank() ? target.githubRepo : source, new GithubReleaseResolver(config, client));
                 case "modrinth":
                     return new SourcePlan(type, source.isBlank() ? "Modrinth API" : source, new ModrinthResolver(config, client));
+                case "spigot":
+                case "spiget":
+                    return new SourcePlan(type, source, new SpigetResolver());
                 case "direct":
                     return new SourcePlan(type, source, new DirectResolver(config));
                 default:
@@ -652,12 +911,21 @@ public final class VelocityAutoUpdater {
             if (lowerSource.contains("modrinth.com/") || lowerSource.contains("api.modrinth.com/")) {
                 return "modrinth";
             }
+            if (lowerSource.contains("hangar.papermc.io/")) {
+                return "hangar";
+            }
+            if (lowerSource.contains("spigotmc.org/resources") || lowerSource.contains("api.spiget.org/")) {
+                return "spigot";
+            }
             if (lowerSource.contains("github.com/")
                 && (lowerSource.contains("/releases/download/") || lowerSource.endsWith(".jar"))) {
                 return "direct";
             }
-            if (lowerSource.endsWith(".git") || lowerSource.startsWith("git@") || lowerSource.contains("github.com/")) {
+            if (lowerSource.endsWith(".git") || lowerSource.startsWith("git@")) {
                 return "git";
+            }
+            if (lowerSource.contains("github.com/") || (target.githubRepo != null && !target.githubRepo.isBlank())) {
+                return "github-release";
             }
             if (lowerSource.contains("download.geysermc.org/v2/")) {
                 return "direct";
@@ -738,10 +1006,22 @@ public final class VelocityAutoUpdater {
     private static final class ResolvedDownload {
         final URI uri;
         final String label;
+        final String sourceType;
+        final String project;
+        final String gameVersion;
+        final String build;
 
         ResolvedDownload(URI uri, String label) {
+            this(uri, label, "", "", "", "");
+        }
+
+        ResolvedDownload(URI uri, String label, String sourceType, String project, String gameVersion, String build) {
             this.uri = uri;
             this.label = label;
+            this.sourceType = sourceType;
+            this.project = project;
+            this.gameVersion = gameVersion;
+            this.build = build;
         }
     }
 
@@ -758,6 +1038,155 @@ public final class VelocityAutoUpdater {
                 throw new IllegalArgumentException("Direct source needs a URL for " + target.displayName());
             }
             return new ResolvedDownload(sourceUri(target.source, config), target.source);
+        }
+    }
+
+    private static final class GithubReleaseResolver implements DownloadResolver {
+        private final AppConfig config;
+        private final HttpClient client;
+
+        GithubReleaseResolver(AppConfig config, HttpClient client) {
+            this.config = config;
+            this.client = client;
+        }
+
+        @Override
+        public ResolvedDownload resolve(TargetConfig target) throws Exception {
+            GithubRepo repo = inferRepo(target);
+            List<Map<String, Object>> releases = loadReleases(repo);
+            for (Map<String, Object> release : releases) {
+                if (Boolean.TRUE.equals(release.get("draft"))) {
+                    continue;
+                }
+                if (target.versionType == null || target.versionType.isBlank()) {
+                    if (Boolean.TRUE.equals(release.get("prerelease"))) {
+                        continue;
+                    }
+                }
+                Optional<Map<String, Object>> asset = findJarAsset(release);
+                if (asset.isEmpty()) {
+                    continue;
+                }
+                String url = stringValue(asset.get().get("browser_download_url"));
+                if (url.isBlank()) {
+                    continue;
+                }
+                String tag = firstNonBlank(stringValue(release.get("tag_name")), stringValue(release.get("name")), "latest");
+                String filename = stringValue(asset.get().get("name"));
+                return new ResolvedDownload(URI.create(url), "GitHub release " + repo.owner + "/" + repo.name + " " + tag + " " + filename);
+            }
+            throw new IOException("No GitHub release jar found for " + repo.owner + "/" + repo.name);
+        }
+
+        private List<Map<String, Object>> loadReleases(GithubRepo repo) throws Exception {
+            URI uri = URI.create("https://api.github.com/repos/" + urlEncode(repo.owner) + "/" + urlEncode(repo.name) + "/releases?per_page=30");
+            HttpRequest request = HttpRequest.newBuilder(uri)
+                .timeout(Duration.ofSeconds(45))
+                .header("User-Agent", config.userAgent)
+                .header("Accept", "application/vnd.github+json")
+                .GET()
+                .build();
+            HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            int status = response.statusCode();
+            if (status < 200 || status >= 300) {
+                throw new IOException("GitHub releases API failed with HTTP " + status + " for " + repo.owner + "/" + repo.name);
+            }
+            Object json = new JsonParser(response.body()).parse();
+            if (!(json instanceof List<?> list)) {
+                throw new IOException("GitHub releases API returned an unexpected response for " + repo.owner + "/" + repo.name);
+            }
+            List<Map<String, Object>> releases = new ArrayList<>();
+            for (Object item : list) {
+                releases.add(asMap(item));
+            }
+            return releases;
+        }
+
+        private Optional<Map<String, Object>> findJarAsset(Map<String, Object> release) {
+            Object assetsObj = release.get("assets");
+            if (!(assetsObj instanceof List<?> assets)) {
+                return Optional.empty();
+            }
+            List<Map<String, Object>> jars = new ArrayList<>();
+            for (Object item : assets) {
+                Map<String, Object> asset = asMap(item);
+                String name = lower(stringValue(asset.get("name")));
+                if (!name.endsWith(".jar")) {
+                    continue;
+                }
+                if (name.contains("sources") || name.contains("javadoc") || name.contains("-dev") || name.contains("-plain")) {
+                    continue;
+                }
+                jars.add(asset);
+            }
+            return jars.isEmpty() ? Optional.empty() : Optional.of(jars.get(0));
+        }
+
+        private GithubRepo inferRepo(TargetConfig target) {
+            String value = firstNonBlank(target.githubRepo, target.project, target.source, "");
+            if (value.contains("github.com/")) {
+                List<String> parts = pathParts(URI.create(value));
+                if (parts.size() >= 2) {
+                    return new GithubRepo(parts.get(0), parts.get(1).replace(".git", ""));
+                }
+            }
+            if (value.contains("/")) {
+                String[] parts = value.split("/", 2);
+                return new GithubRepo(parts[0], parts[1].replace(".git", ""));
+            }
+            throw new IllegalArgumentException("GitHub release source needs a repo like Owner/Repo or https://github.com/Owner/Repo");
+        }
+    }
+
+    private static final class GithubRepo {
+        final String owner;
+        final String name;
+
+        GithubRepo(String owner, String name) {
+            this.owner = owner;
+            this.name = name;
+        }
+    }
+
+    private static final class SpigetResolver implements DownloadResolver {
+        @Override
+        public ResolvedDownload resolve(TargetConfig target) {
+            String resourceId = firstNonBlank(target.project, inferResourceId(target.source), "");
+            if (resourceId.isBlank()) {
+                throw new IllegalArgumentException("Spigot/Spiget source needs a Spigot resource URL or resource ID");
+            }
+            String url = "https://api.spiget.org/v2/resources/" + urlEncode(resourceId) + "/download";
+            return new ResolvedDownload(URI.create(url), "Spiget resource " + resourceId);
+        }
+
+        private String inferResourceId(String source) {
+            if (source == null || source.isBlank()) {
+                return "";
+            }
+            if (source.matches("\\d+")) {
+                return source;
+            }
+            if (source.contains("api.spiget.org/")) {
+                List<String> parts = pathParts(URI.create(source));
+                for (int i = 0; i < parts.size() - 1; i++) {
+                    if (parts.get(i).equals("resources")) {
+                        return parts.get(i + 1);
+                    }
+                }
+            }
+            if (source.contains("spigotmc.org/resources")) {
+                List<String> parts = pathParts(URI.create(source));
+                for (String part : parts) {
+                    int dot = part.lastIndexOf('.');
+                    if (dot >= 0 && dot + 1 < part.length()) {
+                        String candidate = part.substring(dot + 1);
+                        if (candidate.matches("\\d+")) {
+                            return candidate;
+                        }
+                    }
+                }
+            }
+            return "";
         }
     }
 
@@ -803,6 +1232,125 @@ public final class VelocityAutoUpdater {
                 return "standalone";
             }
             return "velocity";
+        }
+    }
+
+    private static final class HangarResolver implements DownloadResolver {
+        private final AppConfig config;
+        private final HttpClient client;
+
+        HangarResolver(AppConfig config, HttpClient client) {
+            this.config = config;
+            this.client = client;
+        }
+
+        @Override
+        public ResolvedDownload resolve(TargetConfig target) throws Exception {
+            HangarProject project = inferProject(target);
+            String platform = firstNonBlank(target.platform, target.loader, "paper").toUpperCase(Locale.ROOT);
+            String channel = firstNonBlank(target.channel, target.versionType, "Release");
+            List<Map<String, Object>> versions = loadVersions(project);
+            Optional<ResolvedDownload> preferred = findDownload(project, versions, platform, channel);
+            if (preferred.isPresent()) {
+                return preferred.get();
+            }
+            if (target.channel == null && target.versionType == null) {
+                Optional<ResolvedDownload> any = findDownload(project, versions, platform, "");
+                if (any.isPresent()) {
+                    return any.get();
+                }
+            }
+            throw new IOException("No Hangar download found for " + project.owner + "/" + project.slug + " on platform " + platform);
+        }
+
+        private List<Map<String, Object>> loadVersions(HangarProject project) throws Exception {
+            URI uri = URI.create("https://hangar.papermc.io/api/v1/projects/"
+                + urlEncode(project.owner) + "/" + urlEncode(project.slug) + "/versions?limit=100&offset=0");
+            HttpRequest request = HttpRequest.newBuilder(uri)
+                .timeout(Duration.ofSeconds(45))
+                .header("User-Agent", config.userAgent)
+                .header("Accept", "application/json")
+                .GET()
+                .build();
+            HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            int status = response.statusCode();
+            if (status < 200 || status >= 300) {
+                throw new IOException("Hangar API failed with HTTP " + status + " for " + project.owner + "/" + project.slug);
+            }
+            Object json = new JsonParser(response.body()).parse();
+            Object result = asMap(json).get("result");
+            if (!(result instanceof List<?> list)) {
+                throw new IOException("Hangar API returned an unexpected response for " + project.owner + "/" + project.slug);
+            }
+            List<Map<String, Object>> versions = new ArrayList<>();
+            for (Object item : list) {
+                Map<String, Object> version = asMap(item);
+                if ("public".equalsIgnoreCase(stringValue(version.get("visibility")))) {
+                    versions.add(version);
+                }
+            }
+            versions.sort((a, b) -> stringValue(b.get("createdAt")).compareTo(stringValue(a.get("createdAt"))));
+            return versions;
+        }
+
+        private Optional<ResolvedDownload> findDownload(HangarProject project, List<Map<String, Object>> versions, String platform, String channel) {
+            for (Map<String, Object> version : versions) {
+                if (!channel.isBlank()) {
+                    Object channelObj = version.get("channel");
+                    String channelName = channelObj instanceof Map<?, ?> map ? stringValue(castStringMap(map).get("name")) : "";
+                    if (!channel.equalsIgnoreCase(channelName)) {
+                        continue;
+                    }
+                }
+                Object downloadsObj = version.get("downloads");
+                if (!(downloadsObj instanceof Map<?, ?> rawDownloads)) {
+                    continue;
+                }
+                Map<String, Object> downloads = castStringMap(rawDownloads);
+                Object downloadObj = downloads.get(platform);
+                if (!(downloadObj instanceof Map<?, ?>)) {
+                    downloadObj = downloads.get(platform.toUpperCase(Locale.ROOT));
+                }
+                if (!(downloadObj instanceof Map<?, ?> rawDownload)) {
+                    continue;
+                }
+                Map<String, Object> download = castStringMap(rawDownload);
+                String externalUrl = stringValue(download.get("externalUrl"));
+                String downloadUrl = stringValue(download.get("downloadUrl"));
+                String url = firstNonBlank(downloadUrl, externalUrl);
+                if (url.isBlank()) {
+                    continue;
+                }
+                String name = stringValue(version.get("name"));
+                return Optional.of(new ResolvedDownload(URI.create(url), "Hangar " + project.owner + "/" + project.slug + " " + name + " " + platform));
+            }
+            return Optional.empty();
+        }
+
+        private HangarProject inferProject(TargetConfig target) {
+            if (target.project != null && target.project.contains("/")) {
+                String[] parts = target.project.split("/", 2);
+                return new HangarProject(parts[0], parts[1]);
+            }
+            String source = firstNonBlank(target.source, "");
+            if (source.contains("hangar.papermc.io/")) {
+                URI uri = URI.create(source);
+                List<String> parts = pathParts(uri);
+                if (parts.size() >= 2) {
+                    return new HangarProject(parts.get(0), parts.get(1));
+                }
+            }
+            throw new IllegalArgumentException("Hangar source needs a URL like https://hangar.papermc.io/Owner/Project/versions");
+        }
+    }
+
+    private static final class HangarProject {
+        final String owner;
+        final String slug;
+
+        HangarProject(String owner, String slug) {
+            this.owner = owner;
+            this.slug = slug;
         }
     }
 
@@ -989,10 +1537,25 @@ public final class VelocityAutoUpdater {
         @Override
         public ResolvedDownload resolve(TargetConfig target) throws Exception {
             String project = firstNonBlank(target.project, inferProject(target), "velocity");
+            boolean allowVersionChange = target.changeVersion != null && target.changeVersion;
+            String lockedVersion = allowVersionChange ? "" : firstNonBlank(target.gameVersion, readLockValue(config, "serverGameVersion"), "");
+            if (!allowVersionChange && lockedVersion.isBlank()) {
+                throw new IllegalArgumentException("changeVersion is false for " + target.displayName()
+                    + ", but no gameVersion is set and updater.lock.yml has no serverGameVersion. Set gameVersion or set changeVersion: true.");
+            }
+            if (!lockedVersion.isBlank()) {
+                Optional<ResolvedDownload> download = loadBuild(project, lockedVersion, target);
+                if (download.isPresent()) {
+                    return download.get();
+                }
+                throw new IOException("No downloadable PaperMC build found for " + project + " version " + lockedVersion);
+            }
+
             List<String> versions = loadVersions(project);
             if (versions.isEmpty()) {
                 throw new IOException("PaperMC returned no versions for project " + project);
             }
+            versions.sort(VelocityAutoUpdater::compareVersionsNewestFirst);
             int attempts = Math.min(versions.size(), 15);
             for (int i = 0; i < attempts; i++) {
                 String version = versions.get(i);
@@ -1006,6 +1569,19 @@ public final class VelocityAutoUpdater {
 
         private String inferProject(TargetConfig target) {
             String source = lower(firstNonBlank(target.source, target.name, target.installAs, ""));
+            if (source.contains("papermc.io/downloads/")) {
+                String[] parts = source.split("/");
+                String last = parts.length == 0 ? "" : parts[parts.length - 1];
+                if (last.equals("paper") || last.equals("folia") || last.equals("velocity") || last.equals("waterfall")) {
+                    return last;
+                }
+            }
+            if (source.contains("folia")) {
+                return "folia";
+            }
+            if (source.contains("paper")) {
+                return "paper";
+            }
             if (source.contains("velocity")) {
                 return "velocity";
             }
@@ -1093,7 +1669,7 @@ public final class VelocityAutoUpdater {
             if (preferred instanceof Map<?, ?> map) {
                 String url = stringValue(castStringMap(map).get("url"));
                 if (!url.isBlank()) {
-                    return Optional.of(new ResolvedDownload(URI.create(url), label(project, version, build)));
+                    return Optional.of(new ResolvedDownload(URI.create(url), label(project, version, build), "papermc", project, version, buildNumber(build)));
                 }
             }
             for (Map.Entry<String, Object> entry : downloads.entrySet()) {
@@ -1103,7 +1679,7 @@ public final class VelocityAutoUpdater {
                 if (entry.getValue() instanceof Map<?, ?> map) {
                     String url = stringValue(castStringMap(map).get("url"));
                     if (!url.isBlank()) {
-                        return Optional.of(new ResolvedDownload(URI.create(url), label(project, version, build)));
+                        return Optional.of(new ResolvedDownload(URI.create(url), label(project, version, build), "papermc", project, version, buildNumber(build)));
                     }
                 }
             }
@@ -1111,7 +1687,7 @@ public final class VelocityAutoUpdater {
                 if (value instanceof Map<?, ?> map) {
                     String url = stringValue(castStringMap(map).get("url"));
                     if (!url.isBlank()) {
-                        return Optional.of(new ResolvedDownload(URI.create(url), label(project, version, build)));
+                        return Optional.of(new ResolvedDownload(URI.create(url), label(project, version, build), "papermc", project, version, buildNumber(build)));
                     }
                 }
             }
@@ -1119,9 +1695,13 @@ public final class VelocityAutoUpdater {
         }
 
         private String label(String project, String version, Map<String, Object> build) {
-            String number = firstNonBlank(stringValue(build.get("number")), stringValue(build.get("id")), "?");
+            String number = buildNumber(build);
             String channel = stringValue(build.get("channel"));
             return project + " " + version + " build " + number + (channel.isBlank() ? "" : " (" + channel + ")");
+        }
+
+        private String buildNumber(Map<String, Object> build) {
+            return firstNonBlank(stringValue(build.get("number")), stringValue(build.get("id")), "?");
         }
 
         private Object getJson(URI uri) throws Exception {
@@ -1493,6 +2073,24 @@ public final class VelocityAutoUpdater {
         return v.equals("true") || v.equals("yes") || v.equals("on") || v.equals("1");
     }
 
+    private static List<String> parseList(String value) {
+        if (value == null || value.isBlank()) {
+            return new ArrayList<>();
+        }
+        String trimmed = value.trim();
+        if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+            trimmed = trimmed.substring(1, trimmed.length() - 1);
+        }
+        List<String> result = new ArrayList<>();
+        for (String part : trimmed.split(",")) {
+            String item = part.trim();
+            if (!item.isEmpty()) {
+                result.add(ConfigParser.unquote(item));
+            }
+        }
+        return result;
+    }
+
     private static Duration parseDuration(String value) {
         String v = lower(value).trim();
         if (v.isEmpty()) {
@@ -1600,6 +2198,95 @@ public final class VelocityAutoUpdater {
         return config.resolve(Paths.get(source)).toUri();
     }
 
+    private static List<String> pathParts(URI uri) {
+        String path = uri.getPath() == null ? "" : uri.getPath();
+        List<String> parts = new ArrayList<>();
+        for (String part : path.split("/")) {
+            if (!part.isBlank()) {
+                parts.add(part);
+            }
+        }
+        return parts;
+    }
+
+    private static String readLockValue(AppConfig config, String key) {
+        Path lock = config.resolve(Paths.get("updater.lock.yml"));
+        if (!Files.exists(lock)) {
+            return "";
+        }
+        try {
+            for (String raw : Files.readAllLines(lock, StandardCharsets.UTF_8)) {
+                String line = ConfigParser.stripComment(raw).trim();
+                if (line.isEmpty() || !line.contains(":")) {
+                    continue;
+                }
+                KeyValue kv = ConfigParser.keyValue(line, 0);
+                if (kv.key.equals(key)) {
+                    return kv.value;
+                }
+            }
+        } catch (Exception ex) {
+            Log.warn("Could not read updater.lock.yml: " + ex.getMessage());
+        }
+        return "";
+    }
+
+    private static int compareVersionsNewestFirst(String a, String b) {
+        return compareVersionValues(b, a);
+    }
+
+    private static int compareVersionValues(String a, String b) {
+        List<String> aa = versionTokens(a);
+        List<String> bb = versionTokens(b);
+        int max = Math.max(aa.size(), bb.size());
+        for (int i = 0; i < max; i++) {
+            String av = i < aa.size() ? aa.get(i) : "0";
+            String bv = i < bb.size() ? bb.get(i) : "0";
+            boolean an = av.matches("\\d+");
+            boolean bn = bv.matches("\\d+");
+            int cmp;
+            if (an && bn) {
+                cmp = Long.compare(Long.parseLong(av), Long.parseLong(bv));
+            } else {
+                cmp = av.compareToIgnoreCase(bv);
+            }
+            if (cmp != 0) {
+                return cmp;
+            }
+        }
+        return 0;
+    }
+
+    private static List<String> versionTokens(String value) {
+        List<String> tokens = new ArrayList<>();
+        StringBuilder current = new StringBuilder();
+        boolean numeric = false;
+        boolean started = false;
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (!Character.isLetterOrDigit(c)) {
+                if (current.length() > 0) {
+                    tokens.add(current.toString());
+                    current.setLength(0);
+                }
+                started = false;
+                continue;
+            }
+            boolean cNumeric = Character.isDigit(c);
+            if (started && cNumeric != numeric) {
+                tokens.add(current.toString());
+                current.setLength(0);
+            }
+            current.append(c);
+            numeric = cNumeric;
+            started = true;
+        }
+        if (current.length() > 0) {
+            tokens.add(current.toString());
+        }
+        return tokens;
+    }
+
     private static String urlEncode(String value) {
         return URLEncoder.encode(value, StandardCharsets.UTF_8);
     }
@@ -1665,235 +2352,224 @@ public final class VelocityAutoUpdater {
     }
 
     private static final class ExampleConfig {
-        private static final String TEXT = ""
-            + "# Velocity Auto Updater\n"
-            + "# Run with: java -jar velocity-auto-updater.jar run\n"
-            + "#\n"
-            + "# ---------------------------------------------------------------------------\n"
-            + "# Field Guide\n"
-            + "# ---------------------------------------------------------------------------\n"
-            + "#\n"
-            + "# mode\n"
-            + "#   What the updater is allowed to do.\n"
-            + "#\n"
-            + "#   Options:\n"
-            + "#     hosted-safe\n"
-            + "#       Recommended for BisectHosting and other server hosts.\n"
-            + "#       The updater only downloads ready-made jar files from websites/APIs.\n"
-            + "#       It will NOT run Git, Gradle, Maven, or compile source code.\n"
-            + "#\n"
-            + "#     auto\n"
-            + "#       Allows the updater to auto-detect source types.\n"
-            + "#       In this version, it still only supports hosted/downloaded jars.\n"
-            + "#       Build-from-source is not included yet.\n"
-            + "#\n"
-            + "# onFailure\n"
-            + "#   What happens if a jar cannot be updated.\n"
-            + "#\n"
-            + "#   Options:\n"
-            + "#     keep-current\n"
-            + "#       Recommended.\n"
-            + "#       If the update fails but an old jar already exists, keep using the old jar.\n"
-            + "#       This lets the server still start when a download site is temporarily down.\n"
-            + "#\n"
-            + "#     stop\n"
-            + "#       Stop startup if an update fails.\n"
-            + "#\n"
-            + "# userAgent\n"
-            + "#   Text sent with download requests.\n"
-            + "#   PaperMC asks automated download clients to use a real User-Agent with\n"
-            + "#   contact info, so replace your-email@example.com with your own email or site.\n"
-            + "#\n"
-            + "# name\n"
-            + "#   A friendly label shown in updater logs.\n"
-            + "#   It has no fixed options. You can name it whatever you want.\n"
-            + "#   This does NOT control the jar filename.\n"
-            + "#\n"
-            + "#   Example:\n"
-            + "#     name: Geyser\n"
-            + "#\n"
-            + "# source\n"
-            + "#   Where the updater gets the new jar from.\n"
-            + "#   This can be a supported website, a direct jar download URL, or a local jar path.\n"
-            + "#\n"
-            + "#   Examples:\n"
-            + "#     PaperMC Velocity:\n"
-            + "#       https://papermc.io/downloads/velocity\n"
-            + "#\n"
-            + "#     Geyser for Velocity:\n"
-            + "#       https://download.geysermc.org/v2/projects/geyser/versions/latest/builds/latest/downloads/velocity\n"
-            + "#\n"
-            + "#     Floodgate for Velocity:\n"
-            + "#       https://download.geysermc.org/v2/projects/floodgate/versions/latest/builds/latest/downloads/velocity\n"
-            + "#\n"
-            + "#     Modrinth project page:\n"
-            + "#       https://modrinth.com/plugin/fancyholograms/versions\n"
-            + "#\n"
-            + "#     Direct jar URL:\n"
-            + "#       https://example.com/MyPlugin.jar\n"
-            + "#\n"
-            + "# type\n"
-            + "#   Tells the updater how to understand the source.\n"
-            + "#\n"
-            + "#   Options:\n"
-            + "#     auto\n"
-            + "#       Recommended.\n"
-            + "#       The updater guesses the correct type from the source URL.\n"
-            + "#\n"
-            + "#     modrinth\n"
-            + "#       Force the updater to treat the source as a Modrinth project.\n"
-            + "#\n"
-            + "#     papermc\n"
-            + "#       Force the updater to treat the source as a PaperMC download.\n"
-            + "#\n"
-            + "#     geysermc\n"
-            + "#       Force the updater to treat the source as a GeyserMC download.\n"
-            + "#\n"
-            + "#     direct\n"
-            + "#       Treat the source as a direct jar download URL or local jar file.\n"
-            + "#\n"
-            + "# loader\n"
-            + "#   Optional Modrinth filter.\n"
-            + "#   Use this when you only want versions for a specific server/plugin loader.\n"
-            + "#\n"
-            + "#   Examples:\n"
-            + "#     loader: paper\n"
-            + "#     loader: velocity\n"
-            + "#\n"
-            + "# gameVersion\n"
-            + "#   Optional Modrinth filter.\n"
-            + "#   Use this when you only want versions for a specific Minecraft version.\n"
-            + "#\n"
-            + "#   Example:\n"
-            + "#     gameVersion: \"1.21.8\"\n"
-            + "#\n"
-            + "# versionType\n"
-            + "#   Optional Modrinth release-type filter.\n"
-            + "#   If omitted, the updater prefers release builds, then beta, then alpha.\n"
-            + "#\n"
-            + "#   Options:\n"
-            + "#     release\n"
-            + "#     beta\n"
-            + "#     alpha\n"
-            + "#\n"
-            + "# installAs\n"
-            + "#   The exact file path and filename the downloaded jar will become.\n"
-            + "#   This is what controls the final jar name.\n"
-            + "#\n"
-            + "#   Example:\n"
-            + "#     installAs: plugins/Geyser-Velocity.jar\n"
-            + "#\n"
-            + "#   That means the downloaded file will be saved as:\n"
-            + "#     plugins/Geyser-Velocity.jar\n"
-            + "#\n"
-            + "# required\n"
-            + "#   Controls what happens when this jar is missing and cannot be downloaded.\n"
-            + "#\n"
-            + "#   Options:\n"
-            + "#     false\n"
-            + "#       If the update fails and an old jar exists, keep the old jar.\n"
-            + "#       If no old jar exists, the server may still start without this plugin.\n"
-            + "#\n"
-            + "#     true\n"
-            + "#       If the update fails and an old jar exists, keep the old jar.\n"
-            + "#       If no old jar exists, stop startup.\n"
-            + "#\n"
-            + "# java\n"
-            + "#   The Java command used to start Velocity.\n"
-            + "#   Usually:\n"
-            + "#     java\n"
-            + "#\n"
-            + "# javaArgs\n"
-            + "#   Memory/Java options used when starting Velocity.\n"
-            + "#\n"
-            + "#   Example:\n"
-            + "#     javaArgs: \"-Xms512M -Xmx1G\"\n"
-            + "#\n"
-            + "#   If your host already controls RAM settings, use:\n"
-            + "#     javaArgs: \"\"\n"
-            + "#\n"
-            + "# args\n"
-            + "#   Extra arguments passed to Velocity after the jar name.\n"
-            + "#   Usually leave this empty:\n"
-            + "#     args: \"\"\n"
-            + "#\n"
-            + "# restart.enabled\n"
-            + "#   Turns scheduled restarts on or off.\n"
-            + "#\n"
-            + "#   Options:\n"
-            + "#     true\n"
-            + "#     false\n"
-            + "#\n"
-            + "# restart.interval\n"
-            + "#   How often to restart.\n"
-            + "#\n"
-            + "#   Examples:\n"
-            + "#     7d  = every 7 days\n"
-            + "#     12h = every 12 hours\n"
-            + "#     30m = every 30 minutes\n"
-            + "#\n"
-            + "# restart.stopCommand\n"
-            + "#   Console command sent when it is time to stop Velocity.\n"
-            + "#   Usually:\n"
-            + "#     shutdown\n"
-            + "#\n"
-            + "# restart.warnings\n"
-            + "#   Warning commands sent before the restart.\n"
-            + "#   These are sent into the Velocity console.\n"
-            + "#\n"
-            + "# ---------------------------------------------------------------------------\n"
-            + "\n"
-            + "mode: hosted-safe\n"
-            + "onFailure: keep-current\n"
-            + "# PaperMC asks automated clients to use a real User-Agent with contact info.\n"
-            + "userAgent: \"velocity-auto-updater/" + VERSION + " (contact: your-email@example.com)\"\n"
-            + "\n"
-            + "server:\n"
-            + "  name: Velocity\n"
-            + "  source: https://papermc.io/downloads/velocity\n"
-            + "  type: auto\n"
-            + "  installAs: velocity.jar\n"
-            + "  java: java\n"
-            + "  javaArgs: \"-Xms512M -Xmx1G\"\n"
-            + "  args: \"\"\n"
-            + "\n"
-            + "plugins:\n"
-            + "  - name: Geyser\n"
-            + "    source: https://download.geysermc.org/v2/projects/geyser/versions/latest/builds/latest/downloads/velocity\n"
-            + "    type: auto\n"
-            + "    installAs: plugins/Geyser-Velocity.jar\n"
-            + "    required: false\n"
-            + "\n"
-            + "  # Optional Floodgate example:\n"
-            + "  # - name: Floodgate\n"
-            + "  #   source: https://download.geysermc.org/v2/projects/floodgate/versions/latest/builds/latest/downloads/velocity\n"
-            + "  #   type: auto\n"
-            + "  #   installAs: plugins/Floodgate-Velocity.jar\n"
-            + "  #   required: false\n"
-            + "\n"
-            + "  # Optional Modrinth example.\n"
-            + "  # FancyHolograms is normally a backend server plugin, not a Velocity proxy plugin.\n"
-            + "  # Install it into the plugins folder for the backend server that should run it.\n"
-            + "  # - name: FancyHolograms\n"
-            + "  #   source: https://modrinth.com/plugin/fancyholograms/versions\n"
-            + "  #   type: auto\n"
-            + "  #   loader: paper\n"
-            + "  #   installAs: plugins/FancyHolograms.jar\n"
-            + "  #   required: false\n"
-            + "\n"
-            + "restart:\n"
-            + "  enabled: true\n"
-            + "  interval: 7d\n"
-            + "  stopCommand: shutdown\n"
-            + "  gracefulStopSeconds: 60\n"
-            + "  warnings:\n"
-            + "    - before: 2h\n"
-            + "      command: \"alert Proxy restart in 2 hours for updates.\"\n"
-            + "    - before: 30m\n"
-            + "      command: \"alert Proxy restart in 30 minutes for updates.\"\n"
-            + "    - before: 5m\n"
-            + "      command: \"alert Proxy restart in 5 minutes for updates.\"\n"
-            + "    - before: 1m\n"
-            + "      command: \"alert Proxy restart in 1 minute for updates.\"\n";
+        private static final String TEXT = """
+            # Auto-Updater
+            # Run with: java -jar auto-updater.jar run
+            #
+            # ---------------------------------------------------------------------------
+            # Field Guide
+            # ---------------------------------------------------------------------------
+            #
+            # mode
+            #   What the updater is allowed to do.
+            #
+            #   Options:
+            #     hosted-safe
+            #       Recommended for hosted panels and normal servers.
+            #       Only downloads ready-made jar files from websites/APIs.
+            #       It will NOT run Git, Gradle, Maven, or compile source code.
+            #
+            #     auto
+            #       Allows source auto-detection.
+            #       In this version, auto still only supports hosted/downloaded jars.
+            #
+            # onFailure
+            #   What happens if a jar cannot be updated.
+            #
+            #   Options:
+            #     keep-current
+            #       Recommended.
+            #       If the update fails but an old jar already exists, keep using the old jar.
+            #       This lets the server still start when a download site is temporarily down.
+            #
+            #     stop
+            #       Stop startup if an update fails.
+            #
+            # source
+            #   Where the updater gets the new jar from.
+            #
+            #   Examples:
+            #     PaperMC server jar:
+            #       https://papermc.io/downloads/folia
+            #       https://papermc.io/downloads/paper
+            #       https://papermc.io/downloads/velocity
+            #
+            #     Hangar plugin:
+            #       https://hangar.papermc.io/ViaVersion/ViaVersion/versions
+            #
+            #     GitHub release:
+            #       https://github.com/ViaVersion/ViaVersion
+            #
+            #     Modrinth plugin:
+            #       https://modrinth.com/plugin/fancyholograms/versions
+            #
+            #     SpigotMC resource:
+            #       https://www.spigotmc.org/resources/epichomes-26-1-x-support.109590/
+            #
+            #     Direct jar URL:
+            #       https://example.com/MyPlugin.jar
+            #
+            # type
+            #   Tells the updater how to understand the source.
+            #
+            #   Options:
+            #     auto
+            #       Recommended. Guesses the source type from the URL.
+            #
+            #     papermc
+            #       Treat source as PaperMC server software: Folia, Paper, Velocity, etc.
+            #
+            #     github-release
+            #       Treat source as a GitHub repo and download the latest release jar.
+            #
+            #     hangar
+            #       Treat source as a Hangar plugin page/API source.
+            #
+            #     modrinth
+            #       Treat source as a Modrinth project.
+            #
+            #     spigot
+            #       Treat source as a SpigotMC resource through the Spiget API.
+            #       This only works for resources Spiget can download without a login.
+            #
+            #     geysermc
+            #       Treat source as a GeyserMC download.
+            #
+            #     direct
+            #       Treat source as a direct jar download URL or local jar file.
+            #
+            # installAs
+            #   The exact file path and filename the downloaded jar will become.
+            #   This controls the final jar name.
+            #
+            # fallbackSources
+            #   Optional comma-separated backup sources to try if the main source fails.
+            #
+            # discovery
+            #   Suggests source choices and reports fallback/trust policy.
+            #   This version only auto-tries sources explicitly listed in fallbackSources.
+            #
+            # buildFromSource
+            #   Safety settings for future Git build support.
+            #   Trusted means a GitHub org/repo you explicitly allow the updater to build.
+            #
+            # changeVersion
+            #   Server jar safety switch.
+            #
+            #   Options:
+            #     false
+            #       Recommended for production.
+            #       Stay on the configured gameVersion. The updater may install newer
+            #       builds for that same version, but it will not jump to another version.
+            #
+            #     true
+            #       Allow the server jar to move to the newest available version.
+            #
+            # gameVersion
+            #   For PaperMC server jars: the server version to stay on when changeVersion is false.
+            #
+            # platform
+            #   For Hangar plugins: which platform download to use. Common: paper, velocity, waterfall.
+            #
+            # loader
+            #   Optional Modrinth filter. Examples: paper, velocity, fabric.
+            #
+            # required
+            #   Controls what happens when this jar is missing and cannot be downloaded.
+            #
+            # restart.stopCommand
+            #   Folia/Paper usually use: stop
+            #   Velocity usually uses: shutdown
+            #
+            # ---------------------------------------------------------------------------
+
+            mode: hosted-safe
+            onFailure: keep-current
+            userAgent: "Auto-Updater/%s (contact: your-email@example.com)"
+
+            discovery:
+              enabled: true
+              mode: suggest
+              sourcePriority: github-release, hangar, modrinth, spigot
+              checkAlternateSourcesWhenOutdated: true
+              outdatedThresholdDays: 14
+              autoSwitchSource: false
+
+            buildFromSource:
+              enabled: false
+              onlyTrusted: true
+              preferHostedIfSameVersion: true
+              trustedGithubOrgs: PaperMC, GeyserMC, ViaVersion
+              trustedGithubRepos: Inquisitors-transfers/MyCustomPlugin
+
+            server:
+              name: Folia
+              source: https://papermc.io/downloads/folia
+              type: auto
+              installAs: folia.jar
+              gameVersion: "26.1.2"
+              changeVersion: false
+              java: java
+              javaArgs: "-Xms512M -Xmx1G"
+              args: ""
+
+            plugins:
+              - name: ViaVersion
+                source: https://github.com/ViaVersion/ViaVersion
+                type: auto
+                githubRepo: ViaVersion/ViaVersion
+                platform: paper
+                fallbackSources: https://hangar.papermc.io/ViaVersion/ViaVersion/versions, https://modrinth.com/plugin/viaversion/versions
+                installAs: plugins/ViaVersion.jar
+                required: false
+
+              - name: ViaBackwards
+                source: https://github.com/ViaVersion/ViaBackwards
+                type: auto
+                githubRepo: ViaVersion/ViaBackwards
+                platform: paper
+                fallbackSources: https://hangar.papermc.io/ViaVersion/ViaBackwards/versions, https://modrinth.com/plugin/viabackwards/versions
+                installAs: plugins/ViaBackwards.jar
+                required: false
+
+              - name: ViaRewind
+                source: https://github.com/ViaVersion/ViaRewind
+                type: auto
+                githubRepo: ViaVersion/ViaRewind
+                platform: paper
+                fallbackSources: https://hangar.papermc.io/ViaVersion/ViaRewind/versions, https://modrinth.com/plugin/viarewind/versions
+                installAs: plugins/ViaRewind.jar
+                required: false
+
+              # Optional Modrinth example:
+              # - name: FancyHolograms
+              #   source: https://modrinth.com/plugin/fancyholograms/versions
+              #   type: auto
+              #   loader: paper
+              #   installAs: plugins/FancyHolograms.jar
+              #   required: false
+
+              # Optional Spigot/Spiget example:
+              # - name: EpicHomes
+              #   source: https://www.spigotmc.org/resources/epichomes-26-1-x-support.109590/
+              #   type: auto
+              #   installAs: plugins/EpicHomes.jar
+              #   required: false
+
+            restart:
+              enabled: true
+              interval: 7d
+              stopCommand: stop
+              gracefulStopSeconds: 60
+              warnings:
+                - before: 2h
+                  command: "say Server restart in 2 hours for updates."
+                - before: 30m
+                  command: "say Server restart in 30 minutes for updates."
+                - before: 5m
+                  command: "say Server restart in 5 minutes for updates."
+                - before: 1m
+                  command: "say Server restart in 1 minute for updates."
+            """.formatted(VERSION);
     }
 }

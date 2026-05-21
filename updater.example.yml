@@ -1,5 +1,5 @@
-# Velocity Auto Updater
-# Run with: java -jar velocity-auto-updater.jar run
+# Auto-Updater
+# Run with: java -jar auto-updater.jar run
 #
 # ---------------------------------------------------------------------------
 # Field Guide
@@ -10,14 +10,13 @@
 #
 #   Options:
 #     hosted-safe
-#       Recommended for BisectHosting and other server hosts.
-#       The updater only downloads ready-made jar files from websites/APIs.
+#       Recommended for hosted panels and normal servers.
+#       Only downloads ready-made jar files from websites/APIs.
 #       It will NOT run Git, Gradle, Maven, or compile source code.
 #
 #     auto
-#       Allows the updater to auto-detect source types.
-#       In this version, it still only supports hosted/downloaded jars.
-#       Build-from-source is not included yet.
+#       Allows source auto-detection.
+#       In this version, auto still only supports hosted/downloaded jars.
 #
 # onFailure
 #   What happens if a jar cannot be updated.
@@ -31,35 +30,38 @@
 #     stop
 #       Stop startup if an update fails.
 #
-# userAgent
-#   Text sent with download requests.
-#   PaperMC asks automated download clients to use a real User-Agent with
-#   contact info, so replace your-email@example.com with your own email or site.
+# discovery
+#   Optional source comparison/suggestion behavior.
+#   Discovery is conservative: it suggests and reports. It does not silently
+#   switch plugin sources unless autoSwitchSource is true, and this version only
+#   auto-tries sources that are explicitly listed in fallbackSources.
 #
-# name
-#   A friendly label shown in updater logs.
-#   It has no fixed options. You can name it whatever you want.
-#   This does NOT control the jar filename.
-#
-#   Example:
-#     name: Geyser
+# buildFromSource
+#   Safety settings for future Git build support.
+#   Trusted means a GitHub org/repo you explicitly allow the updater to build.
+#   Building a repo can run Gradle/Maven scripts, so it is a higher-trust action
+#   than downloading a hosted jar.
 #
 # source
 #   Where the updater gets the new jar from.
-#   This can be a supported website, a direct jar download URL, or a local jar path.
 #
 #   Examples:
-#     PaperMC Velocity:
+#     GitHub release:
+#       https://github.com/ViaVersion/ViaVersion
+#
+#     PaperMC server jar:
+#       https://papermc.io/downloads/folia
+#       https://papermc.io/downloads/paper
 #       https://papermc.io/downloads/velocity
 #
-#     Geyser for Velocity:
-#       https://download.geysermc.org/v2/projects/geyser/versions/latest/builds/latest/downloads/velocity
+#     Hangar plugin:
+#       https://hangar.papermc.io/ViaVersion/ViaVersion/versions
 #
-#     Floodgate for Velocity:
-#       https://download.geysermc.org/v2/projects/floodgate/versions/latest/builds/latest/downloads/velocity
-#
-#     Modrinth project page:
+#     Modrinth plugin:
 #       https://modrinth.com/plugin/fancyholograms/versions
+#
+#     SpigotMC resource:
+#       https://www.spigotmc.org/resources/epichomes-26-1-x-support.109590/
 #
 #     Direct jar URL:
 #       https://example.com/MyPlugin.jar
@@ -69,54 +71,86 @@
 #
 #   Options:
 #     auto
-#       Recommended.
-#       The updater guesses the correct type from the source URL.
-#
-#     modrinth
-#       Force the updater to treat the source as a Modrinth project.
+#       Recommended. Guesses the source type from the URL.
 #
 #     papermc
-#       Force the updater to treat the source as a PaperMC download.
+#       Treat source as PaperMC server software: Folia, Paper, Velocity, etc.
+#
+#     github-release
+#       Treat source as a GitHub repo and download the latest release jar.
+#
+#     hangar
+#       Treat source as a Hangar plugin page/API source.
+#
+#     modrinth
+#       Treat source as a Modrinth project.
+#
+#     spigot
+#       Treat source as a SpigotMC resource through the Spiget API.
+#       This only works for resources Spiget can download without a login.
 #
 #     geysermc
-#       Force the updater to treat the source as a GeyserMC download.
+#       Treat source as a GeyserMC download.
 #
 #     direct
-#       Treat the source as a direct jar download URL or local jar file.
+#       Treat source as a direct jar download URL or local jar file.
 #
-# loader
-#   Optional Modrinth filter.
-#   Use this when you only want versions for a specific server/plugin loader.
-#
-#   Examples:
-#     loader: paper
-#     loader: velocity
-#
-# gameVersion
-#   Optional Modrinth filter.
-#   Use this when you only want versions for a specific Minecraft version.
+# installAs
+#   The exact file path and filename the downloaded jar will become.
+#   This controls the final jar name.
 #
 #   Example:
-#     gameVersion: "1.21.8"
+#     installAs: plugins/ViaVersion.jar
+#
+# fallbackSources
+#   Optional comma-separated backup sources to try if the main source fails.
+#   These are explicit sources you approved.
+#
+#   Example:
+#     fallbackSources: https://hangar.papermc.io/ViaVersion/ViaVersion/versions, https://modrinth.com/plugin/viaversion/versions
+#
+# changeVersion
+#   Server jar safety switch.
+#
+#   Options:
+#     false
+#       Recommended for production.
+#       Stay on the configured gameVersion. The updater may install newer
+#       builds for that same version, but it will not jump to another version.
+#
+#     true
+#       Allow the server jar to move to the newest available version.
+#
+# gameVersion
+#   For PaperMC server jars: the server version to stay on when changeVersion is false.
+#   Set this to the Folia/Paper/Velocity version you intentionally want.
+#
+#   Example:
+#     gameVersion: "26.1.2"
+#
+# platform
+#   For Hangar plugins: which platform download to use.
+#
+#   Options commonly include:
+#     paper
+#     velocity
+#     waterfall
+#
+# loader
+#   Optional Modrinth filter. Examples: paper, velocity, fabric.
 #
 # versionType
 #   Optional Modrinth release-type filter.
-#   If omitted, the updater prefers release builds, then beta, then alpha.
+#   If omitted, Modrinth prefers release, then beta, then alpha.
 #
 #   Options:
 #     release
 #     beta
 #     alpha
 #
-# installAs
-#   The exact file path and filename the downloaded jar will become.
-#   This is what controls the final jar name.
-#
-#   Example:
-#     installAs: plugins/Geyser-Velocity.jar
-#
-#   That means the downloaded file will be saved as:
-#     plugins/Geyser-Velocity.jar
+# channel
+#   Optional Hangar channel filter.
+#   If omitted, Hangar prefers Release builds.
 #
 # required
 #   Controls what happens when this jar is missing and cannot be downloaded.
@@ -131,81 +165,91 @@
 #       If no old jar exists, stop startup.
 #
 # java
-#   The Java command used to start Velocity.
-#   Usually:
-#     java
+#   The Java command used to start the server. Usually: java
 #
 # javaArgs
-#   Memory/Java options used when starting Velocity.
-#
-#   Example:
-#     javaArgs: "-Xms512M -Xmx1G"
-#
-#   If your host already controls RAM settings, use:
-#     javaArgs: ""
+#   Memory/Java options used when starting the server.
+#   If your host or panel already controls RAM settings, use: ""
 #
 # args
-#   Extra arguments passed to Velocity after the jar name.
-#   Usually leave this empty:
-#     args: ""
+#   Extra arguments passed to the server after the jar name. Usually: ""
 #
 # restart.enabled
-#   Turns scheduled restarts on or off.
-#
-#   Options:
-#     true
-#     false
+#   Turns scheduled restarts on or off. Options: true or false
 #
 # restart.interval
-#   How often to restart.
-#
-#   Examples:
-#     7d  = every 7 days
-#     12h = every 12 hours
-#     30m = every 30 minutes
+#   How often to restart. Examples: 7d, 12h, 30m
 #
 # restart.stopCommand
-#   Console command sent when it is time to stop Velocity.
-#   Usually:
-#     shutdown
+#   Console command sent when it is time to stop the server.
+#   Folia/Paper usually use: stop
+#   Velocity usually uses: shutdown
 #
 # restart.warnings
-#   Warning commands sent before the restart.
-#   These are sent into the Velocity console.
+#   Warning commands sent into the server console before the restart.
 #
 # ---------------------------------------------------------------------------
 
 mode: hosted-safe
 onFailure: keep-current
 # PaperMC asks automated clients to use a real User-Agent with contact info.
-userAgent: "velocity-auto-updater/0.2.0 (contact: your-email@example.com)"
+userAgent: "Auto-Updater/0.3.0 (contact: your-email@example.com)"
+
+discovery:
+  enabled: true
+  mode: suggest
+  sourcePriority: github-release, hangar, modrinth, spigot
+  checkAlternateSourcesWhenOutdated: true
+  outdatedThresholdDays: 14
+  autoSwitchSource: false
+
+buildFromSource:
+  enabled: false
+  onlyTrusted: true
+  preferHostedIfSameVersion: true
+  trustedGithubOrgs: PaperMC, GeyserMC, ViaVersion
+  trustedGithubRepos: Inquisitors-transfers/MyCustomPlugin
 
 server:
-  name: Velocity
-  source: https://papermc.io/downloads/velocity
+  name: Folia
+  source: https://papermc.io/downloads/folia
   type: auto
-  installAs: velocity.jar
+  installAs: folia.jar
+  gameVersion: "26.1.2"
+  changeVersion: false
   java: java
   javaArgs: "-Xms512M -Xmx1G"
   args: ""
 
 plugins:
-  - name: Geyser
-    source: https://download.geysermc.org/v2/projects/geyser/versions/latest/builds/latest/downloads/velocity
+  - name: ViaVersion
+    source: https://github.com/ViaVersion/ViaVersion
     type: auto
-    installAs: plugins/Geyser-Velocity.jar
+    githubRepo: ViaVersion/ViaVersion
+    platform: paper
+    fallbackSources: https://hangar.papermc.io/ViaVersion/ViaVersion/versions, https://modrinth.com/plugin/viaversion/versions
+    installAs: plugins/ViaVersion.jar
     required: false
 
-  # Optional Floodgate example:
-  # - name: Floodgate
-  #   source: https://download.geysermc.org/v2/projects/floodgate/versions/latest/builds/latest/downloads/velocity
-  #   type: auto
-  #   installAs: plugins/Floodgate-Velocity.jar
-  #   required: false
+  - name: ViaBackwards
+    source: https://github.com/ViaVersion/ViaBackwards
+    type: auto
+    githubRepo: ViaVersion/ViaBackwards
+    platform: paper
+    fallbackSources: https://hangar.papermc.io/ViaVersion/ViaBackwards/versions, https://modrinth.com/plugin/viabackwards/versions
+    installAs: plugins/ViaBackwards.jar
+    required: false
 
-  # Optional Modrinth example.
-  # FancyHolograms is normally a backend server plugin, not a Velocity proxy plugin.
-  # Install it into the plugins folder for the backend server that should run it.
+  - name: ViaRewind
+    source: https://github.com/ViaVersion/ViaRewind
+    type: auto
+    githubRepo: ViaVersion/ViaRewind
+    platform: paper
+    fallbackSources: https://hangar.papermc.io/ViaVersion/ViaRewind/versions, https://modrinth.com/plugin/viarewind/versions
+    installAs: plugins/ViaRewind.jar
+    required: false
+
+  # Optional Modrinth example:
   # - name: FancyHolograms
   #   source: https://modrinth.com/plugin/fancyholograms/versions
   #   type: auto
@@ -213,17 +257,24 @@ plugins:
   #   installAs: plugins/FancyHolograms.jar
   #   required: false
 
+  # Optional Spigot/Spiget example:
+  # - name: EpicHomes
+  #   source: https://www.spigotmc.org/resources/epichomes-26-1-x-support.109590/
+  #   type: auto
+  #   installAs: plugins/EpicHomes.jar
+  #   required: false
+
 restart:
   enabled: true
   interval: 7d
-  stopCommand: shutdown
+  stopCommand: stop
   gracefulStopSeconds: 60
   warnings:
     - before: 2h
-      command: "alert Proxy restart in 2 hours for updates."
+      command: "say Server restart in 2 hours for updates."
     - before: 30m
-      command: "alert Proxy restart in 30 minutes for updates."
+      command: "say Server restart in 30 minutes for updates."
     - before: 5m
-      command: "alert Proxy restart in 5 minutes for updates."
+      command: "say Server restart in 5 minutes for updates."
     - before: 1m
-      command: "alert Proxy restart in 1 minute for updates."
+      command: "say Server restart in 1 minute for updates."

@@ -4,3 +4,4 @@ cache/
 smoke-output/
 *.log
 updater.yml
+updater.lock.yml
