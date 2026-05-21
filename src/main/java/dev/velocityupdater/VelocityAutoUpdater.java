@@ -321,7 +321,7 @@ public final class VelocityAutoUpdater {
         List<String> sourcePriority = new ArrayList<>(List.of("github-release", "hangar", "modrinth", "spigot"));
         boolean checkAlternateSourcesWhenOutdated = true;
         int outdatedThresholdDays = 14;
-        boolean autoSwitchSource = false;
+        boolean autoSwitchSource = true;
         boolean scanInstalledPlugins = true;
     }
 
@@ -941,9 +941,59 @@ public final class VelocityAutoUpdater {
                     }
                 }
                 if (config.discovery.autoSwitchSource) {
-                    Log.warn("autoSwitchSource is enabled. This jar still only auto-switches among explicitly configured fallbackSources.");
+                    if (best != null && needsDiscoveredSource(target)) {
+                        Log.info("autoSwitchSource would use " + best.source + " for " + target.displayName() + ".");
+                    } else {
+                        Log.info("autoSwitchSource is enabled.");
+                    }
                 }
             }
+        }
+
+        private void autoSwitchMissingPluginSources() {
+            if (!config.discovery.autoSwitchSource) {
+                return;
+            }
+            for (TargetConfig target : allTargets()) {
+                if (!target.enabled || target.server || !needsDiscoveredSource(target)) {
+                    continue;
+                }
+                Log.info("Auto-switch discovery for " + target.displayName() + ".");
+                List<DiscoveryCandidate> discovered = discoverSourceCandidates(target);
+                if (discovered.isEmpty()) {
+                    Log.warn("No reliable hosted source found for " + target.displayName() + "; keeping existing jar.");
+                    continue;
+                }
+                applyDiscoveredSource(target, discovered);
+            }
+        }
+
+        private boolean needsDiscoveredSource(TargetConfig target) {
+            return target.source == null || target.source.isBlank() || isAutoValue(target.source);
+        }
+
+        private void applyDiscoveredSource(TargetConfig target, List<DiscoveryCandidate> discovered) {
+            DiscoveryCandidate best = discovered.get(0);
+            target.source = best.source;
+            target.type = "auto";
+            if (best.type.equals("github-release") && !best.projectHint.isBlank()) {
+                target.githubRepo = best.projectHint;
+            }
+
+            Set<String> fallbackSet = new HashSet<>(target.fallbackSources);
+            for (DiscoveryCandidate candidate : discovered) {
+                if (candidate.source.equals(best.source)) {
+                    continue;
+                }
+                if (fallbackSet.add(candidate.source)) {
+                    target.fallbackSources.add(candidate.source);
+                }
+                if (target.fallbackSources.size() >= 3) {
+                    break;
+                }
+            }
+            Log.info("Auto-switched " + target.displayName() + " source -> " + best.source
+                + (target.fallbackSources.isEmpty() ? "" : " with " + target.fallbackSources.size() + " fallback(s)"));
         }
 
         private List<DiscoveryCandidate> discoverSourceCandidates(TargetConfig target) {
@@ -1441,6 +1491,7 @@ public final class VelocityAutoUpdater {
             List<InstalledUpdate> installed = new ArrayList<>();
             Files.createDirectories(config.resolve(config.cacheDir));
             Files.createDirectories(config.resolve(config.backupDir));
+            autoSwitchMissingPluginSources();
             for (TargetConfig target : allTargets()) {
                 if (!target.enabled) {
                     Log.info("Skipping disabled target: " + target.displayName());
@@ -3528,7 +3579,7 @@ public final class VelocityAutoUpdater {
               sourcePriority: github-release, hangar, modrinth, spigot
               checkAlternateSourcesWhenOutdated: true
               outdatedThresholdDays: 14
-              autoSwitchSource: false
+              autoSwitchSource: true
               scanInstalledPlugins: true
 
             buildFromSource:
@@ -3659,8 +3710,9 @@ public final class VelocityAutoUpdater {
             #   How old a source can look before discovery treats it as stale.
             #
             # discovery.autoSwitchSource
-            #   If false, the updater will not silently switch plugin sources.
-            #   This version only auto-tries sources listed in fallbackSources.
+            #   If true, plugins with no source can use the best discovered hosted source
+            #   automatically for that run, with other strong matches added as fallbacks.
+            #   Existing explicit sources are left alone.
             #
             # discovery.scanInstalledPlugins
             #   If true, scans plugins/ for jars that are not already listed.

@@ -13,7 +13,7 @@ discovery:
   sourcePriority: github-release, hangar, modrinth, spigot
   checkAlternateSourcesWhenOutdated: true
   outdatedThresholdDays: 14
-  autoSwitchSource: false
+  autoSwitchSource: true
   scanInstalledPlugins: true
 
 buildFromSource:
@@ -144,8 +144,9 @@ restart:
 #   How old a source can look before discovery treats it as stale.
 #
 # discovery.autoSwitchSource
-#   If false, the updater will not silently switch plugin sources.
-#   This version only auto-tries sources listed in fallbackSources.
+#   If true, plugins with no source can use the best discovered hosted source
+#   automatically for that run, with other strong matches added as fallbacks.
+#   Existing explicit sources are left alone.
 #
 # discovery.scanInstalledPlugins
 #   If true, scans plugins/ for jars that are not already listed.
