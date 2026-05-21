@@ -1,4 +1,5 @@
 build/
+.gradle/
 backups/
 cache/
 smoke-output/

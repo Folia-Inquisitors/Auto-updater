@@ -13,7 +13,26 @@ https://discord.gg/aT9z7q7hX8
 
 ## Building instructions
 
+On Windows:
+
+```powershell
+.\gradlew.bat build
+```
+
+On Linux/macOS:
+
+```bash
 ./gradlew build
+```
+
+The jar is written to Gradle's build output and also copied to `dist/`:
+
+```text
+build/libs/auto-updater.jar
+dist/auto-updater.jar
+```
+
+The older `build.ps1` script is still available as a simple fallback build on Windows.
 
 ## What It Supports
 
@@ -41,7 +60,6 @@ https://discord.gg/aT9z7q7hX8
 ### Folia inquisitors
 
 [<img src="https://github.com/Folia-Inquisitors.png" width=80 alt="Folia-Inquisitors">](https://github.com/orgs/Folia-Inquisitors/repositories)
-
 
 ## First Run
 Server Root Shape

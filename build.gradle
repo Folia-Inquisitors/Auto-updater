@@ -1,0 +1,42 @@
+plugins {
+    id 'application'
+    id 'java'
+}
+
+group = 'dev.velocityupdater'
+version = '0.3.0'
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
+
+application {
+    mainClass = 'dev.velocityupdater.VelocityAutoUpdater'
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = 17
+}
+
+tasks.named('jar') {
+    archiveFileName = 'auto-updater.jar'
+    manifest {
+        attributes(
+            'Main-Class': application.mainClass.get(),
+            'Implementation-Version': project.version
+        )
+    }
+}
+
+tasks.register('copyDist', Copy) {
+    dependsOn tasks.named('jar')
+    from(tasks.named('jar').flatMap { it.archiveFile })
+    into(layout.projectDirectory.dir('dist'))
+    rename { 'auto-updater.jar' }
+}
+
+tasks.named('build') {
+    dependsOn tasks.named('copyDist')
+}
