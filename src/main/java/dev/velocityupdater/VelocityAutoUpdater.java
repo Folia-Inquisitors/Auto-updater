@@ -97,8 +97,8 @@ public final class VelocityAutoUpdater {
                 updater.updateAll();
                 return 0;
             case "run":
-                updater.updateAll();
-                return new ServerRunner(config, updater).runServerLoop();
+                List<InstalledUpdate> startupUpdates = updater.updateAll();
+                return new ServerRunner(config, updater).runServerLoop(startupUpdates);
             default:
                 Log.error("Unknown command: " + cli.command);
                 printHelp();
@@ -808,6 +808,22 @@ public final class VelocityAutoUpdater {
         }
     }
 
+    private static final class InstalledUpdate {
+        final TargetConfig target;
+        final Path targetPath;
+        final Path backupPath;
+
+        InstalledUpdate(TargetConfig target, Path targetPath, Path backupPath) {
+            this.target = target;
+            this.targetPath = targetPath;
+            this.backupPath = backupPath;
+        }
+
+        boolean hasBackup() {
+            return backupPath != null && Files.exists(backupPath);
+        }
+    }
+
     private static final class Updater {
         private final AppConfig config;
         private final HttpClient client;
@@ -1421,7 +1437,8 @@ public final class VelocityAutoUpdater {
             return compareVersionValues(cleanedCandidate, cleanedLocal) < 0;
         }
 
-        void updateAll() throws Exception {
+        List<InstalledUpdate> updateAll() throws Exception {
+            List<InstalledUpdate> installed = new ArrayList<>();
             Files.createDirectories(config.resolve(config.cacheDir));
             Files.createDirectories(config.resolve(config.backupDir));
             for (TargetConfig target : allTargets()) {
@@ -1434,7 +1451,8 @@ public final class VelocityAutoUpdater {
                     continue;
                 }
                 try {
-                    updateOne(target);
+                    Optional<InstalledUpdate> update = updateOne(target);
+                    update.ifPresent(installed::add);
                 } catch (Exception ex) {
                     Path targetPath = config.resolve(Paths.get(target.installAs));
                     boolean mayContinue = config.onFailure.equals("keep-current") && Files.exists(targetPath);
@@ -1449,6 +1467,7 @@ public final class VelocityAutoUpdater {
                     }
                 }
             }
+            return installed;
         }
 
         private List<TargetConfig> allTargets() {
@@ -1458,10 +1477,10 @@ public final class VelocityAutoUpdater {
             return targets;
         }
 
-        private void updateOne(TargetConfig target) throws Exception {
+        private Optional<InstalledUpdate> updateOne(TargetConfig target) throws Exception {
             if (target.source == null || target.source.isBlank() || isAutoValue(target.source)) {
                 Log.info("No source configured for " + target.displayName() + "; keeping existing jar.");
-                return;
+                return Optional.empty();
             }
             List<String> sources = new ArrayList<>();
             sources.add(target.source);
@@ -1470,8 +1489,7 @@ public final class VelocityAutoUpdater {
             for (int i = 0; i < sources.size(); i++) {
                 TargetConfig candidate = i == 0 ? target : target.copyWithSource(sources.get(i));
                 try {
-                    updateOneFromSource(candidate);
-                    return;
+                    return updateOneFromSource(candidate);
                 } catch (Exception ex) {
                     last = ex;
                     if (i + 1 < sources.size()) {
@@ -1483,7 +1501,7 @@ public final class VelocityAutoUpdater {
             throw last == null ? new IOException("No source configured for " + target.displayName()) : last;
         }
 
-        private void updateOneFromSource(TargetConfig target) throws Exception {
+        private Optional<InstalledUpdate> updateOneFromSource(TargetConfig target) throws Exception {
             SourcePlan plan = resolveSource(target);
             Log.info("Checking " + target.displayName() + " (" + plan.type + ")");
             ResolvedDownload download = plan.resolver.resolve(target);
@@ -1502,11 +1520,11 @@ public final class VelocityAutoUpdater {
                     Files.deleteIfExists(staging);
                     Log.info(target.displayName() + " is already current (" + shortHash(newHash) + ").");
                     updateLockIfNeeded(target, download);
-                    return;
+                    return Optional.empty();
                 }
-                backup(targetPath);
             }
 
+            Path backupPath = Files.exists(targetPath) ? backup(targetPath) : null;
             Path parent = targetPath.getParent();
             if (parent != null) {
                 Files.createDirectories(parent);
@@ -1514,6 +1532,7 @@ public final class VelocityAutoUpdater {
             moveReplace(staging, targetPath);
             Log.info("Installed " + target.displayName() + " -> " + targetPath + " (" + shortHash(newHash) + ")");
             updateLockIfNeeded(target, download);
+            return Optional.of(new InstalledUpdate(target, targetPath, backupPath));
         }
 
         private boolean isTrustedGithubRepo(String repo) {
@@ -1643,7 +1662,7 @@ public final class VelocityAutoUpdater {
             }
         }
 
-        private void backup(Path targetPath) throws IOException {
+        private Path backup(Path targetPath) throws IOException {
             Path backups = config.resolve(config.backupDir);
             Files.createDirectories(backups);
             String filename = targetPath.getFileName().toString();
@@ -1651,6 +1670,7 @@ public final class VelocityAutoUpdater {
             Path backup = backups.resolve(filename + "." + stamp + ".bak");
             Files.copy(targetPath, backup, StandardCopyOption.REPLACE_EXISTING);
             Log.info("Backed up " + targetPath.getFileName() + " -> " + backup);
+            return backup;
         }
 
         private static void validateJar(Path path) throws IOException {
@@ -2395,16 +2415,34 @@ public final class VelocityAutoUpdater {
             this.updater = updater;
         }
 
-        int runServerLoop() throws Exception {
+        int runServerLoop(List<InstalledUpdate> startupUpdates) throws Exception {
             Path serverJar = config.resolve(Paths.get(config.server.installAs));
             if (!Files.exists(serverJar)) {
                 throw new IOException("Server jar does not exist: " + serverJar);
             }
 
+            List<InstalledUpdate> pendingStartupUpdates = new ArrayList<>(startupUpdates);
             while (true) {
                 Process process = startServer(serverJar);
-                Thread outputThread = pipeOutput(process);
+                StartupHealthMonitor startupHealth = new StartupHealthMonitor(pendingStartupUpdates);
+                Thread outputThread = pipeOutput(process, startupHealth);
                 Thread inputThread = pipeInput(process);
+
+                StartupResult startupResult = monitorStartupHealth(process, startupHealth);
+                if (startupResult.rollbackAndRestart) {
+                    outputThread.join(TimeUnit.SECONDS.toMillis(5));
+                    inputThread.interrupt();
+                    rollbackUpdates(startupResult.failedUpdates);
+                    pendingStartupUpdates = Collections.emptyList();
+                    Log.warn("Restarting once with the previous known-good jar(s).");
+                    continue;
+                }
+                if (startupResult.processExited) {
+                    outputThread.join(TimeUnit.SECONDS.toMillis(5));
+                    inputThread.interrupt();
+                    Log.info("Server exited with code " + startupResult.exitCode + ".");
+                    return startupResult.exitCode;
+                }
 
                 RunResult result = config.restart.enabled
                     ? monitorWithRestart(process)
@@ -2419,7 +2457,7 @@ public final class VelocityAutoUpdater {
                 }
 
                 Log.info("Scheduled restart completed. Updating before next start.");
-                updater.updateAll();
+                pendingStartupUpdates = updater.updateAll();
             }
         }
 
@@ -2438,10 +2476,14 @@ public final class VelocityAutoUpdater {
             return builder.start();
         }
 
-        private Thread pipeOutput(Process process) {
+        private Thread pipeOutput(Process process, StartupHealthMonitor startupHealth) {
             Thread thread = new Thread(() -> {
-                try (InputStream in = process.getInputStream()) {
-                    in.transferTo(System.out);
+                try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        System.out.println(line);
+                        startupHealth.observe(line);
+                    }
                 } catch (IOException ignored) {
                     // Process streams close during normal shutdown.
                 }
@@ -2471,6 +2513,68 @@ public final class VelocityAutoUpdater {
         private RunResult waitForExit(Process process) throws InterruptedException {
             int exitCode = process.waitFor();
             return new RunResult(false, exitCode);
+        }
+
+        private StartupResult monitorStartupHealth(Process process, StartupHealthMonitor startupHealth) throws Exception {
+            if (!startupHealth.enabled()) {
+                return StartupResult.continueRunning();
+            }
+            Instant deadline = Instant.now().plusSeconds(120);
+            while (process.isAlive() && Instant.now().isBefore(deadline)) {
+                if (startupHealth.hasFailures()) {
+                    Log.warn("Detected plugin load failure after update; stopping server to roll back.");
+                    stopProcess(process);
+                    return StartupResult.rollback(startupHealth.failedUpdates());
+                }
+                process.waitFor(1, TimeUnit.SECONDS);
+            }
+            if (!process.isAlive()) {
+                int exitCode = process.exitValue();
+                if (startupHealth.hasFailures()) {
+                    Log.warn("Detected plugin load failure during startup; rolling back recent updated plugin jar(s).");
+                    return StartupResult.rollback(startupHealth.failedUpdates());
+                }
+                if (exitCode != 0 && startupHealth.hasUpdatedJars()) {
+                    Log.warn("Server exited during startup after updates; rolling back recent updated jar(s).");
+                    return StartupResult.rollback(startupHealth.allUpdatedJars());
+                }
+                return StartupResult.exited(exitCode);
+            }
+            Log.info("Startup health window passed for updated jar(s).");
+            return StartupResult.continueRunning();
+        }
+
+        private void stopProcess(Process process) throws Exception {
+            if (!process.isAlive()) {
+                return;
+            }
+            try {
+                sendCommand(process, config.restart.stopCommand);
+            } catch (IOException ex) {
+                Log.warn("Could not send stop command before rollback: " + ex.getMessage());
+            }
+            boolean stopped = process.waitFor(config.restart.gracefulStopSeconds, TimeUnit.SECONDS);
+            if (!stopped) {
+                Log.warn("Server did not stop before rollback; terminating process.");
+                process.destroy();
+                stopped = process.waitFor(15, TimeUnit.SECONDS);
+                if (!stopped) {
+                    process.destroyForcibly();
+                    process.waitFor();
+                }
+            }
+        }
+
+        private void rollbackUpdates(List<InstalledUpdate> updates) throws IOException {
+            for (InstalledUpdate update : updates) {
+                if (update.hasBackup()) {
+                    Files.copy(update.backupPath, update.targetPath, StandardCopyOption.REPLACE_EXISTING);
+                    Log.warn("Rolled back " + update.target.displayName() + " -> " + update.targetPath.getFileName());
+                } else {
+                    Files.deleteIfExists(update.targetPath);
+                    Log.warn("Removed failed new jar for " + update.target.displayName() + " because no previous jar existed.");
+                }
+            }
         }
 
         private RunResult monitorWithRestart(Process process) throws Exception {
@@ -2524,6 +2628,123 @@ public final class VelocityAutoUpdater {
         RunResult(boolean scheduledRestart, int exitCode) {
             this.scheduledRestart = scheduledRestart;
             this.exitCode = exitCode;
+        }
+    }
+
+    private static final class StartupResult {
+        final boolean rollbackAndRestart;
+        final boolean processExited;
+        final int exitCode;
+        final List<InstalledUpdate> failedUpdates;
+
+        private StartupResult(boolean rollbackAndRestart, boolean processExited, int exitCode, List<InstalledUpdate> failedUpdates) {
+            this.rollbackAndRestart = rollbackAndRestart;
+            this.processExited = processExited;
+            this.exitCode = exitCode;
+            this.failedUpdates = failedUpdates;
+        }
+
+        static StartupResult continueRunning() {
+            return new StartupResult(false, false, 0, Collections.emptyList());
+        }
+
+        static StartupResult exited(int exitCode) {
+            return new StartupResult(false, true, exitCode, Collections.emptyList());
+        }
+
+        static StartupResult rollback(List<InstalledUpdate> failedUpdates) {
+            return new StartupResult(true, false, 0, failedUpdates);
+        }
+    }
+
+    private static final class StartupHealthMonitor {
+        private final List<InstalledUpdate> updatedJars;
+        private final List<InstalledUpdate> failedUpdates = Collections.synchronizedList(new ArrayList<>());
+
+        StartupHealthMonitor(List<InstalledUpdate> updatedJars) {
+            this.updatedJars = updatedJars.stream()
+                .filter(update -> update != null && !update.target.server)
+                .toList();
+        }
+
+        boolean enabled() {
+            return !updatedJars.isEmpty();
+        }
+
+        boolean hasUpdatedJars() {
+            return !updatedJars.isEmpty();
+        }
+
+        void observe(String line) {
+            if (!enabled()) {
+                return;
+            }
+            String lowerLine = normalizeLogLine(line);
+            if (!looksLikePluginLoadFailure(lowerLine)) {
+                return;
+            }
+            for (InstalledUpdate update : updatedJars) {
+                if (lineMentionsUpdate(lowerLine, update) && !failedUpdates.contains(update)) {
+                    failedUpdates.add(update);
+                    Log.warn("Startup failure appears to mention updated plugin " + update.target.displayName() + ".");
+                }
+            }
+        }
+
+        boolean hasFailures() {
+            return !failedUpdates.isEmpty();
+        }
+
+        List<InstalledUpdate> failedUpdates() {
+            synchronized (failedUpdates) {
+                return new ArrayList<>(failedUpdates);
+            }
+        }
+
+        List<InstalledUpdate> allUpdatedJars() {
+            return new ArrayList<>(updatedJars);
+        }
+
+        private boolean lineMentionsUpdate(String lowerLine, InstalledUpdate update) {
+            for (String token : updateTokens(update)) {
+                if (!token.isBlank() && lowerLine.contains(token)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private List<String> updateTokens(InstalledUpdate update) {
+            List<String> tokens = new ArrayList<>();
+            tokens.add(normalizeLogLine(update.target.displayName()));
+            tokens.add(normalizeLogLine(update.target.detectedPluginId));
+            tokens.add(normalizeLogLine(update.target.installAs));
+            if (update.targetPath.getFileName() != null) {
+                tokens.add(normalizeLogLine(update.targetPath.getFileName().toString()));
+                String filename = update.targetPath.getFileName().toString();
+                if (lower(filename).endsWith(".jar")) {
+                    tokens.add(normalizeLogLine(filename.substring(0, filename.length() - 4)));
+                }
+            }
+            return tokens.stream().filter(token -> token.length() >= 3).distinct().toList();
+        }
+
+        private boolean looksLikePluginLoadFailure(String lowerLine) {
+            return lowerLine.contains("could not load")
+                || lowerLine.contains("failed to load")
+                || lowerLine.contains("error occurred while enabling")
+                || lowerLine.contains("error occurred while loading")
+                || lowerLine.contains("exception loading")
+                || lowerLine.contains("invalid plugin.yml")
+                || lowerLine.contains("invalid plugin descriptor")
+                || lowerLine.contains("unknown dependency")
+                || lowerLine.contains("missing dependency")
+                || lowerLine.contains("is not a valid plugin")
+                || (lowerLine.contains("disabling") && lowerLine.contains("error"));
+        }
+
+        private String normalizeLogLine(String value) {
+            return value == null ? "" : value.toLowerCase(Locale.ROOT).replace('\\', '/');
         }
     }
 
@@ -3407,6 +3628,13 @@ public final class VelocityAutoUpdater {
             #     This helps the server still start when a download site is down.
             #   stop:
             #     Stop startup if a required update cannot be completed.
+            #
+            # startup rollback
+            #   After installing plugin updates, Auto-Updater watches early server console
+            #   output for load failures that mention an updated plugin. If one is found,
+            #   it restores the previous jar backup, restarts once, and keeps the server on
+            #   the last jar that actually loaded. If no previous jar existed, it removes
+            #   the failed new jar.
             #
             # userAgent
             #   Sent to download APIs. PaperMC asks automated clients to include a real

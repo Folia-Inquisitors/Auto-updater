@@ -114,6 +114,13 @@ restart:
 #   stop:
 #     Stop startup if a required update cannot be completed.
 #
+# startup rollback
+#   After installing plugin updates, Auto-Updater watches early server console
+#   output for load failures that mention an updated plugin. If one is found,
+#   it restores the previous jar backup, restarts once, and keeps the server on
+#   the last jar that actually loaded. If no previous jar existed, it removes
+#   the failed new jar.
+#
 # userAgent
 #   Sent to download APIs. PaperMC asks automated clients to include a real
 #   contact string, so replace your-email@example.com.
