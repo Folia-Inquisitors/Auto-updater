@@ -182,6 +182,7 @@ public final class VelocityAutoUpdater {
         List<TargetConfig> plugins = new ArrayList<>();
         DiscoveryConfig discovery = new DiscoveryConfig();
         BuildFromSourceConfig buildFromSource = new BuildFromSourceConfig();
+        FailureMemoryConfig failureMemory = new FailureMemoryConfig();
         RestartConfig restart = new RestartConfig();
 
         void validate() {
@@ -261,6 +262,8 @@ public final class VelocityAutoUpdater {
             for (TargetConfig plugin : plugins) {
                 if (plugin.installAs != null && !plugin.installAs.isBlank()) {
                     configured.add(normalizedConfigPath(plugin.installAs));
+                } else if (plugin.name != null && !plugin.name.isBlank()) {
+                    configured.add(normalizedConfigPath("plugins/" + safeName(plugin.name) + ".jar"));
                 }
             }
             List<Path> jars = listJarFiles(pluginDir);
@@ -336,10 +339,16 @@ public final class VelocityAutoUpdater {
         List<String> trustedGithubRepos = new ArrayList<>();
     }
 
+    private static final class FailureMemoryConfig {
+        boolean enabled = true;
+        String retryBadAfter = "never";
+    }
+
     private static final class TargetConfig {
         String name;
         boolean server;
         boolean enabled = true;
+        boolean autoUpdate = true;
         boolean required;
         String source;
         List<String> fallbackSources = new ArrayList<>();
@@ -378,6 +387,7 @@ public final class VelocityAutoUpdater {
         TargetConfig copyWithSource(String source) {
             TargetConfig copy = new TargetConfig(name, server);
             copy.enabled = enabled;
+            copy.autoUpdate = autoUpdate;
             copy.required = required;
             copy.source = source;
             copy.type = "auto";
@@ -458,6 +468,10 @@ public final class VelocityAutoUpdater {
                     case "build_from_source":
                         applyBuildFromSource(config.buildFromSource, keyValue(line, lineNo));
                         break;
+                    case "failurememory":
+                    case "failure_memory":
+                        applyFailureMemory(config.failureMemory, keyValue(line, lineNo));
+                        break;
                     case "plugins":
                         if (line.startsWith("- ")) {
                             currentPlugin = new TargetConfig(null, false);
@@ -537,6 +551,10 @@ public final class VelocityAutoUpdater {
                     break;
                 case "enabled":
                     target.enabled = parseBoolean(kv.value);
+                    break;
+                case "autoupdate":
+                case "auto_update":
+                    target.autoUpdate = parseBoolean(kv.value);
                     break;
                 case "required":
                     target.required = parseBoolean(kv.value);
@@ -658,6 +676,20 @@ public final class VelocityAutoUpdater {
                     break;
                 default:
                     throw new IllegalArgumentException("Unknown buildFromSource key: " + kv.key);
+            }
+        }
+
+        private static void applyFailureMemory(FailureMemoryConfig failureMemory, KeyValue kv) {
+            switch (lower(kv.key)) {
+                case "enabled":
+                    failureMemory.enabled = parseBoolean(kv.value);
+                    break;
+                case "retrybadafter":
+                case "retry_bad_after":
+                    failureMemory.retryBadAfter = kv.value;
+                    break;
+                default:
+                    throw new IllegalArgumentException("Unknown failureMemory key: " + kv.key);
             }
         }
 
@@ -991,6 +1023,7 @@ public final class VelocityAutoUpdater {
             entry.add("  - name: " + quoteYaml(target.displayName()));
             entry.add("    source: " + quoteYaml(target.source));
             entry.add("    type: auto");
+            entry.add("    autoUpdate: " + target.autoUpdate);
             if (target.githubRepo != null && !target.githubRepo.isBlank()) {
                 entry.add("    githubRepo: " + quoteYaml(target.githubRepo));
             }
@@ -1024,6 +1057,202 @@ public final class VelocityAutoUpdater {
                 this.end = end;
                 this.itemIndent = itemIndent;
                 this.propertyIndent = propertyIndent;
+            }
+        }
+    }
+
+    private static final class LockState {
+        String serverProject = "";
+        String serverGameVersion = "";
+        String serverBuild = "";
+        final Map<String, BadPluginVersion> badPluginVersions = new LinkedHashMap<>();
+
+        static LockState read(AppConfig config) {
+            LockState state = new LockState();
+            Path lock = lockPath(config);
+            if (!Files.exists(lock)) {
+                return state;
+            }
+            try {
+                List<String> lines = Files.readAllLines(lock, StandardCharsets.UTF_8);
+                String section = "";
+                BadPluginVersion currentBad = null;
+                for (String raw : lines) {
+                    String noComment = ConfigParser.stripComment(raw);
+                    String line = noComment.trim();
+                    if (line.isEmpty() || !line.contains(":")) {
+                        continue;
+                    }
+                    int indent = ConfigParser.countIndent(noComment);
+                    if (indent == 0) {
+                        currentBad = null;
+                        KeyValue kv = ConfigParser.keyValue(line, 0);
+                        String key = lower(kv.key);
+                        if (kv.value.isEmpty()) {
+                            section = key;
+                            continue;
+                        }
+                        section = "";
+                        switch (key) {
+                            case "serverproject":
+                                state.serverProject = kv.value;
+                                break;
+                            case "servergameversion":
+                                state.serverGameVersion = kv.value;
+                                break;
+                            case "serverbuild":
+                                state.serverBuild = kv.value;
+                                break;
+                            default:
+                                break;
+                        }
+                        continue;
+                    }
+
+                    if (!section.equals("badpluginversions")) {
+                        continue;
+                    }
+                    if (indent == 2) {
+                        KeyValue kv = ConfigParser.keyValue(line, 0);
+                        if (kv.value.isEmpty()) {
+                            String installAs = ConfigParser.unquote(kv.key);
+                            currentBad = new BadPluginVersion(installAs);
+                            state.badPluginVersions.put(lockKey(installAs), currentBad);
+                        }
+                        continue;
+                    }
+                    if (indent >= 4 && currentBad != null) {
+                        KeyValue kv = ConfigParser.keyValue(line, 0);
+                        currentBad.apply(kv.key, kv.value);
+                    }
+                }
+            } catch (Exception ex) {
+                Log.warn("Could not read updater.lock.yml: " + ex.getMessage());
+            }
+            return state;
+        }
+
+        void write(AppConfig config) throws IOException {
+            Path lock = lockPath(config);
+            List<String> lines = new ArrayList<>();
+            lines.add("# Auto-generated by " + APP_NAME + ".");
+            lines.add("# Keep this file so Auto-Updater can remember locked server versions and known-bad plugin jars.");
+            if (!serverProject.isBlank()) {
+                lines.add("serverProject: " + quoteYaml(serverProject));
+            }
+            if (!serverGameVersion.isBlank()) {
+                lines.add("serverGameVersion: " + quoteYaml(serverGameVersion));
+            }
+            if (!serverBuild.isBlank()) {
+                lines.add("serverBuild: " + quoteYaml(serverBuild));
+            }
+            if (!badPluginVersions.isEmpty()) {
+                lines.add("badPluginVersions:");
+                for (BadPluginVersion bad : badPluginVersions.values()) {
+                    lines.add("  " + quoteYamlKey(bad.installAs) + ":");
+                    lines.add("    source: " + quoteYaml(bad.source));
+                    lines.add("    version: " + quoteYaml(bad.version));
+                    lines.add("    sha256: " + quoteYaml(bad.sha256));
+                    lines.add("    reason: " + quoteYaml(bad.reason));
+                    lines.add("    failedAt: " + quoteYaml(bad.failedAt));
+                }
+            }
+            Files.write(lock, lines, StandardCharsets.UTF_8);
+        }
+
+        Optional<BadPluginVersion> activeBadPlugin(AppConfig config, TargetConfig target, ResolvedDownload download, String sha256) {
+            if (!config.failureMemory.enabled || target.server) {
+                return Optional.empty();
+            }
+            BadPluginVersion bad = badPluginVersions.get(lockKey(target.installAs));
+            if (bad == null || retryWindowExpired(config, bad)) {
+                return Optional.empty();
+            }
+            if (!bad.sha256.isBlank() && bad.sha256.equalsIgnoreCase(sha256)) {
+                return Optional.of(bad);
+            }
+            if (bad.sha256.isBlank()
+                && !bad.version.isBlank()
+                && !download.version.isBlank()
+                && bad.version.equalsIgnoreCase(download.version)
+                && sourcesMatch(bad.source, target.source)) {
+                return Optional.of(bad);
+            }
+            return Optional.empty();
+        }
+
+        void rememberBadPlugin(InstalledUpdate update, String reason) {
+            if (update == null || update.target.server || update.sha256.isBlank()) {
+                return;
+            }
+            BadPluginVersion bad = new BadPluginVersion(update.target.installAs);
+            bad.source = firstNonBlank(update.source, update.target.source, "");
+            bad.version = update.version;
+            bad.sha256 = update.sha256;
+            bad.reason = reason;
+            bad.failedAt = Instant.now().toString();
+            badPluginVersions.put(lockKey(update.target.installAs), bad);
+        }
+
+        private boolean retryWindowExpired(AppConfig config, BadPluginVersion bad) {
+            String retry = lower(config.failureMemory.retryBadAfter).trim();
+            if (retry.isBlank() || retry.equals("never") || retry.equals("false") || retry.equals("off") || retry.equals("no")) {
+                return false;
+            }
+            try {
+                Duration delay = parseDuration(retry);
+                Instant failed = Instant.parse(bad.failedAt);
+                return Instant.now().isAfter(failed.plus(delay));
+            } catch (Exception ex) {
+                return false;
+            }
+        }
+
+        private static boolean sourcesMatch(String a, String b) {
+            return normalizeSlashes(firstNonBlank(a, "")).equalsIgnoreCase(normalizeSlashes(firstNonBlank(b, "")));
+        }
+
+        private static Path lockPath(AppConfig config) {
+            return config.resolve(Paths.get("updater.lock.yml"));
+        }
+
+        private static String lockKey(String installAs) {
+            return normalizedConfigPath(firstNonBlank(installAs, ""));
+        }
+    }
+
+    private static final class BadPluginVersion {
+        final String installAs;
+        String source = "";
+        String version = "";
+        String sha256 = "";
+        String reason = "";
+        String failedAt = "";
+
+        BadPluginVersion(String installAs) {
+            this.installAs = firstNonBlank(installAs, "plugins/unknown.jar");
+        }
+
+        void apply(String key, String value) {
+            switch (lower(key)) {
+                case "source":
+                    source = value;
+                    break;
+                case "version":
+                    version = value;
+                    break;
+                case "sha256":
+                    sha256 = value;
+                    break;
+                case "reason":
+                    reason = value;
+                    break;
+                case "failedat":
+                case "failed_at":
+                    failedAt = value;
+                    break;
+                default:
+                    break;
             }
         }
     }
@@ -1092,11 +1321,17 @@ public final class VelocityAutoUpdater {
         final TargetConfig target;
         final Path targetPath;
         final Path backupPath;
+        final String source;
+        final String version;
+        final String sha256;
 
-        InstalledUpdate(TargetConfig target, Path targetPath, Path backupPath) {
+        InstalledUpdate(TargetConfig target, Path targetPath, Path backupPath, String source, String version, String sha256) {
             this.target = target;
             this.targetPath = targetPath;
             this.backupPath = backupPath;
+            this.source = firstNonBlank(source, "");
+            this.version = firstNonBlank(version, "");
+            this.sha256 = firstNonBlank(sha256, "");
         }
 
         boolean hasBackup() {
@@ -1123,10 +1358,15 @@ public final class VelocityAutoUpdater {
             Log.info("Installed plugin scan: " + (config.discovery.scanInstalledPlugins ? "enabled" : "disabled"));
             Log.info("Build from source: " + (config.buildFromSource.enabled ? "enabled" : "disabled")
                 + ", preferHostedIfSameVersion=" + config.buildFromSource.preferHostedIfSameVersion);
+            Log.info("Failure memory: " + (config.failureMemory.enabled ? "enabled (retryBadAfter=" + config.failureMemory.retryBadAfter + ")" : "disabled"));
             Log.info("Server install target: " + config.resolve(Paths.get(config.server.installAs)));
             for (TargetConfig target : allTargets()) {
                 if (!target.enabled) {
                     Log.info("Skipping disabled target: " + target.displayName());
+                    continue;
+                }
+                if (!target.server && !target.autoUpdate) {
+                    Log.info("Skipping " + target.displayName() + " because autoUpdate is false.");
                     continue;
                 }
                 if (target.source == null || target.source.isBlank() || isAutoValue(target.source)) {
@@ -1155,6 +1395,7 @@ public final class VelocityAutoUpdater {
             Log.info("Build from source: " + (config.buildFromSource.enabled ? "enabled" : "disabled")
                 + ", onlyTrusted=" + config.buildFromSource.onlyTrusted
                 + ", preferHostedIfSameVersion=" + config.buildFromSource.preferHostedIfSameVersion);
+            Log.info("Failure memory: " + (config.failureMemory.enabled ? "enabled (retryBadAfter=" + config.failureMemory.retryBadAfter + ")" : "disabled"));
             if (!config.buildFromSource.trustedGithubOrgs.isEmpty()) {
                 Log.info("Trusted GitHub orgs: " + String.join(", ", config.buildFromSource.trustedGithubOrgs));
             }
@@ -1164,6 +1405,12 @@ public final class VelocityAutoUpdater {
 
             for (TargetConfig target : allTargets()) {
                 if (!target.enabled || target.server) {
+                    continue;
+                }
+                if (!target.autoUpdate) {
+                    Log.info("");
+                    Log.info("Discovery target: " + target.displayName());
+                    Log.info("autoUpdate is false; skipping source discovery and updates for this plugin.");
                     continue;
                 }
                 Log.info("");
@@ -1243,7 +1490,7 @@ public final class VelocityAutoUpdater {
                 return;
             }
             for (TargetConfig target : allTargets()) {
-                if (!target.enabled || target.server || !needsDiscoveredSource(target)) {
+                if (!target.enabled || target.server || !target.autoUpdate || !needsDiscoveredSource(target)) {
                     continue;
                 }
                 Log.info("Auto-switch discovery for " + target.displayName() + ".");
@@ -1807,6 +2054,10 @@ public final class VelocityAutoUpdater {
                     Log.info("Skipping disabled target: " + target.displayName());
                     continue;
                 }
+                if (!target.server && !target.autoUpdate) {
+                    Log.info("Skipping " + target.displayName() + " because autoUpdate is false.");
+                    continue;
+                }
                 if (target.source == null || target.source.isBlank() || isAutoValue(target.source)) {
                     Log.info("No source configured for " + target.displayName() + "; keeping existing jar.");
                     continue;
@@ -1875,6 +2126,14 @@ public final class VelocityAutoUpdater {
             validateJar(staging);
 
             String newHash = sha256(staging);
+            Optional<BadPluginVersion> knownBad = knownBadPlugin(target, download, newHash);
+            if (knownBad.isPresent()) {
+                Files.deleteIfExists(staging);
+                BadPluginVersion bad = knownBad.get();
+                Log.warn("Skipping known-bad update for " + target.displayName()
+                    + " (" + firstNonBlank(bad.version, shortHash(bad.sha256)) + "); keeping current jar.");
+                return Optional.empty();
+            }
             if (Files.exists(targetPath)) {
                 String oldHash = sha256(targetPath);
                 if (oldHash.equalsIgnoreCase(newHash)) {
@@ -1893,7 +2152,38 @@ public final class VelocityAutoUpdater {
             moveReplace(staging, targetPath);
             Log.info("Installed " + target.displayName() + " -> " + targetPath + " (" + shortHash(newHash) + ")");
             updateLockIfNeeded(target, download);
-            return Optional.of(new InstalledUpdate(target, targetPath, backupPath));
+            return Optional.of(new InstalledUpdate(target, targetPath, backupPath, target.source, downloadVersion(download), newHash));
+        }
+
+        private Optional<BadPluginVersion> knownBadPlugin(TargetConfig target, ResolvedDownload download, String sha256) {
+            LockState lock = LockState.read(config);
+            return lock.activeBadPlugin(config, target, download, sha256);
+        }
+
+        void rememberStartupFailures(List<InstalledUpdate> updates, String reason) {
+            if (!config.failureMemory.enabled || updates.isEmpty()) {
+                return;
+            }
+            try {
+                LockState lock = LockState.read(config);
+                int remembered = 0;
+                for (InstalledUpdate update : updates) {
+                    if (update != null && !update.target.server) {
+                        lock.rememberBadPlugin(update, reason);
+                        remembered++;
+                    }
+                }
+                if (remembered > 0) {
+                    lock.write(config);
+                    Log.warn("Remembered " + remembered + " known-bad plugin update" + (remembered == 1 ? "" : "s") + " in updater.lock.yml.");
+                }
+            } catch (IOException ex) {
+                Log.warn("Could not write failure memory to updater.lock.yml: " + ex.getMessage());
+            }
+        }
+
+        private String downloadVersion(ResolvedDownload download) {
+            return firstNonBlank(download.version, latestFromLabel(download.label));
         }
 
         private boolean isTrustedGithubRepo(String repo) {
@@ -1915,14 +2205,11 @@ public final class VelocityAutoUpdater {
             }
             try {
                 Path lock = config.resolve(Paths.get("updater.lock.yml"));
-                List<String> lines = List.of(
-                    "# Auto-generated by " + APP_NAME + ".",
-                    "# Keep this file if changeVersion is false and gameVersion is not set in updater.yml.",
-                    "serverProject: " + download.project,
-                    "serverGameVersion: \"" + download.gameVersion + "\"",
-                    "serverBuild: \"" + download.build + "\""
-                );
-                Files.write(lock, lines, StandardCharsets.UTF_8);
+                LockState state = LockState.read(config);
+                state.serverProject = download.project;
+                state.serverGameVersion = download.gameVersion;
+                state.serverBuild = download.build;
+                state.write(config);
                 Log.info("Updated version lock -> " + lock.getFileName() + " (" + download.project + " " + download.gameVersion + ")");
             } catch (IOException ex) {
                 Log.warn("Could not write updater.lock.yml: " + ex.getMessage());
@@ -2072,18 +2359,24 @@ public final class VelocityAutoUpdater {
         final String project;
         final String gameVersion;
         final String build;
+        final String version;
 
         ResolvedDownload(URI uri, String label) {
-            this(uri, label, "", "", "", "");
+            this(uri, label, "", "", "", "", "");
         }
 
         ResolvedDownload(URI uri, String label, String sourceType, String project, String gameVersion, String build) {
+            this(uri, label, sourceType, project, gameVersion, build, "");
+        }
+
+        ResolvedDownload(URI uri, String label, String sourceType, String project, String gameVersion, String build, String version) {
             this.uri = uri;
             this.label = label;
             this.sourceType = sourceType;
             this.project = project;
             this.gameVersion = gameVersion;
             this.build = build;
+            this.version = version;
         }
     }
 
@@ -2135,7 +2428,8 @@ public final class VelocityAutoUpdater {
                 }
                 String tag = firstNonBlank(stringValue(release.get("tag_name")), stringValue(release.get("name")), "latest");
                 String filename = stringValue(asset.get().get("name"));
-                return new ResolvedDownload(URI.create(url), "GitHub release " + repo.owner + "/" + repo.name + " " + tag + " " + filename);
+                return new ResolvedDownload(URI.create(url), "GitHub release " + repo.owner + "/" + repo.name + " " + tag + " " + filename,
+                    "", "", "", "", tag);
             }
             throw new IOException("No GitHub release jar found for " + repo.owner + "/" + repo.name);
         }
@@ -2384,7 +2678,8 @@ public final class VelocityAutoUpdater {
                     continue;
                 }
                 String name = stringValue(version.get("name"));
-                return Optional.of(new ResolvedDownload(URI.create(url), "Hangar " + project.owner + "/" + project.slug + " " + name + " " + platform));
+                return Optional.of(new ResolvedDownload(URI.create(url), "Hangar " + project.owner + "/" + project.slug + " " + name + " " + platform,
+                    "", "", "", "", name));
             }
             return Optional.empty();
         }
@@ -2516,7 +2811,8 @@ public final class VelocityAutoUpdater {
                 }
                 String versionNumber = stringValue(version.get("version_number"));
                 String filename = stringValue(file.get().get("filename"));
-                return Optional.of(new ResolvedDownload(URI.create(url), "Modrinth " + project + " " + versionNumber + " " + filename));
+                return Optional.of(new ResolvedDownload(URI.create(url), "Modrinth " + project + " " + versionNumber + " " + filename,
+                    "", "", "", "", versionNumber));
             }
             return Optional.empty();
         }
@@ -2793,6 +3089,7 @@ public final class VelocityAutoUpdater {
                 if (startupResult.rollbackAndRestart) {
                     outputThread.join(TimeUnit.SECONDS.toMillis(5));
                     inputThread.interrupt();
+                    updater.rememberStartupFailures(startupResult.failedUpdates, startupResult.reason);
                     rollbackUpdates(startupResult.failedUpdates);
                     pendingStartupUpdates = Collections.emptyList();
                     Log.warn("Restarting once with the previous known-good jar(s).");
@@ -2885,7 +3182,7 @@ public final class VelocityAutoUpdater {
                 if (startupHealth.hasFailures()) {
                     Log.warn("Detected plugin load failure after update; stopping server to roll back.");
                     stopProcess(process);
-                    return StartupResult.rollback(startupHealth.failedUpdates());
+                    return StartupResult.rollback(startupHealth.failedUpdates(), "startup-load-failed");
                 }
                 process.waitFor(1, TimeUnit.SECONDS);
             }
@@ -2893,11 +3190,11 @@ public final class VelocityAutoUpdater {
                 int exitCode = process.exitValue();
                 if (startupHealth.hasFailures()) {
                     Log.warn("Detected plugin load failure during startup; rolling back recent updated plugin jar(s).");
-                    return StartupResult.rollback(startupHealth.failedUpdates());
+                    return StartupResult.rollback(startupHealth.failedUpdates(), "startup-load-failed");
                 }
                 if (exitCode != 0 && startupHealth.hasUpdatedJars()) {
                     Log.warn("Server exited during startup after updates; rolling back recent updated jar(s).");
-                    return StartupResult.rollback(startupHealth.allUpdatedJars());
+                    return StartupResult.rollback(startupHealth.allUpdatedJars(), "startup-exit-failed");
                 }
                 return StartupResult.exited(exitCode);
             }
@@ -2997,24 +3294,26 @@ public final class VelocityAutoUpdater {
         final boolean processExited;
         final int exitCode;
         final List<InstalledUpdate> failedUpdates;
+        final String reason;
 
-        private StartupResult(boolean rollbackAndRestart, boolean processExited, int exitCode, List<InstalledUpdate> failedUpdates) {
+        private StartupResult(boolean rollbackAndRestart, boolean processExited, int exitCode, List<InstalledUpdate> failedUpdates, String reason) {
             this.rollbackAndRestart = rollbackAndRestart;
             this.processExited = processExited;
             this.exitCode = exitCode;
             this.failedUpdates = failedUpdates;
+            this.reason = reason;
         }
 
         static StartupResult continueRunning() {
-            return new StartupResult(false, false, 0, Collections.emptyList());
+            return new StartupResult(false, false, 0, Collections.emptyList(), "");
         }
 
         static StartupResult exited(int exitCode) {
-            return new StartupResult(false, true, exitCode, Collections.emptyList());
+            return new StartupResult(false, true, exitCode, Collections.emptyList(), "");
         }
 
-        static StartupResult rollback(List<InstalledUpdate> failedUpdates) {
-            return new StartupResult(true, false, 0, failedUpdates);
+        static StartupResult rollback(List<InstalledUpdate> failedUpdates, String reason) {
+            return new StartupResult(true, false, 0, failedUpdates, reason);
         }
     }
 
@@ -3442,6 +3741,11 @@ public final class VelocityAutoUpdater {
             return value;
         }
         return "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
+    }
+
+    private static String quoteYamlKey(String value) {
+        String safe = value == null ? "" : value;
+        return "\"" + safe.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
     }
 
     private static String lower(String value) {
@@ -3900,6 +4204,10 @@ public final class VelocityAutoUpdater {
               trustedGithubOrgs: PaperMC, GeyserMC, ViaVersion
               trustedGithubRepos: Inquisitors-transfers/MyCustomPlugin
 
+            failureMemory:
+              enabled: true
+              retryBadAfter: never
+
             server:
               name: auto
               # source: auto detects an existing server jar. If this is a first
@@ -3917,6 +4225,7 @@ public final class VelocityAutoUpdater {
               - name: ViaVersion
                 source: https://github.com/ViaVersion/ViaVersion
                 type: auto
+                autoUpdate: true
                 githubRepo: ViaVersion/ViaVersion
                 platform: paper
                 fallbackSources: https://hangar.papermc.io/ViaVersion/ViaVersion/versions, https://modrinth.com/plugin/viaversion/versions
@@ -3926,6 +4235,7 @@ public final class VelocityAutoUpdater {
               - name: ViaBackwards
                 source: https://github.com/ViaVersion/ViaBackwards
                 type: auto
+                autoUpdate: true
                 githubRepo: ViaVersion/ViaBackwards
                 platform: paper
                 fallbackSources: https://hangar.papermc.io/ViaVersion/ViaBackwards/versions, https://modrinth.com/plugin/viabackwards/versions
@@ -3935,6 +4245,7 @@ public final class VelocityAutoUpdater {
               - name: ViaRewind
                 source: https://github.com/ViaVersion/ViaRewind
                 type: auto
+                autoUpdate: true
                 githubRepo: ViaVersion/ViaRewind
                 platform: paper
                 fallbackSources: https://hangar.papermc.io/ViaVersion/ViaRewind/versions, https://modrinth.com/plugin/viarewind/versions
@@ -4052,6 +4363,16 @@ public final class VelocityAutoUpdater {
             # buildFromSource.trustedGithubOrgs / trustedGithubRepos
             #   GitHub orgs/repos you explicitly trust for future source builds.
             #
+            # failureMemory.enabled
+            #   If true, records plugin updates that failed startup in updater.lock.yml.
+            #   Future runs skip the same bad jar hash instead of installing it again.
+            #
+            # failureMemory.retryBadAfter
+            #   never:
+            #     Recommended. Do not retry the same bad jar unless the version/hash changes.
+            #   Duration like 14d:
+            #     Allow retrying the same remembered bad jar after that much time.
+            #
             # server.name
             #   Display name. Use auto to derive Paper, Folia, Velocity, etc.
             #
@@ -4127,6 +4448,14 @@ public final class VelocityAutoUpdater {
             #
             # plugins[].githubRepo
             #   Optional repo hint like Owner/Repo. Useful for discovery and GitHub sources.
+            #
+            # plugins[].autoUpdate
+            #   true:
+            #     Default. Auto-Updater may discover, download, replace, and roll back this
+            #     plugin using installAs.
+            #   false:
+            #     Keep the entry so discovery knows the plugin exists, but never replace
+            #     this jar or auto-switch its source.
             #
             # plugins[].platform
             #   Platform for Hangar/GeyserMC downloads. Common: paper, velocity, waterfall.

@@ -24,6 +24,10 @@ buildFromSource:
   trustedGithubOrgs: PaperMC, GeyserMC, ViaVersion
   trustedGithubRepos: Inquisitors-transfers/MyCustomPlugin
 
+failureMemory:
+  enabled: true
+  retryBadAfter: never
+
 server:
   name: auto
   # source: auto detects an existing server jar. If this is a first
@@ -41,6 +45,7 @@ plugins:
   - name: ViaVersion
     source: https://github.com/ViaVersion/ViaVersion
     type: auto
+    autoUpdate: true
     githubRepo: ViaVersion/ViaVersion
     platform: paper
     fallbackSources: https://hangar.papermc.io/ViaVersion/ViaVersion/versions, https://modrinth.com/plugin/viaversion/versions
@@ -50,6 +55,7 @@ plugins:
   - name: ViaBackwards
     source: https://github.com/ViaVersion/ViaBackwards
     type: auto
+    autoUpdate: true
     githubRepo: ViaVersion/ViaBackwards
     platform: paper
     fallbackSources: https://hangar.papermc.io/ViaVersion/ViaBackwards/versions, https://modrinth.com/plugin/viabackwards/versions
@@ -59,6 +65,7 @@ plugins:
   - name: ViaRewind
     source: https://github.com/ViaVersion/ViaRewind
     type: auto
+    autoUpdate: true
     githubRepo: ViaVersion/ViaRewind
     platform: paper
     fallbackSources: https://hangar.papermc.io/ViaVersion/ViaRewind/versions, https://modrinth.com/plugin/viarewind/versions
@@ -176,6 +183,16 @@ restart:
 # buildFromSource.trustedGithubOrgs / trustedGithubRepos
 #   GitHub orgs/repos you explicitly trust for future source builds.
 #
+# failureMemory.enabled
+#   If true, records plugin updates that failed startup in updater.lock.yml.
+#   Future runs skip the same bad jar hash instead of installing it again.
+#
+# failureMemory.retryBadAfter
+#   never:
+#     Recommended. Do not retry the same bad jar unless the version/hash changes.
+#   Duration like 14d:
+#     Allow retrying the same remembered bad jar after that much time.
+#
 # server.name
 #   Display name. Use auto to derive Paper, Folia, Velocity, etc.
 #
@@ -251,6 +268,14 @@ restart:
 #
 # plugins[].githubRepo
 #   Optional repo hint like Owner/Repo. Useful for discovery and GitHub sources.
+#
+# plugins[].autoUpdate
+#   true:
+#     Default. Auto-Updater may discover, download, replace, and roll back this
+#     plugin using installAs.
+#   false:
+#     Keep the entry so discovery knows the plugin exists, but never replace
+#     this jar or auto-switch its source.
 #
 # plugins[].platform
 #   Platform for Hangar/GeyserMC downloads. Common: paper, velocity, waterfall.

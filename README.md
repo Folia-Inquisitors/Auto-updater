@@ -32,6 +32,8 @@ plugins/
 - Fallback on prevous working version if fails to load.
 - Discovery policy reporting with trusted GitHub org/repo settings.
 - Saves discovered plugin sources back into `updater.yml`.
+- Per-plugin `autoUpdate` opt-out.
+- Failure memory for plugin jars that fail startup.
 
 ## Default Config
 
@@ -57,6 +59,10 @@ buildFromSource:
   trustedGithubOrgs: PaperMC, GeyserMC, ViaVersion
   trustedGithubRepos: Inquisitors-transfers/MyCustomPlugin
 
+failureMemory:
+  enabled: true
+  retryBadAfter: never
+
 server:
   name: auto
   source: auto
@@ -72,6 +78,7 @@ plugins:
   - name: ViaVersion
     source: https://github.com/ViaVersion/ViaVersion
     type: auto
+    autoUpdate: true
     githubRepo: ViaVersion/ViaVersion
     platform: paper
     fallbackSources: https://hangar.papermc.io/ViaVersion/ViaVersion/versions, https://modrinth.com/plugin/viaversion/versions
@@ -81,6 +88,7 @@ plugins:
   - name: ViaBackwards
     source: https://github.com/ViaVersion/ViaBackwards
     type: auto
+    autoUpdate: true
     githubRepo: ViaVersion/ViaBackwards
     platform: paper
     fallbackSources: https://hangar.papermc.io/ViaVersion/ViaBackwards/versions, https://modrinth.com/plugin/viabackwards/versions
@@ -90,6 +98,7 @@ plugins:
   - name: ViaRewind
     source: https://github.com/ViaVersion/ViaRewind
     type: auto
+    autoUpdate: true
     githubRepo: ViaVersion/ViaRewind
     platform: paper
     fallbackSources: https://hangar.papermc.io/ViaVersion/ViaRewind/versions, https://modrinth.com/plugin/viarewind/versions
