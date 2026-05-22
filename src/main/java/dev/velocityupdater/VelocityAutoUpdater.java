@@ -183,6 +183,7 @@ public final class VelocityAutoUpdater {
         DiscoveryConfig discovery = new DiscoveryConfig();
         BuildFromSourceConfig buildFromSource = new BuildFromSourceConfig();
         FailureMemoryConfig failureMemory = new FailureMemoryConfig();
+        ValidationConfig validation = new ValidationConfig();
         RestartConfig restart = new RestartConfig();
 
         void validate() {
@@ -353,6 +354,14 @@ public final class VelocityAutoUpdater {
         String retryBadAfter = "never";
     }
 
+    private static final class ValidationConfig {
+        boolean enabled = true;
+        int minAutoInstallScore = 90;
+        int minTrustedSourceScore = 85;
+        boolean rejectOnPluginNameMismatch = true;
+        boolean rejectWrongPlatform = true;
+    }
+
     private static final class TargetConfig {
         String name;
         boolean server;
@@ -480,6 +489,9 @@ public final class VelocityAutoUpdater {
                     case "failurememory":
                     case "failure_memory":
                         applyFailureMemory(config.failureMemory, keyValue(line, lineNo));
+                        break;
+                    case "validation":
+                        applyValidation(config.validation, keyValue(line, lineNo));
                         break;
                     case "plugins":
                         if (line.startsWith("- ")) {
@@ -699,6 +711,32 @@ public final class VelocityAutoUpdater {
                     break;
                 default:
                     throw new IllegalArgumentException("Unknown failureMemory key: " + kv.key);
+            }
+        }
+
+        private static void applyValidation(ValidationConfig validation, KeyValue kv) {
+            switch (lower(kv.key)) {
+                case "enabled":
+                    validation.enabled = parseBoolean(kv.value);
+                    break;
+                case "minautoinstallscore":
+                case "min_auto_install_score":
+                    validation.minAutoInstallScore = Integer.parseInt(kv.value);
+                    break;
+                case "mintrustedsourcescore":
+                case "min_trusted_source_score":
+                    validation.minTrustedSourceScore = Integer.parseInt(kv.value);
+                    break;
+                case "rejectonpluginnamemismatch":
+                case "reject_on_plugin_name_mismatch":
+                    validation.rejectOnPluginNameMismatch = parseBoolean(kv.value);
+                    break;
+                case "rejectwrongplatform":
+                case "reject_wrong_platform":
+                    validation.rejectWrongPlatform = parseBoolean(kv.value);
+                    break;
+                default:
+                    throw new IllegalArgumentException("Unknown validation key: " + kv.key);
             }
         }
 
@@ -1174,18 +1212,25 @@ public final class VelocityAutoUpdater {
                 return Optional.empty();
             }
             BadPluginVersion bad = badPluginVersions.get(lockKey(target.installAs));
-            if (bad == null || retryWindowExpired(config, bad)) {
-                return Optional.empty();
+            if (bad != null && !retryWindowExpired(config, bad)) {
+                if (!bad.sha256.isBlank() && bad.sha256.equalsIgnoreCase(sha256)) {
+                    return Optional.of(bad);
+                }
+                if (bad.sha256.isBlank()
+                    && !bad.version.isBlank()
+                    && !download.version.isBlank()
+                    && bad.version.equalsIgnoreCase(download.version)
+                    && sourcesMatch(bad.source, target.source)) {
+                    return Optional.of(bad);
+                }
             }
-            if (!bad.sha256.isBlank() && bad.sha256.equalsIgnoreCase(sha256)) {
-                return Optional.of(bad);
-            }
-            if (bad.sha256.isBlank()
-                && !bad.version.isBlank()
-                && !download.version.isBlank()
-                && bad.version.equalsIgnoreCase(download.version)
-                && sourcesMatch(bad.source, target.source)) {
-                return Optional.of(bad);
+            for (BadPluginVersion remembered : badPluginVersions.values()) {
+                if (remembered == bad || retryWindowExpired(config, remembered)) {
+                    continue;
+                }
+                if (!remembered.sha256.isBlank() && remembered.sha256.equalsIgnoreCase(sha256)) {
+                    return Optional.of(remembered);
+                }
             }
             return Optional.empty();
         }
@@ -1295,12 +1340,57 @@ public final class VelocityAutoUpdater {
         final String name;
         final String version;
         final String website;
+        final String mainClass;
+        final String authors;
+        final String dependencies;
+        final Set<String> descriptorTypes;
+        final Boolean foliaSupported;
+        final boolean hasDescriptor;
 
         PluginJarInfo(String id, String name, String version, String website) {
+            this(id, name, version, website, "", "", "", Set.of(), null, false);
+        }
+
+        PluginJarInfo(String id, String name, String version, String website, String mainClass, String authors,
+                      String dependencies, Set<String> descriptorTypes, Boolean foliaSupported, boolean hasDescriptor) {
             this.id = firstNonBlank(id, "");
             this.name = firstNonBlank(name, "");
             this.version = firstNonBlank(version, "");
             this.website = firstNonBlank(website, "");
+            this.mainClass = firstNonBlank(mainClass, "");
+            this.authors = firstNonBlank(authors, "");
+            this.dependencies = firstNonBlank(dependencies, "");
+            this.descriptorTypes = Set.copyOf(descriptorTypes);
+            this.foliaSupported = foliaSupported;
+            this.hasDescriptor = hasDescriptor;
+        }
+
+        boolean supportsPlatform(String expectedPlatform) {
+            String expected = lower(expectedPlatform);
+            if (expected.isBlank()) {
+                return true;
+            }
+            if (expected.equals("paper")) {
+                return descriptorTypes.contains("paper") || descriptorTypes.contains("bukkit");
+            }
+            if (expected.equals("folia")) {
+                return descriptorTypes.contains("paper") || descriptorTypes.contains("bukkit");
+            }
+            if (expected.equals("velocity")) {
+                return descriptorTypes.contains("velocity");
+            }
+            if (expected.equals("waterfall") || expected.equals("bungee")) {
+                return descriptorTypes.contains("bungee");
+            }
+            return true;
+        }
+
+        boolean isVelocityOnly() {
+            return descriptorTypes.size() == 1 && descriptorTypes.contains("velocity");
+        }
+
+        String descriptorSummary() {
+            return descriptorTypes.isEmpty() ? "none" : String.join("/", descriptorTypes);
         }
     }
 
@@ -1367,6 +1457,9 @@ public final class VelocityAutoUpdater {
             Log.info("Installed plugin scan: " + (config.discovery.scanInstalledPlugins ? "enabled" : "disabled"));
             Log.info("Build from source: " + config.buildFromSource.enabled
                 + ", preferHostedIfSameVersion=" + config.buildFromSource.preferHostedIfSameVersion);
+            Log.info("Jar validation: " + (config.validation.enabled ? "enabled" : "disabled")
+                + ", autoScore>=" + config.validation.minAutoInstallScore
+                + ", trustedScore>=" + config.validation.minTrustedSourceScore);
             Log.info("Failure memory: " + (config.failureMemory.enabled ? "enabled (retryBadAfter=" + config.failureMemory.retryBadAfter + ")" : "disabled"));
             Log.info("Server install target: " + config.resolve(Paths.get(config.server.installAs)));
             for (TargetConfig target : allTargets()) {
@@ -1404,6 +1497,9 @@ public final class VelocityAutoUpdater {
             Log.info("Build from source: " + config.buildFromSource.enabled
                 + ", onlyTrusted=" + config.buildFromSource.onlyTrusted
                 + ", preferHostedIfSameVersion=" + config.buildFromSource.preferHostedIfSameVersion);
+            Log.info("Jar validation: " + (config.validation.enabled ? "enabled" : "disabled")
+                + ", autoScore>=" + config.validation.minAutoInstallScore
+                + ", trustedScore>=" + config.validation.minTrustedSourceScore);
             Log.info("Failure memory: " + (config.failureMemory.enabled ? "enabled (retryBadAfter=" + config.failureMemory.retryBadAfter + ")" : "disabled"));
             if (!config.buildFromSource.trustedGithubOrgs.isEmpty()) {
                 Log.info("Trusted GitHub orgs: " + String.join(", ", config.buildFromSource.trustedGithubOrgs));
@@ -2197,7 +2293,13 @@ public final class VelocityAutoUpdater {
             Path staging = stagingDir.resolve(safeName(target.displayName()) + "-" + System.currentTimeMillis() + ".jar");
 
             download(download.uri, staging);
-            validateJar(staging);
+            try {
+                validateJar(staging);
+                validateDownloadedJar(target, plan, download, staging, targetPath);
+            } catch (Exception ex) {
+                Files.deleteIfExists(staging);
+                throw ex;
+            }
 
             String newHash = sha256(staging);
             Optional<BadPluginVersion> knownBad = knownBadPlugin(target, download, newHash);
@@ -2232,6 +2334,106 @@ public final class VelocityAutoUpdater {
         private Optional<BadPluginVersion> knownBadPlugin(TargetConfig target, ResolvedDownload download, String sha256) {
             LockState lock = LockState.read(config);
             return lock.activeBadPlugin(config, target, download, sha256);
+        }
+
+        private void validateDownloadedJar(TargetConfig target, SourcePlan plan, ResolvedDownload download, Path staging, Path targetPath) throws IOException {
+            if (!config.validation.enabled || target.server) {
+                return;
+            }
+            PluginJarInfo incoming = readPluginJarInfo(staging);
+            if (!incoming.hasDescriptor) {
+                throw new IOException("Downloaded jar for " + target.displayName()
+                    + " has no plugin descriptor (plugin.yml, paper-plugin.yml, velocity-plugin.json, or bungee.yml)");
+            }
+
+            String actualServerProject = inferPaperMcProject(config.server);
+            String expectedPlatform = firstNonBlank(inferredPluginPlatform(config.server), lower(target.platform), lower(target.loader));
+            if (config.validation.rejectWrongPlatform && !incoming.supportsPlatform(expectedPlatform)) {
+                throw new IOException("Downloaded jar for " + target.displayName()
+                    + " looks like " + incoming.descriptorSummary() + " but this server expects " + firstNonBlank(expectedPlatform, "a compatible") + " plugins");
+            }
+            if (config.validation.rejectWrongPlatform
+                && actualServerProject.equals("folia")
+                && (incoming.descriptorTypes.contains("paper") || incoming.descriptorTypes.contains("bukkit"))
+                && !Boolean.TRUE.equals(incoming.foliaSupported)) {
+                throw new IOException("Downloaded jar for " + target.displayName() + " is not marked as Folia-compatible");
+            }
+
+            PluginJarInfo current = Files.exists(targetPath) ? readPluginJarInfo(targetPath) : null;
+            if (config.validation.rejectOnPluginNameMismatch && current != null && current.hasDescriptor) {
+                int identity = maxIdentitySimilarity(current, incoming);
+                if (identity < 70) {
+                    throw new IOException("Downloaded jar identity does not match installed plugin for "
+                        + target.displayName() + " (installed=" + current.name + ", downloaded="
+                        + incoming.name + ", match=" + identity + "%)");
+                }
+            }
+
+            int score = validationScore(target, current, incoming, download);
+            int minimum = validationMinimum(target, plan);
+            if (score < minimum) {
+                throw new IOException("Downloaded jar for " + target.displayName()
+                    + " failed validation score " + score + "/" + minimum
+                    + " (downloaded plugin=" + firstNonBlank(incoming.name, incoming.id, "unknown") + ")");
+            }
+            Log.info("Validated " + target.displayName() + " candidate as "
+                + firstNonBlank(incoming.name, incoming.id) + " (" + incoming.descriptorSummary()
+                + ", score " + score + ")");
+        }
+
+        private int validationMinimum(TargetConfig target, SourcePlan plan) {
+            boolean trusted = !target.autoDiscovered && !target.sourceDiscoveredThisRun
+                && (isTrustedHostedSource(target, plan) || !target.fallbackSources.contains(target.source));
+            return trusted ? config.validation.minTrustedSourceScore : config.validation.minAutoInstallScore;
+        }
+
+        private boolean isTrustedHostedSource(TargetConfig target, SourcePlan plan) {
+            String type = lower(plan.type);
+            if (type.equals("github-release") || type.equals("github-source")) {
+                String repo = gitRepoHint(target);
+                return !repo.isBlank() && isTrustedGithubRepo(repo);
+            }
+            return !target.sourceDiscoveredThisRun && !target.autoDiscovered && target.source != null && !target.source.isBlank();
+        }
+
+        private int validationScore(TargetConfig target, PluginJarInfo current, PluginJarInfo incoming, ResolvedDownload download) {
+            int score = 0;
+            if (current != null && current.hasDescriptor) {
+                int identity = maxIdentitySimilarity(current, incoming);
+                score += Math.round(identity * 0.60f);
+                if (!current.mainClass.isBlank() && !incoming.mainClass.isBlank()) {
+                    score += current.mainClass.equalsIgnoreCase(incoming.mainClass) ? 15 : packageSimilarityScore(current.mainClass, incoming.mainClass);
+                }
+                if (incoming.supportsPlatform(inferredPluginPlatform(config.server))) {
+                    score += 10;
+                }
+                if (!current.authors.isBlank() && !incoming.authors.isBlank() && normalizedTokensOverlap(current.authors, incoming.authors)) {
+                    score += 5;
+                }
+                if (!current.website.isBlank() && !incoming.website.isBlank() && sameHost(current.website, incoming.website)) {
+                    score += 5;
+                }
+                if (!current.dependencies.isBlank() && !incoming.dependencies.isBlank() && normalizedTokensOverlap(current.dependencies, incoming.dependencies)) {
+                    score += 3;
+                }
+            } else {
+                int identity = maxIdentitySimilarity(target, incoming);
+                score += Math.round(identity * 0.65f);
+                if (incoming.supportsPlatform(inferredPluginPlatform(config.server))) {
+                    score += 20;
+                }
+                if (incoming.hasDescriptor) {
+                    score += 10;
+                }
+            }
+            if (download != null && !download.version.isBlank() && !incoming.version.isBlank()
+                && cleanVersion(download.version).equalsIgnoreCase(cleanVersion(incoming.version))) {
+                score += 3;
+            }
+            if (sourceTextMatchesPlugin(target, incoming)) {
+                score += 7;
+            }
+            return Math.min(100, score);
         }
 
         void rememberStartupFailures(List<InstalledUpdate> updates, String reason) {
@@ -2681,7 +2883,7 @@ public final class VelocityAutoUpdater {
                         continue;
                     }
                 }
-                Optional<Map<String, Object>> asset = findJarAsset(release);
+                Optional<Map<String, Object>> asset = findJarAsset(release, target);
                 if (asset.isEmpty()) {
                     continue;
                 }
@@ -2721,7 +2923,7 @@ public final class VelocityAutoUpdater {
             return releases;
         }
 
-        private Optional<Map<String, Object>> findJarAsset(Map<String, Object> release) {
+        private Optional<Map<String, Object>> findJarAsset(Map<String, Object> release, TargetConfig target) {
             Object assetsObj = release.get("assets");
             if (!(assetsObj instanceof List<?> assets)) {
                 return Optional.empty();
@@ -2736,9 +2938,46 @@ public final class VelocityAutoUpdater {
                 if (name.contains("sources") || name.contains("javadoc") || name.contains("-dev") || name.contains("-plain")) {
                     continue;
                 }
+                if (assetPlatformScore(name, target) <= -100) {
+                    continue;
+                }
                 jars.add(asset);
             }
+            jars.sort(Comparator.comparingInt((Map<String, Object> asset) -> assetPlatformScore(lower(stringValue(asset.get("name"))), target)).reversed());
             return jars.isEmpty() ? Optional.empty() : Optional.of(jars.get(0));
+        }
+
+        private int assetPlatformScore(String filename, TargetConfig target) {
+            String expected = firstNonBlank(lower(target.platform), lower(target.loader), inferredPluginPlatform(config.server));
+            int score = 0;
+            String targetName = normalizeIdentity(target.name);
+            String targetProject = normalizeIdentity(target.project);
+            if ((!targetName.isBlank() && filename.contains(targetName)) || (!targetProject.isBlank() && filename.contains(targetProject))) {
+                score += 15;
+            }
+            if (expected.equals("paper") || expected.equals("folia")) {
+                if (filename.contains("velocity") || filename.contains("fabric") || filename.contains("neoforge") || filename.contains("forge")) {
+                    return -100;
+                }
+                if (filename.contains("paper") || filename.contains("bukkit") || filename.contains("spigot") || filename.contains("folia")) {
+                    score += 25;
+                }
+            } else if (expected.equals("velocity")) {
+                if (filename.contains("paper") || filename.contains("bukkit") || filename.contains("spigot") || filename.contains("folia")) {
+                    return -100;
+                }
+                if (filename.contains("velocity")) {
+                    score += 25;
+                }
+            } else if (expected.equals("waterfall") || expected.equals("bungee")) {
+                if (filename.contains("paper") || filename.contains("bukkit") || filename.contains("spigot") || filename.contains("folia") || filename.contains("velocity")) {
+                    return -100;
+                }
+                if (filename.contains("bungee") || filename.contains("waterfall")) {
+                    score += 25;
+                }
+            }
+            return score;
         }
 
         private GithubRepo inferRepo(TargetConfig target) {
@@ -2995,25 +3234,25 @@ public final class VelocityAutoUpdater {
                 throw new IOException("Modrinth returned no versions for project " + project + filterDescription(target));
             }
 
-            Optional<ResolvedDownload> release = findDownload(project, versions, "release");
+            Optional<ResolvedDownload> release = findDownload(project, versions, "release", target);
             if (target.versionType != null && !target.versionType.isBlank()) {
-                release = findDownload(project, versions, lower(target.versionType));
+                release = findDownload(project, versions, lower(target.versionType), target);
             }
             if (release.isPresent()) {
                 return release.get();
             }
 
-            Optional<ResolvedDownload> beta = findDownload(project, versions, "beta");
+            Optional<ResolvedDownload> beta = findDownload(project, versions, "beta", target);
             if (beta.isPresent()) {
                 return beta.get();
             }
 
-            Optional<ResolvedDownload> alpha = findDownload(project, versions, "alpha");
+            Optional<ResolvedDownload> alpha = findDownload(project, versions, "alpha", target);
             if (alpha.isPresent()) {
                 return alpha.get();
             }
 
-            Optional<ResolvedDownload> any = findDownload(project, versions, "");
+            Optional<ResolvedDownload> any = findDownload(project, versions, "", target);
             if (any.isPresent()) {
                 return any.get();
             }
@@ -3024,8 +3263,9 @@ public final class VelocityAutoUpdater {
             StringBuilder url = new StringBuilder("https://api.modrinth.com/v3/project/")
                 .append(urlEncode(project))
                 .append("/version?include_changelog=false");
-            if (target.loader != null && !target.loader.isBlank()) {
-                url.append("&loaders=").append(urlEncode(jsonArray(target.loader)));
+            String loader = firstNonBlank(target.loader, inferredPluginPlatform(config.server));
+            if (!loader.isBlank()) {
+                url.append("&loaders=").append(urlEncode(jsonArray(loader)));
             }
             if (target.gameVersion != null && !target.gameVersion.isBlank()) {
                 url.append("&game_versions=").append(urlEncode(jsonArray(target.gameVersion)));
@@ -3059,12 +3299,12 @@ public final class VelocityAutoUpdater {
             return versions;
         }
 
-        private Optional<ResolvedDownload> findDownload(String project, List<Map<String, Object>> versions, String versionType) {
+        private Optional<ResolvedDownload> findDownload(String project, List<Map<String, Object>> versions, String versionType, TargetConfig target) {
             for (Map<String, Object> version : versions) {
                 if (!versionType.isBlank() && !versionType.equalsIgnoreCase(stringValue(version.get("version_type")))) {
                     continue;
                 }
-                Optional<Map<String, Object>> file = findFile(version);
+                Optional<Map<String, Object>> file = findFile(version, target);
                 if (file.isEmpty()) {
                     continue;
                 }
@@ -3080,7 +3320,7 @@ public final class VelocityAutoUpdater {
             return Optional.empty();
         }
 
-        private Optional<Map<String, Object>> findFile(Map<String, Object> version) {
+        private Optional<Map<String, Object>> findFile(Map<String, Object> version, TargetConfig target) {
             Object filesObj = version.get("files");
             if (!(filesObj instanceof List<?> files) || files.isEmpty()) {
                 return Optional.empty();
@@ -3100,12 +3340,36 @@ public final class VelocityAutoUpdater {
                 jars.add(file);
             }
 
+            String expected = firstNonBlank(inferredPluginPlatform(config.server), target.loader);
+            jars.removeIf(jar -> modrinthFileScore(lower(stringValue(jar.get("filename"))), expected) <= -100);
+            jars.sort(Comparator.comparingInt((Map<String, Object> jar) -> modrinthFileScore(lower(stringValue(jar.get("filename"))), expected)).reversed());
             for (Map<String, Object> jar : jars) {
                 if (Boolean.TRUE.equals(jar.get("primary"))) {
                     return Optional.of(jar);
                 }
             }
             return jars.isEmpty() ? Optional.empty() : Optional.of(jars.get(0));
+        }
+
+        private int modrinthFileScore(String filename, String expectedPlatform) {
+            String expected = lower(expectedPlatform);
+            int score = 0;
+            if (expected.equals("paper") || expected.equals("folia")) {
+                if (filename.contains("velocity") || filename.contains("fabric") || filename.contains("neoforge") || filename.contains("forge")) {
+                    return -100;
+                }
+                if (filename.contains("paper") || filename.contains("bukkit") || filename.contains("spigot") || filename.contains("folia")) {
+                    score += 25;
+                }
+            } else if (expected.equals("velocity")) {
+                if (filename.contains("paper") || filename.contains("bukkit") || filename.contains("spigot") || filename.contains("folia")) {
+                    return -100;
+                }
+                if (filename.contains("velocity")) {
+                    score += 25;
+                }
+            }
+            return score;
         }
 
         private String inferProject(TargetConfig target) {
@@ -4028,6 +4292,187 @@ public final class VelocityAutoUpdater {
         return value != null && value.trim().equalsIgnoreCase("auto");
     }
 
+    private static int maxIdentitySimilarity(PluginJarInfo current, PluginJarInfo incoming) {
+        List<String> currentIds = pluginIdentityValues(current);
+        List<String> incomingIds = pluginIdentityValues(incoming);
+        int best = 0;
+        for (String left : currentIds) {
+            for (String right : incomingIds) {
+                best = Math.max(best, similarityPercent(left, right));
+            }
+        }
+        return best;
+    }
+
+    private static int maxIdentitySimilarity(TargetConfig target, PluginJarInfo incoming) {
+        List<String> expected = new ArrayList<>();
+        expected.add(target.name);
+        expected.add(target.detectedPluginId);
+        expected.add(jarIdentityHint(target.installAs));
+        expected.add(sourceNameHint(target.source));
+        List<String> incomingIds = pluginIdentityValues(incoming);
+        int best = 0;
+        for (String left : expected) {
+            for (String right : incomingIds) {
+                best = Math.max(best, similarityPercent(left, right));
+            }
+        }
+        return best;
+    }
+
+    private static List<String> pluginIdentityValues(PluginJarInfo info) {
+        if (info == null) {
+            return Collections.emptyList();
+        }
+        List<String> values = new ArrayList<>();
+        values.add(info.id);
+        values.add(info.name);
+        return values;
+    }
+
+    private static int similarityPercent(String left, String right) {
+        String a = normalizeIdentity(left);
+        String b = normalizeIdentity(right);
+        if (a.isBlank() || b.isBlank()) {
+            return 0;
+        }
+        if (a.equals(b)) {
+            return 100;
+        }
+        if (a.contains(b) || b.contains(a)) {
+            int shorter = Math.min(a.length(), b.length());
+            int longer = Math.max(a.length(), b.length());
+            return Math.max(70, (int) Math.round(shorter * 100.0 / longer));
+        }
+        int distance = levenshtein(a, b);
+        int max = Math.max(a.length(), b.length());
+        return Math.max(0, (int) Math.round((max - distance) * 100.0 / max));
+    }
+
+    private static String normalizeIdentity(String value) {
+        return lower(firstNonBlank(value, "")).replaceAll("[^a-z0-9]+", "");
+    }
+
+    private static int levenshtein(String a, String b) {
+        int[] prev = new int[b.length() + 1];
+        int[] curr = new int[b.length() + 1];
+        for (int j = 0; j <= b.length(); j++) {
+            prev[j] = j;
+        }
+        for (int i = 1; i <= a.length(); i++) {
+            curr[0] = i;
+            for (int j = 1; j <= b.length(); j++) {
+                int cost = a.charAt(i - 1) == b.charAt(j - 1) ? 0 : 1;
+                curr[j] = Math.min(Math.min(curr[j - 1] + 1, prev[j] + 1), prev[j - 1] + cost);
+            }
+            int[] tmp = prev;
+            prev = curr;
+            curr = tmp;
+        }
+        return prev[b.length()];
+    }
+
+    private static int packageSimilarityScore(String left, String right) {
+        String a = lower(left);
+        String b = lower(right);
+        int lastA = a.lastIndexOf('.');
+        int lastB = b.lastIndexOf('.');
+        String packageA = lastA > 0 ? a.substring(0, lastA) : a;
+        String packageB = lastB > 0 ? b.substring(0, lastB) : b;
+        if (packageA.equals(packageB)) {
+            return 12;
+        }
+        if (packageA.startsWith(packageB) || packageB.startsWith(packageA)) {
+            return 8;
+        }
+        return 0;
+    }
+
+    private static boolean normalizedTokensOverlap(String left, String right) {
+        Set<String> a = normalizedTokenSet(left);
+        Set<String> b = normalizedTokenSet(right);
+        for (String token : a) {
+            if (b.contains(token)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static Set<String> normalizedTokenSet(String value) {
+        Set<String> result = new HashSet<>();
+        for (String token : firstNonBlank(value, "").split("[^A-Za-z0-9_.-]+")) {
+            String normalized = normalizeIdentity(token);
+            if (!normalized.isBlank()) {
+                result.add(normalized);
+            }
+        }
+        return result;
+    }
+
+    private static boolean sameHost(String left, String right) {
+        try {
+            URI a = URI.create(left);
+            URI b = URI.create(right);
+            return firstNonBlank(a.getHost(), "").equalsIgnoreCase(firstNonBlank(b.getHost(), ""));
+        } catch (RuntimeException ex) {
+            return normalizeIdentity(left).equals(normalizeIdentity(right));
+        }
+    }
+
+    private static boolean sourceTextMatchesPlugin(TargetConfig target, PluginJarInfo incoming) {
+        String sourceText = normalizeIdentity(String.join(" ",
+            firstNonBlank(target.source, ""),
+            firstNonBlank(target.githubRepo, ""),
+            firstNonBlank(target.project, ""),
+            firstNonBlank(target.installAs, ""),
+            firstNonBlank(target.name, "")
+        ));
+        if (sourceText.isBlank()) {
+            return false;
+        }
+        for (String identity : pluginIdentityValues(incoming)) {
+            String normalized = normalizeIdentity(identity);
+            if (!normalized.isBlank() && sourceText.contains(normalized)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static String sourceNameHint(String source) {
+        if (source == null || source.isBlank()) {
+            return "";
+        }
+        try {
+            URI uri = URI.create(source);
+            List<String> parts = pathParts(uri);
+            for (int i = parts.size() - 1; i >= 0; i--) {
+                String part = parts.get(i);
+                if (!part.isBlank() && !part.equalsIgnoreCase("versions") && !part.equalsIgnoreCase("resources")) {
+                    return part.replace(".git", "");
+                }
+            }
+        } catch (RuntimeException ignored) {
+            // Fall through to the raw value.
+        }
+        return source;
+    }
+
+    private static String jarIdentityHint(String value) {
+        String cleaned = value == null ? "" : value.replace('\\', '/');
+        int slash = cleaned.lastIndexOf('/');
+        if (slash >= 0) {
+            cleaned = cleaned.substring(slash + 1);
+        }
+        if (lower(cleaned).endsWith(".jar")) {
+            cleaned = cleaned.substring(0, cleaned.length() - 4);
+        }
+        cleaned = cleaned.replaceAll("(?i)[-_ ]?(bukkit|paper|spigot|folia|velocity|plugin)$", "");
+        cleaned = cleaned.replaceAll("(?i)[-_ ]?v?\\d+(\\.\\d+){0,4}.*$", "");
+        return cleaned.trim();
+    }
+
     private static ServerJarDetection detectExistingServerJar(Path baseDir, TargetConfig target) {
         List<Path> candidates = new ArrayList<>();
         Set<Path> seen = new HashSet<>();
@@ -4135,22 +4580,81 @@ public final class VelocityAutoUpdater {
         String filename = jar.getFileName().toString();
         String fallbackName = filename.substring(0, filename.length() - ".jar".length());
         try (JarFile file = new JarFile(jar.toFile())) {
+            List<PluginJarInfo> descriptors = new ArrayList<>();
             PluginJarInfo velocityInfo = readVelocityPluginInfo(file);
-            if (!velocityInfo.name.isBlank() || !velocityInfo.id.isBlank()) {
-                return new PluginJarInfo(velocityInfo.id, firstNonBlank(velocityInfo.name, velocityInfo.id), velocityInfo.version, velocityInfo.website);
+            if (velocityInfo.hasDescriptor) {
+                descriptors.add(velocityInfo);
             }
             for (String entry : List.of("paper-plugin.yml", "plugin.yml", "bungee.yml")) {
-                String name = readYamlEntryValue(file, entry, "name");
-                if (!name.isBlank()) {
-                    String version = readYamlEntryValue(file, entry, "version");
-                    String website = readYamlEntryValue(file, entry, "website");
-                    return new PluginJarInfo(name, name, version, website);
+                PluginJarInfo yamlInfo = readYamlPluginInfo(file, entry);
+                if (yamlInfo.hasDescriptor) {
+                    descriptors.add(yamlInfo);
                 }
+            }
+            if (!descriptors.isEmpty()) {
+                PluginJarInfo primary = descriptors.stream()
+                    .filter(info -> info.descriptorTypes.contains("paper") || info.descriptorTypes.contains("bukkit"))
+                    .findFirst()
+                    .orElse(descriptors.get(0));
+                Set<String> descriptorTypes = new HashSet<>();
+                for (PluginJarInfo descriptor : descriptors) {
+                    descriptorTypes.addAll(descriptor.descriptorTypes);
+                }
+                return new PluginJarInfo(
+                    primary.id,
+                    firstNonBlank(primary.name, primary.id),
+                    primary.version,
+                    primary.website,
+                    primary.mainClass,
+                    primary.authors,
+                    primary.dependencies,
+                    descriptorTypes,
+                    primary.foliaSupported,
+                    true
+                );
             }
         } catch (IOException ex) {
             Log.warn("Could not inspect plugin jar " + jar.getFileName() + ": " + ex.getMessage());
         }
         return new PluginJarInfo(fallbackName, fallbackName, "", "");
+    }
+
+    private static PluginJarInfo readYamlPluginInfo(JarFile file, String entryName) throws IOException {
+        String text = readJarEntry(file, entryName);
+        if (text.isBlank()) {
+            return new PluginJarInfo("", "", "", "");
+        }
+        String name = readYamlEntryValue(text, "name");
+        if (name.isBlank()) {
+            return new PluginJarInfo("", "", "", "");
+        }
+        String type = switch (entryName) {
+            case "paper-plugin.yml" -> "paper";
+            case "bungee.yml" -> "bungee";
+            default -> "bukkit";
+        };
+        Boolean foliaSupported = parseOptionalBoolean(firstNonBlank(
+            readYamlEntryValue(text, "folia-supported"),
+            readYamlEntryValue(text, "foliaSupported")
+        ));
+        String authors = firstNonBlank(readYamlEntryValue(text, "authors"), readYamlEntryValue(text, "author"));
+        String dependencies = firstNonBlank(
+            readYamlEntryValue(text, "dependencies"),
+            readYamlEntryValue(text, "depend"),
+            readYamlEntryValue(text, "softdepend")
+        );
+        return new PluginJarInfo(
+            name,
+            name,
+            readYamlEntryValue(text, "version"),
+            readYamlEntryValue(text, "website"),
+            readYamlEntryValue(text, "main"),
+            authors,
+            dependencies,
+            Set.of(type),
+            foliaSupported,
+            true
+        );
     }
 
     private static PluginJarInfo readVelocityPluginInfo(JarFile file) throws IOException {
@@ -4164,7 +4668,18 @@ public final class VelocityAutoUpdater {
             String name = stringValue(json.get("name"));
             String version = stringValue(json.get("version"));
             String website = firstNonBlank(stringValue(json.get("url")), stringValue(json.get("website")));
-            return new PluginJarInfo(id, name, version, website);
+            return new PluginJarInfo(
+                id,
+                name,
+                version,
+                website,
+                stringValue(json.get("main")),
+                collectionText(json.get("authors")),
+                collectionText(json.get("dependencies")),
+                Set.of("velocity"),
+                null,
+                !id.isBlank() || !name.isBlank()
+            );
         } catch (RuntimeException ex) {
             return new PluginJarInfo("", "", "", "");
         }
@@ -4172,6 +4687,10 @@ public final class VelocityAutoUpdater {
 
     private static String readYamlEntryValue(JarFile file, String entryName, String key) throws IOException {
         String text = readJarEntry(file, entryName);
+        return readYamlEntryValue(text, key);
+    }
+
+    private static String readYamlEntryValue(String text, String key) {
         if (text.isBlank()) {
             return "";
         }
@@ -4190,6 +4709,40 @@ public final class VelocityAutoUpdater {
             }
         }
         return "";
+    }
+
+    private static Boolean parseOptionalBoolean(String value) {
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        return parseBoolean(value);
+    }
+
+    private static String collectionText(Object value) {
+        if (value == null) {
+            return "";
+        }
+        if (value instanceof List<?> list) {
+            List<String> values = new ArrayList<>();
+            for (Object item : list) {
+                String text = stringValue(item);
+                if (!text.isBlank()) {
+                    values.add(text);
+                }
+            }
+            return String.join(",", values);
+        }
+        if (value instanceof Map<?, ?> map) {
+            List<String> values = new ArrayList<>();
+            for (Object key : map.keySet()) {
+                String text = stringValue(key);
+                if (!text.isBlank()) {
+                    values.add(text);
+                }
+            }
+            return String.join(",", values);
+        }
+        return stringValue(value);
     }
 
     private static String readJarEntry(JarFile file, String entryName) throws IOException {
@@ -4471,6 +5024,13 @@ public final class VelocityAutoUpdater {
               enabled: true
               retryBadAfter: never
 
+            validation:
+              enabled: true
+              minAutoInstallScore: 90
+              minTrustedSourceScore: 85
+              rejectOnPluginNameMismatch: true
+              rejectWrongPlatform: true
+
             server:
               name: auto
               # source: auto detects an existing server jar. If this is a first
@@ -4641,6 +5201,27 @@ public final class VelocityAutoUpdater {
             #     Recommended. Do not retry the same bad jar unless the version/hash changes.
             #   Duration like 14d:
             #     Allow retrying the same remembered bad jar after that much time.
+            #
+            # validation.enabled
+            #   true:
+            #     Recommended. Downloads are checked in cache/staging before replacing
+            #     the live jar.
+            #
+            # validation.minAutoInstallScore
+            #   Minimum metadata match score for auto-discovered or fallback sources.
+            #   90 means only very strong matches install automatically.
+            #
+            # validation.minTrustedSourceScore
+            #   Minimum metadata match score for explicitly configured/trusted sources.
+            #   85 gives trusted sources a little room for normal metadata changes.
+            #
+            # validation.rejectOnPluginNameMismatch
+            #   If true, reject a downloaded jar when its plugin.yml/paper-plugin.yml
+            #   or velocity-plugin.json says it is clearly a different plugin.
+            #
+            # validation.rejectWrongPlatform
+            #   If true, reject wrong-platform jars before install. Example: do not
+            #   install a Velocity/Fabric/NeoForge jar into a Folia/Paper plugins folder.
             #
             # server.name
             #   Display name. Use auto to derive Paper, Folia, Velocity, etc.

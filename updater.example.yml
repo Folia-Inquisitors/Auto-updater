@@ -28,6 +28,13 @@ failureMemory:
   enabled: true
   retryBadAfter: never
 
+validation:
+  enabled: true
+  minAutoInstallScore: 90
+  minTrustedSourceScore: 85
+  rejectOnPluginNameMismatch: true
+  rejectWrongPlatform: true
+
 server:
   name: auto
   # source: auto detects an existing server jar. If this is a first
@@ -198,6 +205,27 @@ restart:
 #     Recommended. Do not retry the same bad jar unless the version/hash changes.
 #   Duration like 14d:
 #     Allow retrying the same remembered bad jar after that much time.
+#
+# validation.enabled
+#   true:
+#     Recommended. Downloads are checked in cache/staging before replacing
+#     the live jar.
+#
+# validation.minAutoInstallScore
+#   Minimum metadata match score for auto-discovered or fallback sources.
+#   90 means only very strong matches install automatically.
+#
+# validation.minTrustedSourceScore
+#   Minimum metadata match score for explicitly configured/trusted sources.
+#   85 gives trusted sources a little room for normal metadata changes.
+#
+# validation.rejectOnPluginNameMismatch
+#   If true, reject a downloaded jar when its plugin.yml/paper-plugin.yml
+#   or velocity-plugin.json says it is clearly a different plugin.
+#
+# validation.rejectWrongPlatform
+#   If true, reject wrong-platform jars before install. Example: do not
+#   install a Velocity/Fabric/NeoForge jar into a Folia/Paper plugins folder.
 #
 # server.name
 #   Display name. Use auto to derive Paper, Folia, Velocity, etc.
