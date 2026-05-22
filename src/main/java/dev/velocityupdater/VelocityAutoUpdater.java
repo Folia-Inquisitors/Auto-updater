@@ -1442,6 +1442,16 @@ public final class VelocityAutoUpdater {
         }
     }
 
+    private static final class PluginJarCandidate {
+        final Path path;
+        final PluginJarInfo info;
+
+        PluginJarCandidate(Path path, PluginJarInfo info) {
+            this.path = path;
+            this.info = info;
+        }
+    }
+
     private static final class InstalledUpdate {
         final TargetConfig target;
         final Path targetPath;
@@ -2376,6 +2386,7 @@ public final class VelocityAutoUpdater {
                     + " has no plugin descriptor (plugin.yml, paper-plugin.yml, velocity-plugin.json, or bungee.yml)");
             }
 
+            PluginJarInfo current = Files.exists(targetPath) ? readPluginJarInfo(targetPath) : null;
             String actualServerProject = inferPaperMcProject(config.server);
             String expectedPlatform = firstNonBlank(inferredPluginPlatform(config.server), lower(target.platform), lower(target.loader));
             if (config.validation.rejectWrongPlatform && !incoming.supportsPlatform(expectedPlatform)) {
@@ -2385,11 +2396,13 @@ public final class VelocityAutoUpdater {
             if (config.validation.rejectWrongPlatform
                 && actualServerProject.equals("folia")
                 && (incoming.descriptorTypes.contains("paper") || incoming.descriptorTypes.contains("bukkit"))
+                && current != null
+                && Boolean.TRUE.equals(current.foliaSupported)
                 && !Boolean.TRUE.equals(incoming.foliaSupported)) {
-                throw new IOException("Downloaded jar for " + target.displayName() + " is not marked as Folia-compatible");
+                throw new IOException("Downloaded jar for " + target.displayName()
+                    + " would downgrade Folia support; installed jar is marked Folia-compatible but the candidate is not");
             }
 
-            PluginJarInfo current = Files.exists(targetPath) ? readPluginJarInfo(targetPath) : null;
             if (config.validation.rejectOnPluginNameMismatch && current != null && current.hasDescriptor) {
                 int identity = maxIdentitySimilarity(current, incoming);
                 if (identity < 70) {
@@ -2496,6 +2509,73 @@ public final class VelocityAutoUpdater {
                 Log.warn("Quarantined duplicate plugin jar for " + installed.name + ": "
                     + jar.getFileName() + " -> " + quarantined);
             }
+        }
+
+        void quarantineAllDuplicatePluginJars() throws IOException {
+            if (!config.duplicates.enabled || !lower(config.duplicates.action).equals("quarantine")) {
+                return;
+            }
+            Path pluginDir = config.resolve(Paths.get("plugins"));
+            if (!Files.isDirectory(pluginDir)) {
+                return;
+            }
+            Map<String, List<PluginJarCandidate>> byIdentity = new LinkedHashMap<>();
+            for (Path jar : listJarFiles(pluginDir)) {
+                PluginJarInfo info = readPluginJarInfo(jar);
+                for (String key : pluginIdentityKeys(info)) {
+                    byIdentity.computeIfAbsent(key, ignored -> new ArrayList<>())
+                        .add(new PluginJarCandidate(jar, info));
+                }
+            }
+
+            Set<Path> quarantined = new HashSet<>();
+            Set<Path> configuredPaths = configuredPluginPaths();
+            for (List<PluginJarCandidate> matches : byIdentity.values()) {
+                List<PluginJarCandidate> active = matches.stream()
+                    .filter(candidate -> !quarantined.contains(candidate.path.toAbsolutePath().normalize()))
+                    .toList();
+                if (active.size() < 2) {
+                    continue;
+                }
+                PluginJarCandidate keeper = chooseDuplicateKeeper(active, configuredPaths);
+                for (PluginJarCandidate candidate : active) {
+                    Path canonical = candidate.path.toAbsolutePath().normalize();
+                    if (canonical.equals(keeper.path.toAbsolutePath().normalize())) {
+                        continue;
+                    }
+                    Path moved = quarantineDuplicate(candidate.path);
+                    quarantined.add(canonical);
+                    Log.warn("Quarantined duplicate plugin jar before startup for " + keeper.info.name + ": "
+                        + candidate.path.getFileName() + " -> " + moved);
+                }
+            }
+        }
+
+        private Set<Path> configuredPluginPaths() {
+            Set<Path> paths = new HashSet<>();
+            for (TargetConfig plugin : config.plugins) {
+                if (plugin.installAs != null && !plugin.installAs.isBlank()) {
+                    paths.add(config.resolve(Paths.get(plugin.installAs)).toAbsolutePath().normalize());
+                }
+            }
+            return paths;
+        }
+
+        private PluginJarCandidate chooseDuplicateKeeper(List<PluginJarCandidate> candidates, Set<Path> configuredPaths) {
+            for (PluginJarCandidate candidate : candidates) {
+                if (configuredPaths.contains(candidate.path.toAbsolutePath().normalize())) {
+                    return candidate;
+                }
+            }
+            return candidates.stream()
+                .max(Comparator.comparing(candidate -> {
+                    try {
+                        return Files.getLastModifiedTime(candidate.path);
+                    } catch (IOException ex) {
+                        return java.nio.file.attribute.FileTime.fromMillis(0);
+                    }
+                }))
+                .orElse(candidates.get(0));
         }
 
         private Path quarantineDuplicate(Path duplicate) throws IOException {
@@ -3684,6 +3764,7 @@ public final class VelocityAutoUpdater {
 
             List<InstalledUpdate> pendingStartupUpdates = new ArrayList<>(startupUpdates);
             while (true) {
+                updater.quarantineAllDuplicatePluginJars();
                 Process process = startServer(serverJar);
                 StartupHealthMonitor startupHealth = new StartupHealthMonitor(pendingStartupUpdates);
                 Thread outputThread = pipeOutput(process, startupHealth);
@@ -5315,11 +5396,12 @@ public final class VelocityAutoUpdater {
             # validation.rejectWrongPlatform
             #   If true, reject wrong-platform jars before install. Example: do not
             #   install a Velocity/Fabric/NeoForge jar into a Folia/Paper plugins folder.
+            #   On Folia, it also prevents downgrading support: if the installed jar has
+            #   folia-supported: true, a replacement jar must keep that flag.
             #
             # duplicates.enabled
-            #   If true, after a plugin is installed or confirmed current, Auto-Updater
-            #   scans the same plugins folder for another jar with the exact same internal
-            #   plugin id/name.
+            #   If true, Auto-Updater scans the plugins folder before startup, and also
+            #   after updates, for another jar with the exact same internal plugin id/name.
             #
             # duplicates.action
             #   quarantine:

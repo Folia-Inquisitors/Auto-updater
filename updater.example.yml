@@ -231,11 +231,12 @@ restart:
 # validation.rejectWrongPlatform
 #   If true, reject wrong-platform jars before install. Example: do not
 #   install a Velocity/Fabric/NeoForge jar into a Folia/Paper plugins folder.
+#   On Folia, it also prevents downgrading support: if the installed jar has
+#   folia-supported: true, a replacement jar must keep that flag.
 #
 # duplicates.enabled
-#   If true, after a plugin is installed or confirmed current, Auto-Updater
-#   scans the same plugins folder for another jar with the exact same internal
-#   plugin id/name.
+#   If true, Auto-Updater scans the plugins folder before startup, and also
+#   after updates, for another jar with the exact same internal plugin id/name.
 #
 # duplicates.action
 #   quarantine:
