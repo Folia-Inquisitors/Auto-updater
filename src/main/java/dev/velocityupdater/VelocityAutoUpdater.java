@@ -184,6 +184,7 @@ public final class VelocityAutoUpdater {
         BuildFromSourceConfig buildFromSource = new BuildFromSourceConfig();
         FailureMemoryConfig failureMemory = new FailureMemoryConfig();
         ValidationConfig validation = new ValidationConfig();
+        DuplicateConfig duplicates = new DuplicateConfig();
         RestartConfig restart = new RestartConfig();
 
         void validate() {
@@ -362,6 +363,12 @@ public final class VelocityAutoUpdater {
         boolean rejectWrongPlatform = true;
     }
 
+    private static final class DuplicateConfig {
+        boolean enabled = true;
+        String action = "quarantine";
+        Path directory = Paths.get("backups", "duplicates");
+    }
+
     private static final class TargetConfig {
         String name;
         boolean server;
@@ -492,6 +499,9 @@ public final class VelocityAutoUpdater {
                         break;
                     case "validation":
                         applyValidation(config.validation, keyValue(line, lineNo));
+                        break;
+                    case "duplicates":
+                        applyDuplicates(config.duplicates, keyValue(line, lineNo));
                         break;
                     case "plugins":
                         if (line.startsWith("- ")) {
@@ -737,6 +747,22 @@ public final class VelocityAutoUpdater {
                     break;
                 default:
                     throw new IllegalArgumentException("Unknown validation key: " + kv.key);
+            }
+        }
+
+        private static void applyDuplicates(DuplicateConfig duplicates, KeyValue kv) {
+            switch (lower(kv.key)) {
+                case "enabled":
+                    duplicates.enabled = parseBoolean(kv.value);
+                    break;
+                case "action":
+                    duplicates.action = kv.value;
+                    break;
+                case "directory":
+                    duplicates.directory = Paths.get(kv.value);
+                    break;
+                default:
+                    throw new IllegalArgumentException("Unknown duplicates key: " + kv.key);
             }
         }
 
@@ -1460,6 +1486,7 @@ public final class VelocityAutoUpdater {
             Log.info("Jar validation: " + (config.validation.enabled ? "enabled" : "disabled")
                 + ", autoScore>=" + config.validation.minAutoInstallScore
                 + ", trustedScore>=" + config.validation.minTrustedSourceScore);
+            Log.info("Duplicate plugin handling: " + (config.duplicates.enabled ? config.duplicates.action : "disabled"));
             Log.info("Failure memory: " + (config.failureMemory.enabled ? "enabled (retryBadAfter=" + config.failureMemory.retryBadAfter + ")" : "disabled"));
             Log.info("Server install target: " + config.resolve(Paths.get(config.server.installAs)));
             for (TargetConfig target : allTargets()) {
@@ -1500,6 +1527,7 @@ public final class VelocityAutoUpdater {
             Log.info("Jar validation: " + (config.validation.enabled ? "enabled" : "disabled")
                 + ", autoScore>=" + config.validation.minAutoInstallScore
                 + ", trustedScore>=" + config.validation.minTrustedSourceScore);
+            Log.info("Duplicate plugin handling: " + (config.duplicates.enabled ? config.duplicates.action : "disabled"));
             Log.info("Failure memory: " + (config.failureMemory.enabled ? "enabled (retryBadAfter=" + config.failureMemory.retryBadAfter + ")" : "disabled"));
             if (!config.buildFromSource.trustedGithubOrgs.isEmpty()) {
                 Log.info("Trusted GitHub orgs: " + String.join(", ", config.buildFromSource.trustedGithubOrgs));
@@ -2315,6 +2343,7 @@ public final class VelocityAutoUpdater {
                 if (oldHash.equalsIgnoreCase(newHash)) {
                     Files.deleteIfExists(staging);
                     Log.info(target.displayName() + " is already current (" + shortHash(newHash) + ").");
+                    quarantineDuplicatePluginJars(target, targetPath);
                     updateLockIfNeeded(target, download);
                     return Optional.empty();
                 }
@@ -2327,6 +2356,7 @@ public final class VelocityAutoUpdater {
             }
             moveReplace(staging, targetPath);
             Log.info("Installed " + target.displayName() + " -> " + targetPath + " (" + shortHash(newHash) + ")");
+            quarantineDuplicatePluginJars(target, targetPath);
             updateLockIfNeeded(target, download);
             return Optional.of(new InstalledUpdate(target, targetPath, backupPath, target.source, downloadVersion(download), newHash));
         }
@@ -2434,6 +2464,53 @@ public final class VelocityAutoUpdater {
                 score += 7;
             }
             return Math.min(100, score);
+        }
+
+        private void quarantineDuplicatePluginJars(TargetConfig target, Path targetPath) throws IOException {
+            if (!config.duplicates.enabled || target.server || !Files.isRegularFile(targetPath)) {
+                return;
+            }
+            if (!lower(config.duplicates.action).equals("quarantine")) {
+                return;
+            }
+            Path pluginDir = targetPath.getParent();
+            if (pluginDir == null || !Files.isDirectory(pluginDir)) {
+                return;
+            }
+            PluginJarInfo installed = readPluginJarInfo(targetPath);
+            Set<String> installedKeys = pluginIdentityKeys(installed);
+            if (installedKeys.isEmpty()) {
+                return;
+            }
+            Path canonicalTarget = targetPath.toAbsolutePath().normalize();
+            for (Path jar : listJarFiles(pluginDir)) {
+                Path canonicalJar = jar.toAbsolutePath().normalize();
+                if (canonicalJar.equals(canonicalTarget)) {
+                    continue;
+                }
+                PluginJarInfo other = readPluginJarInfo(jar);
+                if (Collections.disjoint(installedKeys, pluginIdentityKeys(other))) {
+                    continue;
+                }
+                Path quarantined = quarantineDuplicate(jar);
+                Log.warn("Quarantined duplicate plugin jar for " + installed.name + ": "
+                    + jar.getFileName() + " -> " + quarantined);
+            }
+        }
+
+        private Path quarantineDuplicate(Path duplicate) throws IOException {
+            Path duplicatesDir = config.resolve(config.duplicates.directory);
+            Files.createDirectories(duplicatesDir);
+            String filename = duplicate.getFileName().toString();
+            String stamp = LocalDateTime.now().format(BACKUP_TIME);
+            Path destination = duplicatesDir.resolve(filename + "." + stamp + ".duplicate");
+            int attempt = 1;
+            while (Files.exists(destination)) {
+                destination = duplicatesDir.resolve(filename + "." + stamp + "." + attempt + ".duplicate");
+                attempt++;
+            }
+            moveReplace(duplicate, destination);
+            return destination;
         }
 
         void rememberStartupFailures(List<InstalledUpdate> updates, String reason) {
@@ -4330,6 +4407,17 @@ public final class VelocityAutoUpdater {
         return values;
     }
 
+    private static Set<String> pluginIdentityKeys(PluginJarInfo info) {
+        Set<String> keys = new HashSet<>();
+        for (String value : pluginIdentityValues(info)) {
+            String normalized = normalizeIdentity(value);
+            if (!normalized.isBlank()) {
+                keys.add(normalized);
+            }
+        }
+        return keys;
+    }
+
     private static int similarityPercent(String left, String right) {
         String a = normalizeIdentity(left);
         String b = normalizeIdentity(right);
@@ -5031,6 +5119,11 @@ public final class VelocityAutoUpdater {
               rejectOnPluginNameMismatch: true
               rejectWrongPlatform: true
 
+            duplicates:
+              enabled: true
+              action: quarantine
+              directory: backups/duplicates
+
             server:
               name: auto
               # source: auto detects an existing server jar. If this is a first
@@ -5222,6 +5315,20 @@ public final class VelocityAutoUpdater {
             # validation.rejectWrongPlatform
             #   If true, reject wrong-platform jars before install. Example: do not
             #   install a Velocity/Fabric/NeoForge jar into a Folia/Paper plugins folder.
+            #
+            # duplicates.enabled
+            #   If true, after a plugin is installed or confirmed current, Auto-Updater
+            #   scans the same plugins folder for another jar with the exact same internal
+            #   plugin id/name.
+            #
+            # duplicates.action
+            #   quarantine:
+            #     Recommended. Move duplicate jars to duplicates.directory instead of
+            #     deleting them. This prevents Folia/Paper ambiguous plugin-name errors.
+            #
+            # duplicates.directory
+            #   Where duplicate jars are moved. They are kept with a timestamped filename
+            #   so you can restore them manually if needed.
             #
             # server.name
             #   Display name. Use auto to derive Paper, Folia, Velocity, etc.
