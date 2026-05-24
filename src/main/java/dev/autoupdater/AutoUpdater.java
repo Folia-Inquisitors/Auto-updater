@@ -3774,21 +3774,53 @@ public final class AutoUpdater {
                         + " because " + hintType + " sources are manual-only.");
                     continue;
                 }
-                addCandidates(List.of(new DiscoveryCandidate(
-                    firstNonBlank(hint.type, "auto"),
-                    hint.source,
-                    hint.project,
-                    "",
-                    firstNonBlank(hint.label, hint.source),
-                    firstNonBlank(hint.reason, "configured source hint"),
-                    hint.score,
-                    hint.priority
-                )), candidates, seen);
+                addCandidates(List.of(candidateFromSourceHint(target, hint, hintType)), candidates, seen);
                 if (!hint.githubRepo.isBlank() && (target.githubRepo == null || target.githubRepo.isBlank()
                     || sourceOwnerSignal(target.detectedAuthors, "github-release", target.githubRepo, target.githubRepo, target.githubRepo).conflict)) {
                     target.githubRepo = hint.githubRepo;
                 }
             }
+        }
+
+        private DiscoveryCandidate candidateFromSourceHint(TargetConfig target, SourceHint hint, String hintType) {
+            String label = firstNonBlank(hint.label, hint.source);
+            String reason = firstNonBlank(hint.reason, "configured source hint");
+            if (hintType.equals("modrinth") || hintType.equals("hangar")) {
+                try {
+                    TargetConfig candidateTarget = target.copyWithSource(hint.source);
+                    candidateTarget.project = firstNonBlank(hint.project, candidateTarget.project);
+                    if (candidateTarget.loader == null || candidateTarget.loader.isBlank()) {
+                        candidateTarget.loader = target.platform;
+                    }
+                    ResolvedDownload download = hintType.equals("modrinth")
+                        ? new ModrinthResolver(config, client).resolve(candidateTarget)
+                        : new HangarResolver(config, client).resolve(candidateTarget);
+                    DiscoveryCandidate candidate = candidateFromResolved(target, hintType, hint.source, hint.project,
+                        latestFromLabel(download.label), label, hint.priority, reason, download);
+                    if (candidate.reason.contains("source descriptor matches installed plugin")) {
+                        return withScore(candidate, Math.max(candidate.score, hint.score));
+                    }
+                    return candidate;
+                } catch (Exception ex) {
+                    Log.info("Could not verify source hint for " + target.displayName()
+                        + " from " + hint.source + ": " + ex.getMessage());
+                }
+            }
+            return new DiscoveryCandidate(
+                firstNonBlank(hint.type, "auto"),
+                hint.source,
+                hint.project,
+                "",
+                label,
+                reason,
+                hint.score,
+                hint.priority
+            );
+        }
+
+        private DiscoveryCandidate withScore(DiscoveryCandidate candidate, int score) {
+            return new DiscoveryCandidate(candidate.type, candidate.source, candidate.projectHint, candidate.latestVersion,
+                candidate.label, candidate.reason, score, candidate.priority);
         }
 
         private void addCandidates(List<DiscoveryCandidate> source, List<DiscoveryCandidate> candidates, Set<String> seen) {
@@ -4306,10 +4338,29 @@ public final class AutoUpdater {
 
         private List<DiscoveryCandidate> discoverModrinthSources(TargetConfig target, int priority) throws Exception {
             List<DiscoveryCandidate> candidates = new ArrayList<>();
+            Set<String> triedSlugs = new HashSet<>();
+            for (String slug : exactModrinthSlugs(target)) {
+                if (!triedSlugs.add(lower(slug))) {
+                    continue;
+                }
+                TargetConfig candidateTarget = target.copyWithSource("https://modrinth.com/plugin/" + slug + "/versions");
+                candidateTarget.project = slug;
+                if (candidateTarget.loader == null || candidateTarget.loader.isBlank()) {
+                    candidateTarget.loader = target.platform;
+                }
+                try {
+                    ResolvedDownload download = new ModrinthResolver(config, client).resolve(candidateTarget);
+                    String latest = latestFromLabel(download.label);
+                    candidates.add(candidateFromResolved(target, "modrinth", candidateTarget.source, slug, latest, slug, priority,
+                        "Modrinth exact slug probe: " + slug, download));
+                } catch (Exception ignored) {
+                    // Exact slug probes are intentionally quiet; broad search below will report useful failures.
+                }
+            }
             for (String term : discoverySearchTerms(target)) {
                 URI uri = URI.create("https://api.modrinth.com/v2/search?query="
                     + urlEncode(term)
-                    + "&facets=" + urlEncode("[[\"project_type:plugin\"]]")
+                    + "&facets=" + urlEncode("[[\"project_type:plugin\",\"project_type:mod\"]]")
                     + "&index=relevance&limit=8");
                 Object json = getJson(uri, "Modrinth search");
                 Object hitsObj = asMap(json).get("hits");
@@ -4322,6 +4373,9 @@ public final class AutoUpdater {
                     String title = stringValue(hit.get("title"));
                     String projectId = stringValue(hit.get("project_id"));
                     if (slug.isBlank()) {
+                        continue;
+                    }
+                    if (!triedSlugs.add(lower(slug))) {
                         continue;
                     }
                     int match = nameMatchScore(target, title, slug, projectId);
@@ -4348,6 +4402,24 @@ public final class AutoUpdater {
 
         private List<DiscoveryCandidate> discoverHangarSources(TargetConfig target, int priority) throws Exception {
             List<DiscoveryCandidate> candidates = new ArrayList<>();
+            Set<String> triedProjects = new HashSet<>();
+            for (HangarProject project : exactHangarProjects(target)) {
+                String key = lower(project.owner + "/" + project.slug);
+                if (!triedProjects.add(key)) {
+                    continue;
+                }
+                String source = "https://hangar.papermc.io/" + project.owner + "/" + project.slug + "/versions";
+                TargetConfig candidateTarget = target.copyWithSource(source);
+                candidateTarget.project = project.owner + "/" + project.slug;
+                try {
+                    ResolvedDownload download = new HangarResolver(config, client).resolve(candidateTarget);
+                    String latest = latestFromLabel(download.label);
+                    candidates.add(candidateFromResolved(target, "hangar", source, candidateTarget.project, latest, project.slug, priority,
+                        "Hangar exact project probe: " + project.owner + "/" + project.slug, download));
+                } catch (Exception ignored) {
+                    // Exact project probes are intentionally quiet; broad search below will report useful failures.
+                }
+            }
             for (String term : discoverySearchTerms(target)) {
                 URI uri = URI.create("https://hangar.papermc.io/api/v1/projects?limit=8&offset=0&q=" + urlEncode(term));
                 Object json = getJson(uri, "Hangar search");
@@ -4361,6 +4433,7 @@ public final class AutoUpdater {
                     if (hangarProject == null) {
                         continue;
                     }
+                    triedProjects.add(lower(hangarProject.owner + "/" + hangarProject.slug));
                     String name = firstNonBlank(stringValue(project.get("name")), hangarProject.slug);
                     int match = nameMatchScore(target, name, hangarProject.slug, hangarProject.owner + "/" + hangarProject.slug);
                     if (match < 35) {
@@ -4380,6 +4453,154 @@ public final class AutoUpdater {
                 }
             }
             return candidates;
+        }
+
+        private List<String> exactModrinthSlugs(TargetConfig target) {
+            List<String> slugs = new ArrayList<>();
+            addModrinthSlugFromUrl(slugs, target.detectedWebsite);
+            for (String seed : sourceSlugSeeds(target)) {
+                addSlugVariants(slugs, seed);
+            }
+            return slugs.stream().limit(8).toList();
+        }
+
+        private List<HangarProject> exactHangarProjects(TargetConfig target) {
+            List<HangarProject> projects = new ArrayList<>();
+            addHangarProjectFromUrl(projects, target.detectedWebsite);
+            List<String> owners = new ArrayList<>();
+            for (String author : authorOwnerTerms(target.detectedAuthors)) {
+                String owner = cleanProjectSegment(author);
+                if (!owner.isBlank() && owners.stream().noneMatch(existing -> existing.equalsIgnoreCase(owner))) {
+                    owners.add(owner);
+                }
+            }
+            if (owners.isEmpty()) {
+                for (String owner : mainClassSearchTerms(target.detectedMainClass)) {
+                    String cleaned = cleanProjectSegment(owner);
+                    if (!cleaned.isBlank() && owners.stream().noneMatch(existing -> existing.equalsIgnoreCase(cleaned))) {
+                        owners.add(cleaned);
+                    }
+                }
+            }
+            List<String> slugs = new ArrayList<>();
+            for (String seed : sourceSlugSeeds(target)) {
+                addSlugVariants(slugs, seed);
+            }
+            Set<String> seen = new HashSet<>();
+            for (String owner : owners.stream().limit(1).toList()) {
+                String cleanOwner = cleanProjectSegment(owner);
+                if (cleanOwner.isBlank()) {
+                    continue;
+                }
+                for (String slug : slugs.stream().limit(3).toList()) {
+                    String key = lower(cleanOwner + "/" + slug);
+                    if (seen.add(key)) {
+                        projects.add(new HangarProject(cleanOwner, slug));
+                    }
+                }
+            }
+            return projects;
+        }
+
+        private List<String> authorOwnerTerms(String authors) {
+            if (authors == null || authors.isBlank()) {
+                return Collections.emptyList();
+            }
+            String cleaned = authors
+                .replace("[", " ")
+                .replace("]", " ")
+                .replace("\"", " ")
+                .replace("'", " ");
+            List<String> result = new ArrayList<>();
+            for (String part : cleaned.split("[,;/|]+")) {
+                String author = part.trim();
+                if (author.isBlank()) {
+                    continue;
+                }
+                if (result.stream().noneMatch(existing -> existing.equalsIgnoreCase(author))) {
+                    result.add(author);
+                }
+                String noSeparators = author.replaceAll("[_\\-\\s]+", "");
+                if (!noSeparators.equals(author)
+                    && result.stream().noneMatch(existing -> existing.equalsIgnoreCase(noSeparators))) {
+                    result.add(noSeparators);
+                }
+            }
+            return result;
+        }
+
+        private List<String> sourceSlugSeeds(TargetConfig target) {
+            List<String> seeds = new ArrayList<>();
+            addSearchTerm(seeds, target.detectedPluginId);
+            addSearchTerm(seeds, target.name);
+            addSearchTerm(seeds, stripJarName(target.installAs));
+            return seeds;
+        }
+
+        private void addSlugVariants(List<String> slugs, String value) {
+            String cleaned = cleanSearchTerm(value);
+            if (cleaned.isBlank()) {
+                return;
+            }
+            String kebab = slugify(cleaned);
+            String compact = normalizeName(cleaned);
+            if (!kebab.isBlank() && slugs.stream().noneMatch(existing -> existing.equalsIgnoreCase(kebab))) {
+                slugs.add(kebab);
+            }
+            if (!compact.isBlank() && slugs.stream().noneMatch(existing -> existing.equalsIgnoreCase(compact))) {
+                slugs.add(compact);
+            }
+        }
+
+        private String slugify(String value) {
+            String expanded = firstNonBlank(value, "")
+                .replaceAll("([a-z0-9])([A-Z])", "$1-$2")
+                .replaceAll("([A-Z]+)([A-Z][a-z])", "$1-$2");
+            return expanded.toLowerCase(Locale.ROOT)
+                .replaceAll("[^a-z0-9]+", "-")
+                .replaceAll("^-+|-+$", "");
+        }
+
+        private String cleanProjectSegment(String value) {
+            return firstNonBlank(value, "")
+                .trim()
+                .replaceAll("[^A-Za-z0-9_.-]+", "");
+        }
+
+        private void addModrinthSlugFromUrl(List<String> slugs, String url) {
+            if (url == null || url.isBlank()) {
+                return;
+            }
+            try {
+                URI uri = URI.create(url);
+                if (!lower(uri.getHost()).equals("modrinth.com")) {
+                    return;
+                }
+                List<String> parts = pathParts(uri);
+                if (parts.size() >= 2 && parts.get(0).equalsIgnoreCase("plugin")) {
+                    addSlugVariants(slugs, parts.get(1));
+                }
+            } catch (RuntimeException ignored) {
+                // Ignore malformed metadata websites.
+            }
+        }
+
+        private void addHangarProjectFromUrl(List<HangarProject> projects, String url) {
+            if (url == null || url.isBlank()) {
+                return;
+            }
+            try {
+                URI uri = URI.create(url);
+                if (!lower(uri.getHost()).equals("hangar.papermc.io")) {
+                    return;
+                }
+                List<String> parts = pathParts(uri);
+                if (parts.size() >= 2) {
+                    projects.add(new HangarProject(parts.get(0), parts.get(1)));
+                }
+            } catch (RuntimeException ignored) {
+                // Ignore malformed metadata websites.
+            }
         }
 
         private DiscoveryCandidate candidateFromResolved(TargetConfig target, String type, String source, String projectHint, String latestVersion, String label, int priority, String reason) {
@@ -4404,6 +4625,9 @@ public final class AutoUpdater {
             } else if (descriptorEvidence == SourceDescriptorEvidence.MISMATCH) {
                 score -= 100;
                 descriptorReason = "; source descriptors did not match installed plugin";
+            } else if ((type.equals("modrinth") || type.equals("hangar")) && download != null) {
+                score -= 55;
+                descriptorReason = "; source descriptor could not be verified from candidate jar";
             }
             score += ownerSignal.scoreDelta;
             String localVersion = target.detectedVersion == null ? "" : target.detectedVersion;
@@ -5181,7 +5405,11 @@ public final class AutoUpdater {
                     if (haystack.equals(needle)) {
                         best = Math.max(best, 60);
                     } else if (haystack.contains(needle) || needle.contains(haystack)) {
-                        best = Math.max(best, Math.min(45, 20 + Math.min(needle.length(), haystack.length())));
+                        int containsScore = 20 + Math.min(needle.length(), haystack.length());
+                        if (needle.length() >= 6 && (haystack.endsWith(needle) || needle.endsWith(haystack))) {
+                            containsScore += 10;
+                        }
+                        best = Math.max(best, Math.min(45, containsScore));
                     }
                 }
             }
@@ -8282,10 +8510,19 @@ public final class AutoUpdater {
         }
 
         private List<Map<String, Object>> loadVersions(String project, TargetConfig target) throws Exception {
+            for (String loader : modrinthLoaderFallbacks(firstNonBlank(target.loader, inferredPluginPlatform(config.server)))) {
+                List<Map<String, Object>> versions = loadVersions(project, target, loader);
+                if (!versions.isEmpty()) {
+                    return versions;
+                }
+            }
+            return Collections.emptyList();
+        }
+
+        private List<Map<String, Object>> loadVersions(String project, TargetConfig target, String loader) throws Exception {
             StringBuilder url = new StringBuilder("https://api.modrinth.com/v3/project/")
                 .append(urlEncode(project))
                 .append("/version?include_changelog=false");
-            String loader = firstNonBlank(target.loader, inferredPluginPlatform(config.server));
             if (!loader.isBlank()) {
                 url.append("&loaders=").append(urlEncode(jsonArray(loader)));
             }
@@ -8319,6 +8556,25 @@ public final class AutoUpdater {
             }
             versions.sort((a, b) -> stringValue(b.get("date_published")).compareTo(stringValue(a.get("date_published"))));
             return versions;
+        }
+
+        private List<String> modrinthLoaderFallbacks(String loader) {
+            String normalized = lower(loader);
+            List<String> loaders = new ArrayList<>();
+            if (!normalized.isBlank()) {
+                loaders.add(normalized);
+            }
+            if (normalized.equals("paper") || normalized.equals("folia") || normalized.equals("spigot")) {
+                loaders.add("bukkit");
+            }
+            loaders.add("");
+            List<String> distinct = new ArrayList<>();
+            for (String value : loaders) {
+                if (distinct.stream().noneMatch(existing -> existing.equals(value))) {
+                    distinct.add(value);
+                }
+            }
+            return distinct;
         }
 
         private Optional<ResolvedDownload> findDownload(String project, List<Map<String, Object>> versions, String versionType, TargetConfig target) {
