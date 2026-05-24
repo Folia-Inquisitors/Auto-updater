@@ -4235,7 +4235,13 @@ public final class AutoUpdater {
             if (!candidates.isEmpty()) {
                 return candidates;
             }
+            if (githubRateLimited || config.githubRateLimit.isPaused()) {
+                return candidates;
+            }
             for (String term : discoverySearchTerms(target)) {
+                if (githubRateLimited || config.githubRateLimit.isPaused()) {
+                    return candidates;
+                }
                 URI uri = URI.create("https://api.github.com/search/repositories?q="
                     + urlEncode(term + " minecraft plugin")
                     + "&per_page=8");
@@ -4280,35 +4286,48 @@ public final class AutoUpdater {
         private List<DiscoveryCandidate> discoverTargetedGithubSources(TargetConfig target, int priority, boolean allowReleaseLookup) {
             List<DiscoveryCandidate> candidates = new ArrayList<>();
             for (GithubRepo repo : likelyGithubRepos(target)) {
-                String source = "https://github.com/" + repo.owner + "/" + repo.name;
-                String repoName = repo.owner + "/" + repo.name;
-                SourceDescriptorEvidence descriptorEvidence = allowReleaseLookup
-                    ? githubTargetedDescriptorEvidence(target, repo)
-                    : githubCommonRawDescriptorEvidence(target, repo);
-                if (descriptorEvidence != SourceDescriptorEvidence.MATCH) {
-                    continue;
-                }
-                Optional<DiscoveryCandidate> latest = allowReleaseLookup
-                    ? latestGithubCandidate(target, repo, priority, "targeted GitHub repo descriptor match")
-                    : Optional.empty();
-                if (latest.isPresent()) {
-                    candidates.add(latest.get());
-                } else if (sourceBuildAllowedForRepo(repoName, SourceDescriptorEvidence.MATCH)) {
-                    candidates.add(candidateFromResolved(
-                        target,
-                        "github-source",
-                        source,
-                        repoName,
-                        "",
-                        repoName,
-                        sourceBuildFallbackPriority(priority),
-                        allowReleaseLookup
-                            ? "targeted GitHub repo descriptor match; no hosted release jar resolved"
-                            : "targeted GitHub repo descriptor match; GitHub API paused so using source build fallback"
-                    ));
+                List<GithubRepo> matchedRepos = matchingGithubRepoVariants(target, repo, allowReleaseLookup);
+                for (GithubRepo matchedRepo : matchedRepos) {
+                    String source = githubSourceUrl(matchedRepo);
+                    String repoName = matchedRepo.owner + "/" + matchedRepo.name;
+                    Optional<DiscoveryCandidate> latest = allowReleaseLookup
+                        ? latestGithubCandidate(target, matchedRepo, priority, "targeted GitHub repo descriptor match")
+                        : Optional.empty();
+                    if (latest.isPresent()) {
+                        candidates.add(latest.get());
+                    } else if (sourceBuildAllowedForRepo(repoName, SourceDescriptorEvidence.MATCH)) {
+                        candidates.add(candidateFromResolved(
+                            target,
+                            "github-source",
+                            source,
+                            repoName,
+                            "",
+                            repoName,
+                            sourceBuildFallbackPriority(priority),
+                            allowReleaseLookup
+                                ? "targeted GitHub repo descriptor match; no hosted release jar resolved"
+                                : "targeted GitHub repo descriptor match; GitHub API paused so using source build fallback"
+                        ));
+                    }
                 }
             }
             return candidates;
+        }
+
+        private List<GithubRepo> matchingGithubRepoVariants(TargetConfig target, GithubRepo repo, boolean allowApiInspection) {
+            Optional<GithubRepo> rawMatch = githubCommonRawDescriptorMatch(target, repo);
+            if (rawMatch.isPresent()) {
+                return List.of(rawMatch.get());
+            }
+            if (allowApiInspection && githubSourceDescriptorEvidence(
+                target,
+                "github-source",
+                githubSourceUrl(repo),
+                repo.owner + "/" + repo.name
+            ) == SourceDescriptorEvidence.MATCH) {
+                return List.of(repo);
+            }
+            return Collections.emptyList();
         }
 
         private List<GithubRepo> likelyGithubRepos(TargetConfig target) {
@@ -4320,7 +4339,7 @@ public final class AutoUpdater {
 
             List<String> owners = likelyGithubOwners(target);
             List<String> repoNames = likelyGithubRepoNames(target);
-            int budget = 32;
+            int budget = 12;
             for (String owner : owners) {
                 for (String repoName : repoNames) {
                     if (repos.size() >= budget) {
@@ -4354,11 +4373,12 @@ public final class AutoUpdater {
             }
             String owner = cleanGithubPathPart(repo.owner);
             String name = cleanGithubPathPart(repo.name);
+            String ref = cleanGithubRef(repo.ref);
             if (owner.isBlank() || name.isBlank()) {
                 return;
             }
-            String key = lower(owner + "/" + name);
-            repos.putIfAbsent(key, new GithubRepo(owner, name));
+            String key = lower(owner + "/" + name + (ref.isBlank() ? "" : "@" + ref));
+            repos.putIfAbsent(key, new GithubRepo(owner, name, ref));
         }
 
         private GithubRepo repoFromGithubText(String value) {
@@ -4405,6 +4425,9 @@ public final class AutoUpdater {
             for (String token : mainClassSearchTerms(target.detectedMainClass)) {
                 addLikelyGithubOwner(owners, token);
             }
+            for (String owner : provenGithubOwners()) {
+                addLikelyGithubOwner(owners, owner);
+            }
             return owners;
         }
 
@@ -4434,6 +4457,31 @@ public final class AutoUpdater {
             }
         }
 
+        private List<String> provenGithubOwners() {
+            Map<String, Integer> counts = new LinkedHashMap<>();
+            for (SourceProof proof : lockState.sourceProofs.values()) {
+                String type = lower(proof.type);
+                if (!type.equals("github-release") && !type.equals("github-source")) {
+                    continue;
+                }
+                GithubRepo repo = repoFromGithubText(firstNonBlank(proof.repo, proof.source));
+                if (repo == null || repo.owner.isBlank()) {
+                    continue;
+                }
+                String owner = cleanGithubPathPart(repo.owner);
+                if (owner.isBlank()) {
+                    continue;
+                }
+                counts.put(owner, counts.getOrDefault(owner, 0) + 1);
+            }
+            return counts.entrySet().stream()
+                .filter(entry -> entry.getValue() >= 2)
+                .sorted(Map.Entry.<String, Integer>comparingByValue().reversed())
+                .map(Map.Entry::getKey)
+                .limit(8)
+                .toList();
+        }
+
         private List<String> ownerAliasesForToken(String token) {
             String normalized = normalizeIdentity(token);
             List<String> aliases = new ArrayList<>();
@@ -4452,6 +4500,9 @@ public final class AutoUpdater {
             if (normalized.equals("viabackwards") || normalized.equals("viarewind")) {
                 aliases.add("ViaVersion");
             }
+            if (normalized.equals("hsgamer")) {
+                aliases.add("HSGamer");
+            }
             return aliases;
         }
 
@@ -4466,9 +4517,6 @@ public final class AutoUpdater {
                 addLikelyGithubRepoName(names, cleanSearchTerm(value));
                 addAddonBaseRepoName(names, value);
                 addAddonBaseRepoName(names, cleanSearchTerm(value));
-            }
-            for (String term : mainClassSearchTerms(target.detectedMainClass)) {
-                addLikelyGithubRepoName(names, term);
             }
             return names;
         }
@@ -4555,7 +4603,7 @@ public final class AutoUpdater {
                         continue;
                     }
                     String version = firstNonBlank(stringValue(release.get("tag_name")), stringValue(release.get("name")));
-                    String source = "https://github.com/" + repo.owner + "/" + repo.name;
+                    String source = githubSourceUrl(repo);
                     String label = repo.owner + "/" + repo.name + " " + version + " " + stringValue(asset.get().get("name"));
                     String repoName = repo.owner + "/" + repo.name;
                     String assetName = stringValue(asset.get().get("name"));
@@ -4588,7 +4636,7 @@ public final class AutoUpdater {
                 Log.warn("GitHub releases lookup failed for " + repo.owner + "/" + repo.name + ": " + ex.getMessage());
             }
             if (config.buildFromSource.allowsBuild()) {
-                String source = "https://github.com/" + repo.owner + "/" + repo.name;
+                String source = githubSourceUrl(repo);
                 String repoName = repo.owner + "/" + repo.name;
                 if (sourceBuildAllowedForRepo(repoName, githubSourceDescriptorEvidence(target, "github-source", source, repoName))) {
                     return Optional.of(candidateFromResolved(target, "github-source", source, repoName, "", repoName,
@@ -5119,29 +5167,40 @@ public final class AutoUpdater {
         }
 
         private SourceDescriptorEvidence githubCommonRawDescriptorEvidence(TargetConfig target, GithubRepo repo) {
+            return githubCommonRawDescriptorMatch(target, repo).isPresent()
+                ? SourceDescriptorEvidence.MATCH
+                : SourceDescriptorEvidence.UNKNOWN;
+        }
+
+        private Optional<GithubRepo> githubCommonRawDescriptorMatch(TargetConfig target, GithubRepo repo) {
             Optional<SourceProof> proof = lockState.activeSourceProof(target, repo);
             if (proof.isPresent()) {
-                return SourceDescriptorEvidence.MATCH;
+                GithubRepo proofRepo = repoFromGithubText(firstNonBlank(proof.get().source, proof.get().repo));
+                return Optional.of(proofRepo == null ? repo : proofRepo);
             }
             List<String> paths = likelyGithubDescriptorPaths(target, repo);
+            List<String> branches = likelyGithubBranches(target, repo);
             PluginJarInfo installed = installedPluginInfo(target);
-            for (String path : paths) {
-                try {
-                    Optional<String> text = fetchGithubRawOptional(repo, path);
-                    if (text.isEmpty()) {
-                        continue;
+            for (String branch : branches) {
+                GithubRepo branchRepo = branch.isBlank() ? new GithubRepo(repo.owner, repo.name) : new GithubRepo(repo.owner, repo.name, branch);
+                for (String path : paths) {
+                    try {
+                        Optional<String> text = fetchGithubRawOptional(branchRepo, path);
+                        if (text.isEmpty()) {
+                            continue;
+                        }
+                        PluginJarInfo info = parsePluginDescriptor(path, text.get());
+                        if (info.hasDescriptor && pluginDescriptorMatchesTarget(installed, target, info)) {
+                            rememberSourceProof(target, githubSourceUrl(branchRepo),
+                                "github-source", branchRepo, info, "raw-descriptor-match");
+                            return Optional.of(branchRepo);
+                        }
+                    } catch (Exception ignored) {
+                        // Raw descriptor probing is an optimization; fall back to API tree inspection.
                     }
-                    PluginJarInfo info = parsePluginDescriptor(path, text.get());
-                    if (info.hasDescriptor && pluginDescriptorMatchesTarget(installed, target, info)) {
-                        rememberSourceProof(target, "https://github.com/" + repo.owner + "/" + repo.name,
-                            "github-source", repo, info, "raw-descriptor-match");
-                        return SourceDescriptorEvidence.MATCH;
-                    }
-                } catch (Exception ignored) {
-                    // Raw descriptor probing is an optimization; fall back to API tree inspection.
                 }
             }
-            return SourceDescriptorEvidence.UNKNOWN;
+            return Optional.empty();
         }
 
         private List<String> likelyGithubDescriptorPaths(TargetConfig target, GithubRepo repo) {
@@ -5162,7 +5221,32 @@ public final class AutoUpdater {
                     paths.add(module + "/" + descriptor);
                 }
             }
-            return paths.stream().distinct().limit(18).toList();
+            return paths.stream().distinct().limit(8).toList();
+        }
+
+        private List<String> likelyGithubBranches(TargetConfig target, GithubRepo repo) {
+            List<String> branches = new ArrayList<>();
+            addLikelyGithubBranch(branches, repo.ref);
+            addLikelyGithubBranch(branches, "HEAD");
+            addLikelyGithubBranch(branches, "master");
+            addLikelyGithubBranch(branches, "main");
+            if (repoNameMatchesTarget(target, repo) || !cleanGithubRef(repo.ref).isBlank()) {
+                addLikelyGithubBranch(branches, "Master-Lite-Version");
+                addLikelyGithubBranch(branches, "folia");
+                addLikelyGithubBranch(branches, "paper");
+            }
+            return branches.stream().limit(6).toList();
+        }
+
+        private void addLikelyGithubBranch(List<String> branches, String value) {
+            String cleaned = cleanGithubRef(value);
+            if (cleaned.isBlank() || cleaned.equalsIgnoreCase("HEAD")) {
+                cleaned = "";
+            }
+            String branch = cleaned;
+            if (branches.stream().noneMatch(existing -> existing.equalsIgnoreCase(branch))) {
+                branches.add(branch);
+            }
         }
 
         private List<String> likelyGithubModuleNames(TargetConfig target, GithubRepo repo) {
@@ -5202,7 +5286,9 @@ public final class AutoUpdater {
         }
 
         private GithubRepo githubRepoFromSourceParts(String source, String projectHint) {
-            String value = firstNonBlank(projectHint, source, "");
+            String value = source != null && source.contains("github.com/")
+                ? source
+                : firstNonBlank(projectHint, source, "");
             if (value.isBlank()) {
                 return null;
             }
@@ -5278,10 +5364,11 @@ public final class AutoUpdater {
         }
 
         private Path githubRepoArchiveSourceDir(GithubRepo repo) {
+            String name = repo.owner + "-" + repo.name + (cleanGithubRef(repo.ref).isBlank() ? "" : "-" + cleanGithubRef(repo.ref).replace("/", "-"));
             return config.resolve(config.cacheDir)
                 .resolve("discovery")
                 .resolve("github-source")
-                .resolve(safeName(repo.owner + "-" + repo.name));
+                .resolve(safeName(name));
         }
 
         private boolean isFreshDirectory(Path path, Duration maxAge) {
@@ -5297,7 +5384,9 @@ public final class AutoUpdater {
             Files.createDirectories(sourceDir.getParent());
             Path zip = sourceDir.resolveSibling(sourceDir.getFileName() + ".zip");
             Path tmpZip = sourceDir.resolveSibling(sourceDir.getFileName() + ".zip.tmp");
-            URI uri = URI.create("https://github.com/" + urlEncode(repo.owner) + "/" + urlEncode(repo.name) + "/archive/HEAD.zip");
+            String ref = cleanGithubRef(repo.ref);
+            String archiveRef = ref.isBlank() ? "HEAD" : "refs/heads/" + ref;
+            URI uri = URI.create("https://github.com/" + urlEncode(repo.owner) + "/" + urlEncode(repo.name) + "/archive/" + encodePath(archiveRef) + ".zip");
             HttpRequest request = HttpRequest.newBuilder(uri)
                 .timeout(DISCOVERY_ARCHIVE_TIMEOUT)
                 .header("User-Agent", config.userAgent)
@@ -5323,8 +5412,10 @@ public final class AutoUpdater {
         }
 
         private String fetchGithubRaw(GithubRepo repo, String path) throws Exception {
+            String ref = cleanGithubRef(repo.ref);
+            String branch = ref.isBlank() ? "HEAD" : ref;
             URI uri = URI.create("https://raw.githubusercontent.com/" + urlEncode(repo.owner) + "/" + urlEncode(repo.name)
-                + "/HEAD/" + encodePath(path));
+                + "/" + encodePath(branch) + "/" + encodePath(path));
             HttpRequest.Builder builder = HttpRequest.newBuilder(uri)
                 .timeout(DISCOVERY_HTTP_TIMEOUT)
                 .header("User-Agent", config.userAgent);
@@ -5337,8 +5428,10 @@ public final class AutoUpdater {
         }
 
         private Optional<String> fetchGithubRawOptional(GithubRepo repo, String path) throws Exception {
+            String ref = cleanGithubRef(repo.ref);
+            String branch = ref.isBlank() ? "HEAD" : ref;
             URI uri = URI.create("https://raw.githubusercontent.com/" + urlEncode(repo.owner) + "/" + urlEncode(repo.name)
-                + "/HEAD/" + encodePath(path));
+                + "/" + encodePath(branch) + "/" + encodePath(path));
             HttpRequest.Builder builder = HttpRequest.newBuilder(uri)
                 .timeout(DISCOVERY_RAW_TIMEOUT)
                 .header("User-Agent", config.userAgent);
@@ -5622,7 +5715,11 @@ public final class AutoUpdater {
             if (parts.size() < 2) {
                 throw new IllegalArgumentException("GitHub URL needs owner/repo: " + value);
             }
-            return new GithubRepo(parts.get(0), parts.get(1).replace(".git", ""));
+            String ref = "";
+            if (parts.size() >= 4 && parts.get(2).equalsIgnoreCase("tree")) {
+                ref = String.join("/", parts.subList(3, parts.size()));
+            }
+            return new GithubRepo(parts.get(0), parts.get(1).replace(".git", ""), ref);
         }
 
         private GithubRepo repoFromGithubValue(String value) {
@@ -5634,6 +5731,12 @@ public final class AutoUpdater {
                 throw new IllegalArgumentException("GitHub repo needs Owner/Repo: " + value);
             }
             return new GithubRepo(parts[0], parts[1].replace(".git", ""));
+        }
+
+        private String githubSourceUrl(GithubRepo repo) {
+            String base = "https://github.com/" + repo.owner + "/" + repo.name;
+            String ref = cleanGithubRef(repo.ref);
+            return ref.isBlank() ? base : base + "/tree/" + encodePath(ref);
         }
 
         private HangarProject hangarProjectFromSearch(Map<String, Object> project) {
@@ -6921,9 +7024,11 @@ public final class AutoUpdater {
             GithubRepo repo = inferRepo(target);
             String repoName = repo.owner + "/" + repo.name;
 
+            String sourceCacheName = repo.owner + "-" + repo.name
+                + (cleanGithubRef(repo.ref).isBlank() ? "" : "-" + cleanGithubRef(repo.ref).replace("/", "-"));
             Path sourceDir = config.resolve(config.cacheDir)
                 .resolve("source")
-                .resolve(safeName(repo.owner + "-" + repo.name));
+                .resolve(safeName(sourceCacheName));
             syncRepo(repo, sourceDir);
             if (config.buildFromSource.onlyTrusted && !isTrusted(repoName)) {
                 PluginJarInfo installed = installedPluginInfo(target);
@@ -8113,15 +8218,25 @@ public final class AutoUpdater {
         private void syncRepo(GithubRepo repo, Path sourceDir) throws Exception {
             Files.createDirectories(sourceDir.getParent());
             String url = "https://github.com/" + repo.owner + "/" + repo.name + ".git";
+            String ref = cleanGithubRef(repo.ref);
             if (!Files.isDirectory(sourceDir.resolve(".git"))) {
-                runProcess(List.of("git", "-c", "core.longpaths=true", "clone", "--depth", "1", url, sourceDir.toString()),
-                    config.baseDir, Duration.ofMinutes(5));
+                List<String> command = new ArrayList<>(List.of("git", "-c", "core.longpaths=true", "clone", "--depth", "1"));
+                if (!ref.isBlank()) {
+                    command.addAll(List.of("--branch", ref, "--single-branch"));
+                }
+                command.addAll(List.of(url, sourceDir.toString()));
+                runProcess(command, config.baseDir, Duration.ofMinutes(5));
                 configureGitLongPaths(sourceDir);
                 return;
             }
             configureGitLongPaths(sourceDir);
-            runProcess(List.of("git", "fetch", "--depth", "1", "origin"), sourceDir, Duration.ofMinutes(5));
-            runProcess(List.of("git", "reset", "--hard", "origin/HEAD"), sourceDir, Duration.ofMinutes(2));
+            if (ref.isBlank()) {
+                runProcess(List.of("git", "fetch", "--depth", "1", "origin"), sourceDir, Duration.ofMinutes(5));
+                runProcess(List.of("git", "reset", "--hard", "origin/HEAD"), sourceDir, Duration.ofMinutes(2));
+            } else {
+                runProcess(List.of("git", "fetch", "--depth", "1", "origin", ref), sourceDir, Duration.ofMinutes(5));
+                runProcess(List.of("git", "checkout", "--force", "FETCH_HEAD"), sourceDir, Duration.ofMinutes(2));
+            }
         }
 
         private void configureGitLongPaths(Path sourceDir) {
@@ -11039,6 +11154,15 @@ public final class AutoUpdater {
         return Arrays.stream(normalizeSlashes(firstNonBlank(path, "")).split("/"))
             .map(AutoUpdater::urlEncode)
             .collect(Collectors.joining("/"));
+    }
+
+    private static String cleanGithubRef(String value) {
+        String cleaned = firstNonBlank(value, "").trim().replace('\\', '/');
+        if (cleaned.equalsIgnoreCase("HEAD")) {
+            return "";
+        }
+        cleaned = cleaned.replaceAll("^/+", "").replaceAll("/+$", "");
+        return cleaned.replaceAll("[^A-Za-z0-9_./-]+", "");
     }
 
     private static PluginJarInfo parsePluginDescriptor(String path, String text) {
