@@ -42,6 +42,7 @@ import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
+import java.util.jar.Manifest;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -93,6 +94,10 @@ public final class AutoUpdater {
     }
 
     private int run(String[] args) throws Exception {
+        if (args.length > 0 && args[0].equals("apply-self-update")) {
+            return SelfUpdater.applyReplacement(args);
+        }
+
         Cli cli = Cli.parse(args);
         if (cli.command.equals("help") || cli.command.equals("-h") || cli.command.equals("--help")) {
             printHelp();
@@ -118,6 +123,15 @@ public final class AutoUpdater {
         CacheMaintenance.run(config);
 
         Updater updater = new Updater(config);
+        if (cli.command.equals("run") || cli.command.equals("update")) {
+            try {
+                if (updater.relaunchForSelfUpdateIfNeeded(args, cli.command.equals("run"))) {
+                    return 0;
+                }
+            } catch (Exception ex) {
+                Log.warn("Self-update check failed; continuing with the current Auto-Updater jar: " + safeExceptionMessage(ex));
+            }
+        }
         switch (cli.command) {
             case "check":
                 updater.printPlan();
@@ -220,6 +234,7 @@ public final class AutoUpdater {
         ValidationConfig validation = new ValidationConfig();
         DuplicateConfig duplicates = new DuplicateConfig();
         RestartConfig restart = new RestartConfig();
+        SelfUpdateConfig selfUpdate = new SelfUpdateConfig();
         List<SourceHint> sourceHints = defaultSourceHints();
         GithubRateLimitState githubRateLimit = new GithubRateLimitState();
         GithubApiBudget githubBudget = new GithubApiBudget();
@@ -892,6 +907,14 @@ public final class AutoUpdater {
         String command;
     }
 
+    private static final class SelfUpdateConfig {
+        boolean enabled = false;
+        String source = "";
+        String type = "auto";
+        String githubRepo = "";
+        String installAs = "auto";
+    }
+
     private static final class ConfigParser {
         static AppConfig parse(Path path) throws IOException {
             AppConfig config = new AppConfig();
@@ -946,6 +969,10 @@ public final class AutoUpdater {
                         break;
                     case "duplicates":
                         applyDuplicates(config.duplicates, keyValue(line, lineNo));
+                        break;
+                    case "selfupdate":
+                    case "self_update":
+                        applySelfUpdate(config.selfUpdate, keyValue(line, lineNo));
                         break;
                     case "plugins":
                         if (line.startsWith("- ")) {
@@ -1306,6 +1333,30 @@ public final class AutoUpdater {
                     break;
                 default:
                     throw new IllegalArgumentException("Unknown restart key: " + kv.key);
+            }
+        }
+
+        private static void applySelfUpdate(SelfUpdateConfig selfUpdate, KeyValue kv) {
+            switch (lower(kv.key)) {
+                case "enabled":
+                    selfUpdate.enabled = parseBoolean(kv.value);
+                    break;
+                case "source":
+                    selfUpdate.source = kv.value;
+                    break;
+                case "type":
+                    selfUpdate.type = kv.value;
+                    break;
+                case "githubrepo":
+                case "github_repo":
+                    selfUpdate.githubRepo = kv.value;
+                    break;
+                case "installas":
+                case "install_as":
+                    selfUpdate.installAs = kv.value;
+                    break;
+                default:
+                    throw new IllegalArgumentException("Unknown selfUpdate key: " + kv.key);
             }
         }
 
@@ -3173,6 +3224,9 @@ public final class AutoUpdater {
                 + ", trustedScore>=" + config.validation.minTrustedSourceScore);
             Log.info("Duplicate plugin handling: " + (config.duplicates.enabled ? config.duplicates.action : "disabled"));
             Log.info("Failure memory: " + (config.failureMemory.enabled ? "enabled (retryBadAfter=" + config.failureMemory.retryBadAfter + ")" : "disabled"));
+            Log.info("Self-update: " + (config.selfUpdate.enabled
+                ? "enabled, source=" + firstNonBlank(config.selfUpdate.source, config.selfUpdate.githubRepo, "not configured")
+                : "disabled"));
             Log.info("Diagnostics file: " + config.resolve(config.diagnosticsFile));
             reportGithubAccess();
             Log.info("Server install target: " + config.resolve(Paths.get(config.server.installAs)));
@@ -5936,6 +5990,111 @@ public final class AutoUpdater {
             return comparePluginVersions(candidate, local) == VersionOrder.OLDER;
         }
 
+        boolean relaunchForSelfUpdateIfNeeded(String[] originalArgs, boolean relaunchAfterApply) throws Exception {
+            if (!config.selfUpdate.enabled) {
+                return false;
+            }
+            if (firstNonBlank(config.selfUpdate.source, config.selfUpdate.githubRepo).isBlank()) {
+                Log.warn("Self-update is enabled but no selfUpdate.source or selfUpdate.githubRepo is configured.");
+                return false;
+            }
+            Path currentJar = currentLauncherJar();
+            if (currentJar == null) {
+                Log.warn("Self-update skipped because Auto-Updater is not running from a jar file.");
+                return false;
+            }
+
+            TargetConfig target = new TargetConfig(APP_NAME, false);
+            target.source = config.selfUpdate.source;
+            target.type = firstNonBlank(config.selfUpdate.type, "auto");
+            target.githubRepo = config.selfUpdate.githubRepo;
+            target.installAs = isAutoValue(config.selfUpdate.installAs) || config.selfUpdate.installAs.isBlank()
+                ? currentJar.toString()
+                : config.selfUpdate.installAs;
+            if (target.source.isBlank() && !target.githubRepo.isBlank()) {
+                target.source = target.githubRepo;
+            }
+
+            SourcePlan plan = resolveSource(target);
+            if (plan.type.equals("git") || plan.type.equals("github-source")) {
+                Log.warn("Self-update source builds are intentionally unsupported; use a release jar or direct jar URL for Auto-Updater itself.");
+                return false;
+            }
+
+            Log.info("Checking Auto-Updater self-update (" + plan.type + ").");
+            ResolvedDownload download = plan.resolver.resolve(target);
+            Path selfDir = config.resolve(config.cacheDir).resolve("self-update");
+            Files.createDirectories(selfDir);
+            Path candidate = selfDir.resolve("auto-updater-candidate-" + System.currentTimeMillis() + ".jar");
+            download(download.uri, candidate);
+            try {
+                validateSelfUpdateJar(candidate);
+                if (Files.exists(currentJar) && sha256(currentJar).equalsIgnoreCase(sha256(candidate))) {
+                    Files.deleteIfExists(candidate);
+                    Log.info("Auto-Updater is already current (" + shortHash(sha256(currentJar)) + ").");
+                    return false;
+                }
+                String currentVersion = selfUpdateJarVersion(currentJar);
+                String candidateVersion = selfUpdateJarVersion(candidate);
+                if (comparePluginVersions(candidateVersion, currentVersion) == VersionOrder.OLDER) {
+                    Files.deleteIfExists(candidate);
+                    Log.warn("Self-update candidate is older than the running Auto-Updater (candidate "
+                        + candidateVersion + ", current " + currentVersion + "); keeping current jar.");
+                    return false;
+                }
+            } catch (Exception ex) {
+                Files.deleteIfExists(candidate);
+                throw ex;
+            }
+
+            Path helper = selfDir.resolve("auto-updater-self-update-helper-" + System.currentTimeMillis() + ".jar");
+            Files.copy(currentJar, helper, StandardCopyOption.REPLACE_EXISTING);
+            Log.warn("Auto-Updater update found. Relaunching through helper so " + currentJar.getFileName()
+                + " can be replaced safely.");
+            SelfUpdater.launchHelper(config, helper, candidate, currentJar, relaunchAfterApply, originalArgs);
+            return true;
+        }
+
+        private Path currentLauncherJar() {
+            try {
+                URI uri = AutoUpdater.class.getProtectionDomain().getCodeSource().getLocation().toURI();
+                Path path = Paths.get(uri).toAbsolutePath().normalize();
+                return Files.isRegularFile(path) && lower(path.getFileName().toString()).endsWith(".jar") ? path : null;
+            } catch (Exception ex) {
+                return null;
+            }
+        }
+
+        private void validateSelfUpdateJar(Path jar) throws IOException {
+            validateJar(jar);
+            try (JarFile file = new JarFile(jar.toFile(), false)) {
+                Manifest manifest = file.getManifest();
+                String main = manifest == null ? "" : firstNonBlank(
+                    manifest.getMainAttributes().getValue("Main-Class"),
+                    manifest.getMainAttributes().getValue("Launcher-Agent-Class")
+                );
+                if (!main.equals("dev.autoupdater.AutoUpdater")
+                    && !main.equals("dev.velocityupdater.VelocityAutoUpdater")) {
+                    throw new IOException("Self-update jar does not look like Auto-Updater (Main-Class=" + firstNonBlank(main, "missing") + ")");
+                }
+            }
+        }
+
+        private String selfUpdateJarVersion(Path jar) {
+            try (JarFile file = new JarFile(jar.toFile(), false)) {
+                Manifest manifest = file.getManifest();
+                if (manifest == null) {
+                    return "";
+                }
+                return firstNonBlank(
+                    manifest.getMainAttributes().getValue("Implementation-Version"),
+                    manifest.getMainAttributes().getValue("Specification-Version")
+                );
+            } catch (IOException ex) {
+                return "";
+            }
+        }
+
         List<InstalledUpdate> updateAll() throws Exception {
             List<InstalledUpdate> installed = new ArrayList<>();
             Files.createDirectories(config.resolve(config.cacheDir));
@@ -6848,6 +7007,176 @@ public final class AutoUpdater {
                 throw new IllegalArgumentException("Direct source needs a URL for " + target.displayName());
             }
             return new ResolvedDownload(sourceUri(target.source, config), target.source);
+        }
+    }
+
+    private static final class SelfUpdater {
+        private SelfUpdater() {
+        }
+
+        static void launchHelper(AppConfig config, Path helperJar, Path pendingJar, Path targetJar,
+                                 boolean relaunchAfterApply, String[] originalArgs) throws IOException {
+            List<String> command = new ArrayList<>();
+            command.add(javaExecutable());
+            command.add("-jar");
+            command.add(helperJar.toString());
+            command.add("apply-self-update");
+            command.add("--parent-pid");
+            command.add(Long.toString(ProcessHandle.current().pid()));
+            command.add("--pending");
+            command.add(pendingJar.toString());
+            command.add("--target");
+            command.add(targetJar.toString());
+            command.add("--cwd");
+            command.add(config.baseDir.toString());
+            command.add("--relaunch");
+            command.add(Boolean.toString(relaunchAfterApply));
+            command.add("--");
+            command.addAll(Arrays.asList(originalArgs));
+            ProcessBuilder builder = new ProcessBuilder(command);
+            builder.directory(config.baseDir.toFile());
+            builder.inheritIO();
+            builder.start();
+        }
+
+        static int applyReplacement(String[] args) throws Exception {
+            SelfUpdateApplyCommand command = SelfUpdateApplyCommand.parse(args);
+            waitForParent(command.parentPid);
+            validateReplacementInputs(command.pendingJar, command.targetJar);
+
+            Path parent = command.targetJar.getParent();
+            if (parent != null) {
+                Files.createDirectories(parent);
+            }
+            Path backup = command.targetJar.resolveSibling(command.targetJar.getFileName()
+                + "." + LocalDateTime.now().format(BACKUP_TIME) + ".self-update.bak");
+            if (Files.exists(command.targetJar)) {
+                Files.copy(command.targetJar, backup, StandardCopyOption.REPLACE_EXISTING);
+                Log.info("Self-update backed up " + command.targetJar.getFileName() + " -> " + backup);
+            }
+            moveReplace(command.pendingJar, command.targetJar);
+            Log.info("Self-update installed " + command.targetJar + ".");
+
+            if (command.relaunch) {
+                List<String> relaunch = new ArrayList<>();
+                relaunch.add(javaExecutable());
+                relaunch.add("-jar");
+                relaunch.add(command.targetJar.toString());
+                relaunch.addAll(command.relaunchArgs);
+                ProcessBuilder builder = new ProcessBuilder(relaunch);
+                builder.directory(command.cwd.toFile());
+                builder.inheritIO();
+                Log.info("Self-update relaunching: " + String.join(" ", relaunch));
+                builder.start();
+            }
+            return 0;
+        }
+
+        private static void waitForParent(long parentPid) {
+            if (parentPid <= 0) {
+                return;
+            }
+            try {
+                Optional<ProcessHandle> parent = ProcessHandle.of(parentPid);
+                if (parent.isPresent() && parent.get().isAlive()) {
+                    parent.get().onExit().get(120, TimeUnit.SECONDS);
+                }
+            } catch (Exception ignored) {
+                // If the parent cannot be observed, continue; the replacement will still fail safely if locked.
+            }
+        }
+
+        private static void validateReplacementInputs(Path pendingJar, Path targetJar) throws IOException {
+            if (!Files.isRegularFile(pendingJar)) {
+                throw new IOException("Pending self-update jar does not exist: " + pendingJar);
+            }
+            if (Files.exists(targetJar) && !Files.isRegularFile(targetJar)) {
+                throw new IOException("Self-update target is not a file: " + targetJar);
+            }
+            try (JarFile file = new JarFile(pendingJar.toFile(), false)) {
+                Manifest manifest = file.getManifest();
+                String main = manifest == null ? "" : firstNonBlank(
+                    manifest.getMainAttributes().getValue("Main-Class"),
+                    manifest.getMainAttributes().getValue("Launcher-Agent-Class")
+                );
+                if (!main.equals("dev.autoupdater.AutoUpdater")
+                    && !main.equals("dev.velocityupdater.VelocityAutoUpdater")) {
+                    throw new IOException("Pending self-update jar is not Auto-Updater (Main-Class="
+                        + firstNonBlank(main, "missing") + ")");
+                }
+            }
+        }
+
+        private static String javaExecutable() {
+            String home = System.getProperty("java.home", "");
+            String name = isWindows() ? "java.exe" : "java";
+            if (!home.isBlank()) {
+                Path java = Paths.get(home).resolve("bin").resolve(name);
+                if (Files.isRegularFile(java)) {
+                    return java.toString();
+                }
+            }
+            return "java";
+        }
+
+        private static boolean isWindows() {
+            return lower(System.getProperty("os.name", "")).contains("win");
+        }
+
+        private static void moveReplace(Path from, Path to) throws IOException {
+            try {
+                Files.move(from, to, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            } catch (AtomicMoveNotSupportedException ex) {
+                Files.move(from, to, StandardCopyOption.REPLACE_EXISTING);
+            }
+        }
+    }
+
+    private static final class SelfUpdateApplyCommand {
+        long parentPid;
+        Path pendingJar;
+        Path targetJar;
+        Path cwd;
+        boolean relaunch;
+        List<String> relaunchArgs = new ArrayList<>();
+
+        static SelfUpdateApplyCommand parse(String[] args) {
+            SelfUpdateApplyCommand command = new SelfUpdateApplyCommand();
+            command.cwd = Paths.get(".").toAbsolutePath().normalize();
+            for (int i = 1; i < args.length; i++) {
+                String arg = args[i];
+                if (arg.equals("--")) {
+                    command.relaunchArgs.addAll(Arrays.asList(args).subList(i + 1, args.length));
+                    break;
+                }
+                if (i + 1 >= args.length) {
+                    throw new IllegalArgumentException(arg + " needs a value");
+                }
+                String value = args[++i];
+                switch (arg) {
+                    case "--parent-pid":
+                        command.parentPid = Long.parseLong(value);
+                        break;
+                    case "--pending":
+                        command.pendingJar = Paths.get(value).toAbsolutePath().normalize();
+                        break;
+                    case "--target":
+                        command.targetJar = Paths.get(value).toAbsolutePath().normalize();
+                        break;
+                    case "--cwd":
+                        command.cwd = Paths.get(value).toAbsolutePath().normalize();
+                        break;
+                    case "--relaunch":
+                        command.relaunch = parseBoolean(value);
+                        break;
+                    default:
+                        throw new IllegalArgumentException("Unknown self-update argument: " + arg);
+                }
+            }
+            if (command.pendingJar == null || command.targetJar == null) {
+                throw new IllegalArgumentException("apply-self-update needs --pending and --target");
+            }
+            return command;
         }
     }
 
@@ -10726,8 +11055,13 @@ public final class AutoUpdater {
                         true
                     );
                 }
+                Optional<GithubTokenStatus> localToken = githubTokenFromLocalFiles(config, envName);
+                if (localToken.isPresent()) {
+                    return localToken.get();
+                }
                 return new GithubTokenStatus("", "environment variable " + envName,
-                    "githubToken points at environment variable " + envName + ", but that variable is not visible to this Java process.",
+                    "githubToken points at environment variable " + envName + ", but that variable is not visible to this Java process. On Linux, run export "
+                        + envName + "=... before Java, or put " + envName + "=... in .env / .auto-updater.env, or put the token in github.token.",
                     true);
             }
             return new GithubTokenStatus(configured, "literal config value", "", true);
@@ -10740,7 +11074,94 @@ public final class AutoUpdater {
         if (!ghToken.isBlank()) {
             return new GithubTokenStatus(ghToken, "environment variable GH_TOKEN", "", false);
         }
+        Optional<GithubTokenStatus> localToken = githubTokenFromLocalFiles(config, "GITHUB_TOKEN");
+        if (localToken.isPresent()) {
+            return localToken.get();
+        }
         return new GithubTokenStatus("", "", "", false);
+    }
+
+    private static Optional<GithubTokenStatus> githubTokenFromLocalFiles(AppConfig config, String envName) {
+        if (config == null) {
+            return Optional.empty();
+        }
+        for (String filename : List.of(".auto-updater.env", ".env")) {
+            Path path = config.resolve(Paths.get(filename));
+            Optional<String> value = tokenFromEnvFile(path, envName);
+            if (value.isPresent()) {
+                return Optional.of(new GithubTokenStatus(value.get(), filename + " entry " + envName, "", true));
+            }
+        }
+        Path tokenFile = config.resolve(Paths.get("github.token"));
+        Optional<String> value = tokenFromPlainFile(tokenFile);
+        if (value.isPresent()) {
+            return Optional.of(new GithubTokenStatus(value.get(), "github.token file", "", true));
+        }
+        return Optional.empty();
+    }
+
+    private static Optional<String> tokenFromEnvFile(Path path, String envName) {
+        try {
+            if (!Files.isRegularFile(path)) {
+                return Optional.empty();
+            }
+            String expected = firstNonBlank(envName, "GITHUB_TOKEN");
+            for (String rawLine : Files.readAllLines(path, StandardCharsets.UTF_8)) {
+                String line = rawLine.trim();
+                if (line.isBlank() || line.startsWith("#")) {
+                    continue;
+                }
+                if (line.startsWith("export ")) {
+                    line = line.substring("export ".length()).trim();
+                }
+                int equals = line.indexOf('=');
+                if (equals <= 0) {
+                    continue;
+                }
+                String key = line.substring(0, equals).trim();
+                if (!key.equals(expected)) {
+                    continue;
+                }
+                String value = unquoteShellValue(line.substring(equals + 1).trim());
+                return usableGithubToken(value);
+            }
+        } catch (IOException ignored) {
+            // Token files are optional. Missing/unreadable files simply mean no token.
+        }
+        return Optional.empty();
+    }
+
+    private static Optional<String> tokenFromPlainFile(Path path) {
+        try {
+            if (!Files.isRegularFile(path)) {
+                return Optional.empty();
+            }
+            return usableGithubToken(Files.readString(path, StandardCharsets.UTF_8).trim());
+        } catch (IOException ignored) {
+            return Optional.empty();
+        }
+    }
+
+    private static Optional<String> usableGithubToken(String value) {
+        String token = firstNonBlank(value, "").trim();
+        if (token.isBlank() || token.contains("\n") || token.contains("\r")) {
+            return Optional.empty();
+        }
+        return Optional.of(token);
+    }
+
+    private static String unquoteShellValue(String value) {
+        String cleaned = firstNonBlank(value, "").trim();
+        int comment = cleaned.indexOf(" #");
+        if (comment >= 0) {
+            cleaned = cleaned.substring(0, comment).trim();
+        }
+        if (cleaned.length() >= 2
+            && ((cleaned.startsWith("\"") && cleaned.endsWith("\""))
+                || (cleaned.startsWith("'") && cleaned.endsWith("'")))) {
+            cleaned = cleaned.substring(1, cleaned.length() - 1);
+        }
+        return cleaned.trim();
     }
 
     private static boolean looksLikeGithubToken(String value) {

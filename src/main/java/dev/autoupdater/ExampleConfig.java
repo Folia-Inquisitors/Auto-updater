@@ -16,6 +16,13 @@ final class ExampleConfig {
             githubToken: env:GITHUB_TOKEN
             diagnosticsFile: updater.diagnostics.log
 
+            selfUpdate:
+              enabled: false
+              source: https://github.com/Folia-Inquisitors/Auto-updater
+              type: auto
+              githubRepo: Folia-Inquisitors/Auto-updater
+              installAs: auto
+
             discovery:
               enabled: true
               mode: suggest
@@ -144,6 +151,12 @@ final class ExampleConfig {
             #   the last jar that actually loaded. If no previous jar existed, it removes
             #   the failed new jar.
             #
+            # selfUpdate
+            #   Optional. When enabled, Auto-Updater checks a release/direct jar source for
+            #   a replacement auto-updater.jar before normal updates. If it finds one, it
+            #   launches a helper, exits, lets the helper swap this jar safely, and then
+            #   relaunches the same command when running in run mode.
+            #
             # userAgent
             #   Sent to download APIs. PaperMC asks automated clients to include a real
             #   contact string, so replace your-email@example.com.
@@ -155,6 +168,8 @@ final class ExampleConfig {
             # githubToken
             #   Optional. Use env:GITHUB_TOKEN or env:GH_TOKEN to raise GitHub API
             #   limits without storing the token directly in updater.yml.
+            #   If the env var is not exported to Java, the updater also checks
+            #   .auto-updater.env, .env, and github.token in the server folder.
             #   On startup the updater prints the visible token source and current
             #   GitHub core/search limits without printing the token itself.
             #

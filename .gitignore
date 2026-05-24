@@ -9,3 +9,6 @@ smoke-output/
 *.log
 updater.yml
 updater.lock.yml
+.env
+.auto-updater.env
+github.token
