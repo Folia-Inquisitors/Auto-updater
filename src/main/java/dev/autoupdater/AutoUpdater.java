@@ -61,6 +61,10 @@ public final class AutoUpdater {
     private static final Duration GITHUB_CACHE_FRESH = Duration.ofMinutes(30);
     private static final Duration GITHUB_CACHE_STALE = Duration.ofHours(24);
     private static final Duration DISCOVERY_NOT_FOUND_BACKOFF = Duration.ofHours(1);
+    private static final Duration DISCOVERY_HTTP_TIMEOUT = Duration.ofSeconds(25);
+    private static final Duration DISCOVERY_RAW_TIMEOUT = Duration.ofSeconds(8);
+    private static final Duration DISCOVERY_ARCHIVE_TIMEOUT = Duration.ofSeconds(60);
+    private static final Duration DISCOVERY_JAR_TIMEOUT = Duration.ofSeconds(45);
     private static final int GITHUB_CORE_RESERVE_REMAINING = 5;
     private static final int GITHUB_SEARCH_RESERVE_REMAINING = 1;
     private static final DateTimeFormatter BACKUP_TIME = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss");
@@ -2913,7 +2917,13 @@ public final class AutoUpdater {
         private final Set<String> writtenDiagnostics = new HashSet<>();
         private final Set<String> githubBudgetWarnings = new HashSet<>();
         private final Map<String, List<PluginJarInfo>> githubDescriptorCache = new HashMap<>();
+        private final Set<String> discoveryFound = new HashSet<>();
+        private final Set<String> discoveryDeferred = new HashSet<>();
+        private final Set<String> discoveryUnresolved = new HashSet<>();
+        private final Set<String> discoveryProviderFailures = new HashSet<>();
         private boolean githubRateLimited = false;
+        private boolean githubAuthFailed = false;
+        private boolean githubAuthFailureLogged = false;
 
         Updater(AppConfig config) {
             this.config = config;
@@ -3049,8 +3059,8 @@ public final class AutoUpdater {
                     Log.info("Why: " + best.reason);
                 } else if (needsDiscoveredSource(target) && githubRateLimited) {
                     Log.warn("Discovery for " + target.displayName()
-                        + " was incomplete because GitHub rate limiting is active; leaving source unchanged for now.");
-                    rememberDiscoveryDeferred(target, "GitHub rate limited", discoveryRetryAfter());
+                        + " was incomplete because " + githubUnavailableReason() + "; leaving source unchanged for now.");
+                    rememberDiscoveryDeferred(target, githubDeferredReason(), discoveryRetryAfter());
                 } else if (needsDiscoveredSource(target)) {
                     Log.warn("No reliable hosted source found. Marking source as " + SOURCE_NOT_FOUND + ".");
                     markSourceNotFound(target);
@@ -3128,6 +3138,7 @@ public final class AutoUpdater {
                 }
             }
             saveDiscoveredSourcesIfRequested();
+            printDiscoverySummary("Discovery");
         }
 
         private void reportGithubAccess() {
@@ -3150,6 +3161,10 @@ public final class AutoUpdater {
                 applyGithubAuth(builder, config, uri);
                 HttpResponse<String> response = client.send(builder.GET().build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
                 if (response.statusCode() < 200 || response.statusCode() >= 300) {
+                    if (response.statusCode() == 401) {
+                        handleGithubAuthFailure("GitHub rate limit check", uri, response);
+                        return;
+                    }
                     Log.warn("GitHub rate limit check failed with HTTP " + response.statusCode() + ".");
                     return;
                 }
@@ -3222,8 +3237,8 @@ public final class AutoUpdater {
                 if (discovered.isEmpty()) {
                     if (githubRateLimited) {
                         Log.warn("Discovery deferred for " + target.displayName()
-                            + " because GitHub rate limiting prevented a complete search; leaving the current source unchanged.");
-                        rememberDiscoveryDeferred(target, "GitHub rate limited", discoveryRetryAfter());
+                            + " because " + githubUnavailableReason() + " prevented a complete search; leaving the current source unchanged.");
+                        rememberDiscoveryDeferred(target, githubDeferredReason(), discoveryRetryAfter());
                         continue;
                     }
                     Log.warn("No reliable hosted source found for " + target.displayName()
@@ -3234,6 +3249,7 @@ public final class AutoUpdater {
                 applyDiscoveredSource(target, discovered);
             }
             saveDiscoveredSourcesIfRequested();
+            printDiscoverySummary("Auto-switch discovery");
         }
 
         private boolean shouldDeferMissingSourceDiscovery(TargetConfig target) {
@@ -3263,7 +3279,16 @@ public final class AutoUpdater {
             return Instant.now().plus(DISCOVERY_NOT_FOUND_BACKOFF);
         }
 
+        private String githubUnavailableReason() {
+            return githubAuthFailed ? "GitHub authentication failed" : "GitHub rate limiting is active";
+        }
+
+        private String githubDeferredReason() {
+            return githubAuthFailed ? "GitHub auth failed" : "GitHub rate limited";
+        }
+
         private void rememberDiscoveryDeferred(TargetConfig target, String reason, Instant nextRetryAfter) {
+            discoveryDeferred.add(target.displayName() + " (" + firstNonBlank(reason, "deferred") + ")");
             lockState.rememberDiscoveryDeferred(target, reason, nextRetryAfter);
             writeLockQuietly();
         }
@@ -3360,7 +3385,7 @@ public final class AutoUpdater {
                 if (better.isEmpty()) {
                     if (githubRateLimited) {
                         Log.warn("Spigot migration deferred for " + target.displayName()
-                            + " because GitHub rate limiting prevented a complete replacement search; leaving the current source unchanged.");
+                            + " because " + githubUnavailableReason() + " prevented a complete replacement search; leaving the current source unchanged.");
                     } else {
                         Log.warn("No better non-Spigot source found for " + target.displayName()
                             + "; marking source as " + SOURCE_NOT_FOUND + " because Spigot sources are unsupported.");
@@ -3401,7 +3426,7 @@ public final class AutoUpdater {
                         "identity-mismatched source", "migrated away from author-mismatched primary", false);
                 } else if (githubRateLimited) {
                     Log.warn("Author-mismatch migration deferred for " + target.displayName()
-                        + " because GitHub rate limiting prevented a complete source check; leaving the current source unchanged.");
+                        + " because " + githubUnavailableReason() + " prevented a complete source check; leaving the current source unchanged.");
                 } else {
                     Log.warn("No author-compatible source found for " + target.displayName()
                         + "; marking source as " + SOURCE_NOT_FOUND + " instead of using the mismatched primary.");
@@ -3588,6 +3613,7 @@ public final class AutoUpdater {
             target.sourceOrigin = SOURCE_ORIGIN_UNRESOLVED;
             target.type = "auto";
             target.sourceDiscoveredThisRun = true;
+            discoveryUnresolved.add(target.displayName());
             rememberDiscoveryNotFound(target, "no reliable source found");
         }
 
@@ -3606,6 +3632,7 @@ public final class AutoUpdater {
                 target.githubRepo = "";
             }
             target.sourceDiscoveredThisRun = true;
+            discoveryFound.add(target.displayName() + " -> " + best.type);
             clearDiscoveryState(target);
 
             Set<String> fallbackSet = new HashSet<>(target.fallbackSources);
@@ -3676,6 +3703,51 @@ public final class AutoUpdater {
             }
         }
 
+        private void printDiscoverySummary(String label) {
+            if (discoveryFound.isEmpty()
+                && discoveryDeferred.isEmpty()
+                && discoveryUnresolved.isEmpty()
+                && discoveryProviderFailures.isEmpty()
+                && !githubAuthFailed
+                && !githubRateLimited) {
+                return;
+            }
+            Log.info("");
+            Log.info(label + " summary: found " + discoveryFound.size()
+                + ", deferred " + discoveryDeferred.size()
+                + ", unresolved " + discoveryUnresolved.size()
+                + ", provider issues " + discoveryProviderFailures.size() + ".");
+            if (githubAuthFailed) {
+                Log.warn("GitHub API disabled for this run because authentication failed with HTTP 401. Check githubToken/env and avoid using an expired or revoked token.");
+            } else if (githubRateLimited) {
+                Log.warn("GitHub API discovery was limited this run; non-GitHub discovery continued and unresolved GitHub work will retry later.");
+            }
+            printSummaryItems("Found", discoveryFound, LogLevel.INFO);
+            printSummaryItems("Deferred", discoveryDeferred, LogLevel.WARN);
+            printSummaryItems("Unresolved", discoveryUnresolved, LogLevel.WARN);
+            printSummaryItems("Provider issues", discoveryProviderFailures, LogLevel.WARN);
+        }
+
+        private void printSummaryItems(String label, Set<String> items, LogLevel level) {
+            if (items.isEmpty()) {
+                return;
+            }
+            List<String> sorted = new ArrayList<>(items);
+            sorted.sort(String.CASE_INSENSITIVE_ORDER);
+            String text = label + ": " + String.join(", ", sorted.stream().limit(18).toList())
+                + (sorted.size() > 18 ? " +" + (sorted.size() - 18) + " more" : "");
+            if (level == LogLevel.WARN) {
+                Log.warn(text);
+            } else {
+                Log.info(text);
+            }
+        }
+
+        private enum LogLevel {
+            INFO,
+            WARN
+        }
+
         private List<DiscoveryCandidate> discoverSourceCandidates(TargetConfig target) {
             List<DiscoveryCandidate> candidates = new ArrayList<>();
             Set<String> seen = new HashSet<>();
@@ -3686,6 +3758,15 @@ public final class AutoUpdater {
             List<String> priority = normalizedDiscoveryPriority();
             for (int i = 0; i < priority.size(); i++) {
                 String type = lower(priority.get(i));
+                if ((type.equals("github") || type.equals("github-release")) && githubAuthFailed) {
+                    githubRateLimited = true;
+                    addCandidates(discoverTargetedGithubSources(target, i, false), candidates, seen);
+                    if (!config.githubRateLimit.skipLogged) {
+                        Log.warn("GitHub API discovery is disabled for this run because authentication failed; continuing with raw descriptor probes and non-GitHub sources.");
+                        config.githubRateLimit.skipLogged = true;
+                    }
+                    continue;
+                }
                 if ((type.equals("github") || type.equals("github-release")) && config.githubRateLimit.isPaused()) {
                     githubRateLimited = true;
                     addCandidates(discoverTargetedGithubSources(target, i, false), candidates, seen);
@@ -3718,7 +3799,9 @@ public final class AutoUpdater {
                             break;
                     }
                 } catch (Exception ex) {
-                    Log.warn("Discovery provider " + type + " failed for " + target.displayName() + ": " + ex.getMessage());
+                    String message = "Discovery provider " + type + " failed for " + target.displayName() + ": " + ex.getMessage();
+                    discoveryProviderFailures.add(target.displayName() + " (" + type + ")");
+                    Log.warn(message);
                 }
             }
             candidates.sort(Comparator
@@ -3796,7 +3879,7 @@ public final class AutoUpdater {
                         ? new ModrinthResolver(config, client).resolve(candidateTarget)
                         : new HangarResolver(config, client).resolve(candidateTarget);
                     DiscoveryCandidate candidate = candidateFromResolved(target, hintType, hint.source, hint.project,
-                        latestFromLabel(download.label), label, hint.priority, reason, download);
+                        latestFromDownload(download), label, hint.priority, reason, download);
                     if (candidate.reason.contains("source descriptor matches installed plugin")) {
                         return withScore(candidate, Math.max(candidate.score, hint.score));
                     }
@@ -3870,11 +3953,11 @@ public final class AutoUpdater {
                 } else if (lowerWebsite.contains("hangar.papermc.io/")) {
                     TargetConfig candidateTarget = target.copyWithSource(website);
                     ResolvedDownload download = new HangarResolver(config, client).resolve(candidateTarget);
-                    addCandidates(List.of(candidateFromResolved(target, "hangar", website, "", latestFromLabel(download.label), download.label, priority, "plugin metadata website", download)), candidates, seen);
+                    addCandidates(List.of(candidateFromResolved(target, "hangar", website, "", latestFromDownload(download), download.label, priority, "plugin metadata website", download)), candidates, seen);
                 } else if (lowerWebsite.contains("modrinth.com/")) {
                     TargetConfig candidateTarget = target.copyWithSource(website);
                     ResolvedDownload download = new ModrinthResolver(config, client).resolve(candidateTarget);
-                    addCandidates(List.of(candidateFromResolved(target, "modrinth", website, "", latestFromLabel(download.label), download.label, priority, "plugin metadata website", download)), candidates, seen);
+                    addCandidates(List.of(candidateFromResolved(target, "modrinth", website, "", latestFromDownload(download), download.label, priority, "plugin metadata website", download)), candidates, seen);
                 } else if (lowerWebsite.contains("geysermc.org")) {
                     String project = lower(String.join(" ", firstNonBlank(target.name, ""), firstNonBlank(target.installAs, ""))).contains("floodgate")
                         ? "floodgate"
@@ -4350,7 +4433,7 @@ public final class AutoUpdater {
                 }
                 try {
                     ResolvedDownload download = new ModrinthResolver(config, client).resolve(candidateTarget);
-                    String latest = latestFromLabel(download.label);
+                    String latest = latestFromDownload(download);
                     candidates.add(candidateFromResolved(target, "modrinth", candidateTarget.source, slug, latest, slug, priority,
                         "Modrinth exact slug probe: " + slug, download));
                 } catch (Exception ignored) {
@@ -4389,7 +4472,7 @@ public final class AutoUpdater {
                     }
                     try {
                         ResolvedDownload download = new ModrinthResolver(config, client).resolve(candidateTarget);
-                        String latest = latestFromLabel(download.label);
+                        String latest = latestFromDownload(download);
                         candidates.add(candidateFromResolved(target, "modrinth", candidateTarget.source, slug, latest, title, priority,
                             "Modrinth search match: " + title, download));
                     } catch (Exception ex) {
@@ -4413,7 +4496,7 @@ public final class AutoUpdater {
                 candidateTarget.project = project.owner + "/" + project.slug;
                 try {
                     ResolvedDownload download = new HangarResolver(config, client).resolve(candidateTarget);
-                    String latest = latestFromLabel(download.label);
+                    String latest = latestFromDownload(download);
                     candidates.add(candidateFromResolved(target, "hangar", source, candidateTarget.project, latest, project.slug, priority,
                         "Hangar exact project probe: " + project.owner + "/" + project.slug, download));
                 } catch (Exception ignored) {
@@ -4444,7 +4527,7 @@ public final class AutoUpdater {
                     candidateTarget.project = hangarProject.owner + "/" + hangarProject.slug;
                     try {
                         ResolvedDownload download = new HangarResolver(config, client).resolve(candidateTarget);
-                        String latest = latestFromLabel(download.label);
+                        String latest = latestFromDownload(download);
                         candidates.add(candidateFromResolved(target, "hangar", source, candidateTarget.project, latest, name, priority,
                             "Hangar search match: " + name, download));
                     } catch (Exception ex) {
@@ -4752,7 +4835,7 @@ public final class AutoUpdater {
             }
             Path tmp = jar.resolveSibling(jar.getFileName() + ".tmp");
             HttpRequest request = HttpRequest.newBuilder(download.uri)
-                .timeout(Duration.ofMinutes(5))
+                .timeout(DISCOVERY_JAR_TIMEOUT)
                 .header("User-Agent", config.userAgent)
                 .GET()
                 .build();
@@ -4840,7 +4923,7 @@ public final class AutoUpdater {
                     paths.add(module + "/" + descriptor);
                 }
             }
-            return paths.stream().distinct().limit(48).toList();
+            return paths.stream().distinct().limit(18).toList();
         }
 
         private List<String> likelyGithubModuleNames(TargetConfig target, GithubRepo repo) {
@@ -4924,7 +5007,7 @@ public final class AutoUpdater {
                         .comparingInt((String path) -> descriptorPathPriority(path))
                         .thenComparing(String::length));
                     List<PluginJarInfo> apiDescriptors = new ArrayList<>();
-                    for (String path : descriptorPaths.stream().limit(30).toList()) {
+                    for (String path : descriptorPaths.stream().limit(16).toList()) {
                         String text = fetchGithubRaw(repo, path);
                         PluginJarInfo info = parsePluginDescriptor(path, text);
                         if (info.hasDescriptor) {
@@ -4977,7 +5060,7 @@ public final class AutoUpdater {
             Path tmpZip = sourceDir.resolveSibling(sourceDir.getFileName() + ".zip.tmp");
             URI uri = URI.create("https://github.com/" + urlEncode(repo.owner) + "/" + urlEncode(repo.name) + "/archive/HEAD.zip");
             HttpRequest request = HttpRequest.newBuilder(uri)
-                .timeout(Duration.ofMinutes(5))
+                .timeout(DISCOVERY_ARCHIVE_TIMEOUT)
                 .header("User-Agent", config.userAgent)
                 .GET()
                 .build();
@@ -5004,7 +5087,7 @@ public final class AutoUpdater {
             URI uri = URI.create("https://raw.githubusercontent.com/" + urlEncode(repo.owner) + "/" + urlEncode(repo.name)
                 + "/HEAD/" + encodePath(path));
             HttpRequest.Builder builder = HttpRequest.newBuilder(uri)
-                .timeout(Duration.ofSeconds(45))
+                .timeout(DISCOVERY_HTTP_TIMEOUT)
                 .header("User-Agent", config.userAgent);
             HttpRequest request = builder.GET().build();
             HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
@@ -5018,7 +5101,7 @@ public final class AutoUpdater {
             URI uri = URI.create("https://raw.githubusercontent.com/" + urlEncode(repo.owner) + "/" + urlEncode(repo.name)
                 + "/HEAD/" + encodePath(path));
             HttpRequest.Builder builder = HttpRequest.newBuilder(uri)
-                .timeout(Duration.ofSeconds(20))
+                .timeout(DISCOVERY_RAW_TIMEOUT)
                 .header("User-Agent", config.userAgent);
             HttpRequest request = builder.GET().build();
             HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
@@ -5063,6 +5146,14 @@ public final class AutoUpdater {
                 if (fresh.isPresent()) {
                     return new JsonParser(fresh.get()).parse();
                 }
+                if (githubAuthFailed) {
+                    Optional<String> stale = readGithubApiCache(config, uri, GITHUB_CACHE_STALE);
+                    if (stale.isPresent()) {
+                        Log.info("Using cached GitHub API response for " + apiName + " while GitHub auth is unavailable: " + uri);
+                        return new JsonParser(stale.get()).parse();
+                    }
+                    throw new IOException("GitHub API auth failed earlier this run; skipping API call for " + apiName);
+                }
                 if (config.githubRateLimit.isPaused()) {
                     Optional<String> stale = readGithubApiCache(config, uri, GITHUB_CACHE_STALE);
                     if (stale.isPresent()) {
@@ -5074,7 +5165,7 @@ public final class AutoUpdater {
                 enforceGithubBudget(budgetTarget, apiName, uri);
             }
             HttpRequest.Builder builder = HttpRequest.newBuilder(uri)
-                .timeout(Duration.ofSeconds(45))
+                .timeout(DISCOVERY_HTTP_TIMEOUT)
                 .header("User-Agent", config.userAgent)
                 .header("Accept", "application/json");
             applyGithubAuth(builder, config, uri);
@@ -5082,6 +5173,15 @@ public final class AutoUpdater {
             HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
             int status = response.statusCode();
             if (status < 200 || status >= 300) {
+                if (status == 401 && githubApi) {
+                    String diagnosis = handleGithubAuthFailure(apiName, uri, response);
+                    Optional<String> stale = readGithubApiCache(config, uri, GITHUB_CACHE_STALE);
+                    if (stale.isPresent()) {
+                        Log.info("Using cached GitHub API response for " + apiName + " after 401: " + uri);
+                        return new JsonParser(stale.get()).parse();
+                    }
+                    throw new IOException(apiName + " failed with HTTP 401 for " + uri + " (" + diagnosis + ")");
+                }
                 if ((status == 403 || status == 429) && githubApi) {
                     String diagnosis = github403Diagnosis(apiName, uri, response);
                     Optional<String> stale = readGithubApiCache(config, uri, GITHUB_CACHE_STALE);
@@ -5098,6 +5198,29 @@ public final class AutoUpdater {
                 writeGithubApiCache(config, uri, response.body());
             }
             return new JsonParser(response.body()).parse();
+        }
+
+        private String handleGithubAuthFailure(String apiName, URI uri, HttpResponse<String> response) {
+            githubAuthFailed = true;
+            githubRateLimited = true;
+            String message = jsonMessage(response.body());
+            String diagnosis = "GitHub authentication failed with HTTP 401"
+                + (message.isBlank() ? "" : " (" + message + ")");
+            writeDiagnosticOnce(
+                "github-401",
+                "GitHub API 401",
+                "Context: " + apiName + System.lineSeparator()
+                    + "URL: " + uri + System.lineSeparator()
+                    + "Diagnosis: " + diagnosis + System.lineSeparator()
+                    + "Token setting: " + githubTokenStatus(config).display() + System.lineSeparator()
+                    + "Body: " + abbreviate(response.body(), 700)
+            );
+            if (!githubAuthFailureLogged) {
+                Log.warn(diagnosis + ". Disabling GitHub API discovery for this run; non-GitHub discovery will continue. Details written to "
+                    + config.diagnosticsFile + ".");
+                githubAuthFailureLogged = true;
+            }
+            return diagnosis;
         }
 
         private void observeGithubRateHeaders(String apiName, HttpResponse<?> response) {
@@ -5452,6 +5575,13 @@ public final class AutoUpdater {
             return "";
         }
 
+        private String latestFromDownload(ResolvedDownload download) {
+            if (download == null) {
+                return "";
+            }
+            return firstNonBlank(download.version, latestFromLabel(download.label));
+        }
+
         private boolean isClearlyOlderVersion(String candidate, String local) {
             return comparePluginVersions(candidate, local) == VersionOrder.OLDER;
         }
@@ -5711,6 +5841,13 @@ public final class AutoUpdater {
                 if (fresh.isPresent()) {
                     return commitTimeFromGitHubResponse(fresh.get());
                 }
+                if (githubAuthFailed) {
+                    Optional<String> stale = readGithubApiCache(config, uri, GITHUB_CACHE_STALE);
+                    if (stale.isPresent()) {
+                        return commitTimeFromGitHubResponse(stale.get());
+                    }
+                    return Optional.empty();
+                }
                 if (config.githubRateLimit.isPaused()) {
                     Optional<String> stale = readGithubApiCache(config, uri, GITHUB_CACHE_STALE);
                     if (stale.isPresent()) {
@@ -5720,7 +5857,7 @@ public final class AutoUpdater {
                 }
                 enforceGithubBudget(target, "GitHub commit lookup", uri);
                 HttpRequest.Builder builder = HttpRequest.newBuilder(uri)
-                    .timeout(Duration.ofSeconds(45))
+                    .timeout(DISCOVERY_HTTP_TIMEOUT)
                     .header("User-Agent", config.userAgent)
                     .header("Accept", "application/vnd.github+json");
                 applyGithubAuth(builder, config, uri);
@@ -5728,6 +5865,14 @@ public final class AutoUpdater {
                 HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
                 int status = response.statusCode();
                 if (status < 200 || status >= 300) {
+                    if (status == 401) {
+                        handleGithubAuthFailure("GitHub commit lookup", uri, response);
+                        Optional<String> stale = readGithubApiCache(config, uri, GITHUB_CACHE_STALE);
+                        if (stale.isPresent()) {
+                            return commitTimeFromGitHubResponse(stale.get());
+                        }
+                        return Optional.empty();
+                    }
                     if (status == 403 || status == 429) {
                         String diagnosis = github403Diagnosis("GitHub commit lookup", uri, response);
                         Log.warn("GitHub commit lookup failed with HTTP " + status + " for " + repo.owner + "/" + repo.name + ": " + diagnosis);
