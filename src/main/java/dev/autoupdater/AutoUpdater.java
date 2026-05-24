@@ -18,6 +18,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.FileTime;
 import java.security.DigestInputStream;
 import java.security.MessageDigest;
 import java.time.Duration;
@@ -57,6 +58,7 @@ public final class AutoUpdater {
     private static final String SOURCE_ORIGIN_UNRESOLVED = "unresolved";
     private static final String MANAGED_MAVEN_VERSION = "3.9.11";
     private static final String MANAGED_GRADLE_VERSION = "9.2.1";
+    private static final List<Integer> MANAGED_BUILD_JAVA_FALLBACKS = List.of(21, 18);
     private static final List<String> DEFAULT_DISCOVERY_SOURCE_PRIORITY = List.of("github-release", "hangar", "modrinth");
     private static final Duration GITHUB_CACHE_FRESH = Duration.ofMinutes(30);
     private static final Duration GITHUB_CACHE_STALE = Duration.ofHours(24);
@@ -65,6 +67,11 @@ public final class AutoUpdater {
     private static final Duration DISCOVERY_RAW_TIMEOUT = Duration.ofSeconds(8);
     private static final Duration DISCOVERY_ARCHIVE_TIMEOUT = Duration.ofSeconds(60);
     private static final Duration DISCOVERY_JAR_TIMEOUT = Duration.ofSeconds(45);
+    private static final Duration CACHE_STAGING_MAX_AGE = Duration.ofHours(1);
+    private static final Duration CACHE_DISCOVERY_JAR_MAX_AGE = Duration.ofDays(7);
+    private static final Duration CACHE_DISCOVERY_METADATA_MAX_AGE = Duration.ofDays(14);
+    private static final Duration CACHE_SOURCE_FAILURE_MAX_AGE = Duration.ofDays(14);
+    private static final long CACHE_DISCOVERY_JAR_MAX_BYTES = 96L * 1024L * 1024L;
     private static final int GITHUB_CORE_RESERVE_REMAINING = 5;
     private static final int GITHUB_SEARCH_RESERVE_REMAINING = 1;
     private static final DateTimeFormatter BACKUP_TIME = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss");
@@ -74,7 +81,7 @@ public final class AutoUpdater {
         try {
             code = new AutoUpdater().run(args);
         } catch (Exception ex) {
-            Log.error("Fatal error: " + ex.getMessage());
+            Log.error("Fatal error: " + safeExceptionMessage(ex));
             if (Boolean.getBoolean("autoUpdater.debug") || Boolean.getBoolean("velocityUpdater.debug")) {
                 ex.printStackTrace(System.err);
             }
@@ -108,6 +115,7 @@ public final class AutoUpdater {
         config.configPath = configPath;
         config.baseDir = configPath.getParent() == null ? Paths.get(".").toAbsolutePath().normalize() : configPath.getParent();
         config.validate();
+        CacheMaintenance.run(config);
 
         Updater updater = new Updater(config);
         switch (cli.command) {
@@ -201,6 +209,7 @@ public final class AutoUpdater {
         String userAgent = APP_NAME + "/" + VERSION + " (contact: your-email@example.com)";
         String githubToken = "";
         Path cacheDir = Paths.get("cache");
+        boolean cacheDirConfigured = false;
         Path backupDir = Paths.get("backups");
         Path diagnosticsFile = Paths.get("updater.diagnostics.log");
         TargetConfig server = new TargetConfig(null, true);
@@ -214,8 +223,11 @@ public final class AutoUpdater {
         List<SourceHint> sourceHints = defaultSourceHints();
         GithubRateLimitState githubRateLimit = new GithubRateLimitState();
         GithubApiBudget githubBudget = new GithubApiBudget();
+        boolean githubTokenDisabled = false;
+        boolean githubTokenRejectedLogged = false;
 
         void validate() {
+            applyCacheDefaults();
             mode = lower(mode);
             onFailure = lower(onFailure);
             if (!mode.equals("hosted-safe") && !mode.equals("auto")) {
@@ -246,6 +258,27 @@ public final class AutoUpdater {
                 enrichPluginFromInstalledJar(plugin);
             }
             restart.warnings.sort(Comparator.comparing((RestartWarning w) -> w.before).reversed());
+        }
+
+        private void applyCacheDefaults() {
+            if (cacheDirConfigured || cacheDir == null || cacheDir.isAbsolute()) {
+                return;
+            }
+            if (!normalizedConfigPath(cacheDir.toString()).equals("cache")) {
+                return;
+            }
+            if (!isLikelySyncedPath(baseDir)) {
+                return;
+            }
+            String localAppData = firstNonBlank(System.getenv("LOCALAPPDATA"), "");
+            if (localAppData.isBlank()) {
+                return;
+            }
+            String serverKey = safeName(baseDir.getFileName() == null ? "server" : baseDir.getFileName().toString())
+                + "-" + sha256Text(baseDir.toString()).substring(0, 12);
+            cacheDir = Paths.get(localAppData).resolve("AutoUpdater").resolve("cache").resolve(serverKey);
+            Log.info("Default cacheDir is inside a synced folder, so using local cache instead: " + cacheDir
+                + ". Set cacheDir explicitly to override this.");
         }
 
         private void applyServerAutoDefaults(TargetConfig server) {
@@ -991,6 +1024,7 @@ public final class AutoUpdater {
                 case "cachedir":
                 case "cache_dir":
                     config.cacheDir = Paths.get(kv.value);
+                    config.cacheDirConfigured = true;
                     break;
                 case "backupdir":
                 case "backup_dir":
@@ -2368,8 +2402,8 @@ public final class AutoUpdater {
             }
             BadSourceBuild bad = new BadSourceBuild(repo);
             bad.commit = commit;
-            bad.summary = firstNonBlank(summary, "source-build-failed");
-            bad.reason = firstNonBlank(reason, bad.summary);
+            bad.summary = lockText(firstNonBlank(summary, "source-build-failed"), 300);
+            bad.reason = lockText(firstNonBlank(reason, bad.summary), 1000);
             bad.logFile = firstNonBlank(logFile, "");
             bad.failedAt = Instant.now().toString();
             badSourceBuilds.put(sourceBuildLockKey(repo), bad);
@@ -2910,6 +2944,198 @@ public final class AutoUpdater {
         }
     }
 
+    private static final class CacheMaintenance {
+        private CacheMaintenance() {
+        }
+
+        static void run(AppConfig config) {
+            Path cache = config.resolve(config.cacheDir);
+            if (!Files.exists(cache)) {
+                return;
+            }
+            warnIfSyncedCache(cache);
+            CacheStats stats = new CacheStats();
+            Instant now = Instant.now();
+            pruneOldFiles(cache.resolve("staging"), now.minus(CACHE_STAGING_MAX_AGE), stats);
+            pruneOldFiles(cache.resolve("source-build-failures"), now.minus(CACHE_SOURCE_FAILURE_MAX_AGE), stats);
+            pruneDiscoveryMetadata(cache.resolve("discovery"), now.minus(CACHE_DISCOVERY_METADATA_MAX_AGE), stats);
+            pruneDiscoveryJars(cache.resolve("discovery"), now.minus(CACHE_DISCOVERY_JAR_MAX_AGE), stats);
+            pruneEmptyDirectories(cache.resolve("staging"));
+            pruneEmptyDirectories(cache.resolve("source-build-failures"));
+            if (stats.deletedFiles > 0) {
+                Log.info("Cache maintenance removed " + stats.deletedFiles + " stale file(s), freeing "
+                    + formatBytes(stats.deletedBytes) + ".");
+            }
+        }
+
+        private static void warnIfSyncedCache(Path cache) {
+            if (isLikelySyncedPath(cache)) {
+                Log.warn("Cache directory is inside OneDrive: " + cache
+                    + ". Source-build caches can become large; moving cacheDir outside OneDrive will avoid sync overhead.");
+            }
+        }
+
+        private static void pruneDiscoveryMetadata(Path discovery, Instant cutoff, CacheStats stats) {
+            if (!Files.isDirectory(discovery)) {
+                return;
+            }
+            try (var stream = Files.walk(discovery)) {
+                stream
+                    .filter(Files::isRegularFile)
+                    .filter(path -> !isUnder(path, "jars"))
+                    .filter(path -> olderThan(path, cutoff))
+                    .forEach(path -> deleteFile(path, stats));
+            } catch (IOException ignored) {
+                // Cache maintenance is best-effort.
+            }
+        }
+
+        private static void pruneDiscoveryJars(Path discovery, Instant cutoff, CacheStats stats) {
+            if (!Files.isDirectory(discovery)) {
+                return;
+            }
+            List<Path> jarDirs = new ArrayList<>();
+            try (var stream = Files.walk(discovery)) {
+                stream
+                    .filter(Files::isDirectory)
+                    .filter(path -> path.getFileName() != null && path.getFileName().toString().equalsIgnoreCase("jars"))
+                    .forEach(jarDirs::add);
+            } catch (IOException ignored) {
+                return;
+            }
+            for (Path jarDir : jarDirs) {
+                pruneOldFiles(jarDir, cutoff, stats);
+                capDirectorySize(jarDir, CACHE_DISCOVERY_JAR_MAX_BYTES, stats);
+                pruneEmptyDirectories(jarDir);
+            }
+        }
+
+        private static void pruneOldFiles(Path dir, Instant cutoff, CacheStats stats) {
+            if (!Files.isDirectory(dir)) {
+                return;
+            }
+            try (var stream = Files.walk(dir)) {
+                stream
+                    .filter(Files::isRegularFile)
+                    .filter(path -> olderThan(path, cutoff))
+                    .forEach(path -> deleteFile(path, stats));
+            } catch (IOException ignored) {
+                // Cache maintenance is best-effort.
+            }
+        }
+
+        private static void capDirectorySize(Path dir, long maxBytes, CacheStats stats) {
+            if (!Files.isDirectory(dir)) {
+                return;
+            }
+            try (var stream = Files.walk(dir)) {
+                List<Path> files = stream
+                    .filter(Files::isRegularFile)
+                    .sorted(Comparator.comparing(CacheMaintenance::lastModifiedInstant))
+                    .toList();
+                long total = 0L;
+                for (Path file : files) {
+                    total += fileSize(file);
+                }
+                for (Path file : files) {
+                    if (total <= maxBytes) {
+                        break;
+                    }
+                    long size = fileSize(file);
+                    if (deleteFile(file, stats)) {
+                        total -= size;
+                    }
+                }
+            } catch (IOException ignored) {
+                // Cache maintenance is best-effort.
+            }
+        }
+
+        private static void pruneEmptyDirectories(Path dir) {
+            if (!Files.isDirectory(dir)) {
+                return;
+            }
+            try (var stream = Files.walk(dir)) {
+                List<Path> dirs = stream
+                    .filter(Files::isDirectory)
+                    .sorted(Comparator.reverseOrder())
+                    .toList();
+                for (Path item : dirs) {
+                    if (!item.equals(dir)) {
+                        try {
+                            Files.deleteIfExists(item);
+                        } catch (IOException ignored) {
+                            // Directory is not empty or is in use.
+                        }
+                    }
+                }
+            } catch (IOException ignored) {
+                // Cache maintenance is best-effort.
+            }
+        }
+
+        private static boolean isUnder(Path path, String segment) {
+            for (Path part : path) {
+                if (part.toString().equalsIgnoreCase(segment)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private static boolean olderThan(Path path, Instant cutoff) {
+            return lastModifiedInstant(path).isBefore(cutoff);
+        }
+
+        private static Instant lastModifiedInstant(Path path) {
+            try {
+                return Files.getLastModifiedTime(path).toInstant();
+            } catch (IOException ex) {
+                return Instant.EPOCH;
+            }
+        }
+
+        private static long fileSize(Path path) {
+            try {
+                return Files.size(path);
+            } catch (IOException ex) {
+                return 0L;
+            }
+        }
+
+        private static boolean deleteFile(Path path, CacheStats stats) {
+            long size = fileSize(path);
+            try {
+                if (Files.deleteIfExists(path)) {
+                    stats.deletedFiles++;
+                    stats.deletedBytes += size;
+                    return true;
+                }
+                return false;
+            } catch (IOException ex) {
+                return false;
+            }
+        }
+
+        private static String formatBytes(long bytes) {
+            if (bytes >= 1024L * 1024L * 1024L) {
+                return String.format(Locale.ROOT, "%.1f GB", bytes / 1024.0 / 1024.0 / 1024.0);
+            }
+            if (bytes >= 1024L * 1024L) {
+                return String.format(Locale.ROOT, "%.1f MB", bytes / 1024.0 / 1024.0);
+            }
+            if (bytes >= 1024L) {
+                return String.format(Locale.ROOT, "%.1f KB", bytes / 1024.0);
+            }
+            return bytes + " bytes";
+        }
+
+        private static final class CacheStats {
+            int deletedFiles;
+            long deletedBytes;
+        }
+    }
+
     private static final class Updater {
         private final AppConfig config;
         private final HttpClient client;
@@ -3160,6 +3386,18 @@ public final class AutoUpdater {
                     .header("Accept", "application/json");
                 applyGithubAuth(builder, config, uri);
                 HttpResponse<String> response = client.send(builder.GET().build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+                if (response.statusCode() < 200 || response.statusCode() >= 300) {
+                    if (response.statusCode() == 401) {
+                        Optional<HttpResponse<String>> unauthenticated = retryGithubUnauthenticated(
+                            config, client, uri, Duration.ofSeconds(20), "application/json", "GitHub rate limit check");
+                        if (unauthenticated.isPresent()) {
+                            response = unauthenticated.get();
+                        } else {
+                        handleGithubAuthFailure("GitHub rate limit check", uri, response);
+                        return;
+                        }
+                    }
+                }
                 if (response.statusCode() < 200 || response.statusCode() >= 300) {
                     if (response.statusCode() == 401) {
                         handleGithubAuthFailure("GitHub rate limit check", uri, response);
@@ -4831,6 +5069,7 @@ public final class AutoUpdater {
             Files.createDirectories(dir);
             Path jar = dir.resolve(filename);
             if (Files.isRegularFile(jar) && isFreshFile(jar, GITHUB_CACHE_STALE)) {
+                Files.setLastModifiedTime(jar, FileTime.from(Instant.now()));
                 return jar;
             }
             Path tmp = jar.resolveSibling(jar.getFileName() + ".tmp");
@@ -5174,6 +5413,14 @@ public final class AutoUpdater {
             int status = response.statusCode();
             if (status < 200 || status >= 300) {
                 if (status == 401 && githubApi) {
+                    Optional<HttpResponse<String>> unauthenticated = retryGithubUnauthenticated(
+                        config, client, uri, DISCOVERY_HTTP_TIMEOUT, "application/json", apiName);
+                    if (unauthenticated.isPresent()) {
+                        HttpResponse<String> retry = unauthenticated.get();
+                        observeGithubRateHeaders(apiName, retry);
+                        writeGithubApiCache(config, uri, retry.body());
+                        return new JsonParser(retry.body()).parse();
+                    }
                     String diagnosis = handleGithubAuthFailure(apiName, uri, response);
                     Optional<String> stale = readGithubApiCache(config, uri, GITHUB_CACHE_STALE);
                     if (stale.isPresent()) {
@@ -5617,7 +5864,7 @@ public final class AutoUpdater {
                         mayContinue = true;
                     }
                     if (mayContinue) {
-                        Log.warn("Update failed for " + target.displayName() + ": " + ex.getMessage());
+                        Log.warn("Update failed for " + target.displayName() + ": " + safeExceptionMessage(ex));
                         Log.warn("Keeping current jar for " + target.displayName() + ".");
                     } else {
                         throw ex;
@@ -5672,7 +5919,7 @@ public final class AutoUpdater {
                 } catch (Exception ex) {
                     last = ex;
                     if (i + 1 < sources.size()) {
-                        Log.warn("Source failed for " + target.displayName() + ": " + ex.getMessage());
+                        Log.warn("Source failed for " + target.displayName() + ": " + safeExceptionMessage(ex));
                         Log.warn("Trying fallback source " + (i + 2) + " of " + sources.size() + ".");
                     }
                 }
@@ -5866,6 +6113,14 @@ public final class AutoUpdater {
                 int status = response.statusCode();
                 if (status < 200 || status >= 300) {
                     if (status == 401) {
+                        Optional<HttpResponse<String>> unauthenticated = retryGithubUnauthenticated(
+                            config, client, uri, DISCOVERY_HTTP_TIMEOUT, "application/vnd.github+json", "GitHub commit lookup");
+                        if (unauthenticated.isPresent()) {
+                            HttpResponse<String> retry = unauthenticated.get();
+                            observeGithubRateHeaders("GitHub commit lookup", retry);
+                            writeGithubApiCache(config, uri, retry.body());
+                            return commitTimeFromGitHubResponse(retry.body());
+                        }
                         handleGithubAuthFailure("GitHub commit lookup", uri, response);
                         Optional<String> stale = readGithubApiCache(config, uri, GITHUB_CACHE_STALE);
                         if (stale.isPresent()) {
@@ -6694,15 +6949,16 @@ public final class AutoUpdater {
                 }
                 repairSourceBuildFiles(buildDir, target);
                 List<BuildCommand> commands = detectBuildCommands(buildDir);
-                Path builtJar = runBuildCommands(repoName, commit, buildDir, target, commands);
+                BuildJavaChoice javaChoice = chooseInitialBuildJava(buildDir, commands, target);
+                Path builtJar = runBuildCommands(repoName, commit, buildDir, target, commands, javaChoice);
                 validateBuiltJar(builtJar);
                 return new ResolvedDownload(builtJar.toUri(), "Git source " + repoName + " " + shortHash(commit) + " " + builtJar.getFileName(),
                     "github-source", repoName, "", "", commit);
             } catch (Exception ex) {
                 if (!(ex instanceof MissingBuildToolException)) {
-                    String details = ex instanceof SourceBuildException sourceEx ? sourceEx.details : ex.getMessage();
+                    String details = ex instanceof SourceBuildException sourceEx ? sourceEx.details : safeExceptionMessage(ex);
                     String logFile = writeSourceBuildFailureLog(repoName, commit, details);
-                    lock.rememberBadSourceBuild(repoName, commit, summarizeFailure(ex.getMessage()), details, logFile);
+                    lock.rememberBadSourceBuild(repoName, commit, summarizeFailure(safeExceptionMessage(ex)), details, logFile);
                     lock.write(config);
                 }
                 throw ex;
@@ -6710,25 +6966,43 @@ public final class AutoUpdater {
         }
 
         private Path runBuildCommands(String repoName, String commit, Path buildDir, TargetConfig target,
-                                      List<BuildCommand> commands) throws Exception {
+                                      List<BuildCommand> commands, BuildJavaChoice javaChoice) throws Exception {
             List<String> failures = new ArrayList<>();
             List<String> details = new ArrayList<>();
+            Instant deadline = Instant.now().plus(Duration.ofMinutes(12));
             for (int i = 0; i < commands.size(); i++) {
                 BuildCommand command = commands.get(i);
                 String label = command.reason.isBlank() ? "" : " (" + command.reason + ")";
                 Log.info("Building " + repoName + "@" + shortHash(commit)
-                    + " with " + String.join(" ", command.command) + label);
+                    + " with " + String.join(" ", command.command)
+                    + buildJavaLabel(javaChoice) + label);
                 try {
-                    runBuildProcess(command, buildDir, Duration.ofMinutes(20), false);
+                    runBuildProcess(command, buildDir, remainingBuildTimeout(deadline), false, javaChoice.javaHome);
                     return findBuiltJar(buildDir, target);
                 } catch (BuildProcessException ex) {
+                    if (isJavaBuildToolCompatibilityFailure(ex.output)) {
+                        JavaRetryResult retry = retryWithManagedJava(repoName, commit, buildDir, target, command, deadline, ex.output, javaChoice.major);
+                        if (retry.jar != null) {
+                            return retry.jar;
+                        }
+                        String failure = "Build command " + (i + 1) + "/" + commands.size()
+                            + " failed because the build tool is incompatible with the current Java runtime: "
+                            + String.join(" ", command.command) + " -> "
+                            + firstNonBlank(retry.failureSummary, shortBuildFailureSummary(ex.output));
+                        failures.add(failure);
+                        details.add(failure + System.lineSeparator() + firstNonBlank(retry.details, ex.output));
+                        Log.warn(failure);
+                        Log.warn("Stopping source build fallbacks for " + target.displayName()
+                            + " because this is a Java/build-tool compatibility failure, not a command-choice failure.");
+                        break;
+                    }
                     boolean dependencyFailure = isDependencyResolutionFailure(ex.output);
                     boolean corruptCache = isCorruptDependencyCacheFailure(ex.output);
                     if (dependencyFailure && attemptDependencyRescue(repoName, buildDir, target, ex.output)) {
                         Log.warn("Retrying source build for " + target.displayName()
                             + " after installing rescued dependencies into the temporary Maven repo.");
                         try {
-                            runBuildProcess(command, buildDir, Duration.ofMinutes(20), true);
+                            runBuildProcess(command, buildDir, remainingBuildTimeout(deadline), true, javaChoice.javaHome);
                             return findBuiltJar(buildDir, target);
                         } catch (BuildProcessException retryEx) {
                             String summary = shortBuildFailureSummary(retryEx.output);
@@ -6756,14 +7030,14 @@ public final class AutoUpdater {
                         Log.warn("Build command " + (i + 1) + "/" + commands.size() + " hit " + retryReason
                             + " for " + target.displayName() + "; retrying once with refreshed dependencies.");
                         try {
-                            runBuildProcess(command, buildDir, Duration.ofMinutes(20), true);
+                            runBuildProcess(command, buildDir, remainingBuildTimeout(deadline), true, javaChoice.javaHome);
                             return findBuiltJar(buildDir, target);
                         } catch (BuildProcessException retryEx) {
                             if (dependencyFailure && attemptDependencyRescue(repoName, buildDir, target, retryEx.output)) {
                                 Log.warn("Retrying source build for " + target.displayName()
                                     + " after refreshed dependency resolution exposed a rescueable dependency.");
                                 try {
-                                    runBuildProcess(command, buildDir, Duration.ofMinutes(20), true);
+                                    runBuildProcess(command, buildDir, remainingBuildTimeout(deadline), true, javaChoice.javaHome);
                                     return findBuiltJar(buildDir, target);
                                 } catch (BuildProcessException rescuedRetryEx) {
                                     retryEx = rescuedRetryEx;
@@ -6798,7 +7072,7 @@ public final class AutoUpdater {
                     }
                 } catch (Exception ex) {
                     String failure = "Build command " + (i + 1) + "/" + commands.size()
-                        + " failed: " + String.join(" ", command.command) + " -> " + ex.getMessage();
+                        + " failed: " + String.join(" ", command.command) + " -> " + safeExceptionMessage(ex);
                     failures.add(failure);
                     details.add(failure);
                     if (i + 1 < commands.size()) {
@@ -6813,9 +7087,308 @@ public final class AutoUpdater {
                 + System.lineSeparator() + String.join(System.lineSeparator() + System.lineSeparator(), details));
         }
 
+        private Duration remainingBuildTimeout(Instant deadline) throws IOException {
+            Duration remaining = Duration.between(Instant.now(), deadline);
+            if (remaining.isNegative() || remaining.isZero()) {
+                throw new IOException("Source build time budget exceeded");
+            }
+            return remaining.compareTo(Duration.ofMinutes(20)) > 0 ? Duration.ofMinutes(20) : remaining;
+        }
+
+        private String buildJavaLabel(BuildJavaChoice javaChoice) {
+            if (javaChoice == null || javaChoice.javaHome == null || javaChoice.major <= 0) {
+                return "";
+            }
+            return " (Java " + javaChoice.major + " preflight)";
+        }
+
+        private BuildJavaChoice chooseInitialBuildJava(Path buildDir, List<BuildCommand> commands, TargetConfig target) {
+            int current = Runtime.version().feature();
+            int major = preferredBuildJavaMajor(buildDir, commands, current);
+            if (major <= 0 || major == current) {
+                return BuildJavaChoice.current();
+            }
+            try {
+                Optional<Path> home = ManagedJava.home(config, major);
+                if (home.isPresent()) {
+                    Log.info("Build preflight for " + target.displayName() + ": using Java " + major
+                        + " before the first build command because " + buildJavaReason(buildDir, commands, current, major) + ".");
+                    return new BuildJavaChoice(major, home.get());
+                }
+            } catch (Exception ex) {
+                Log.warn("Build preflight for " + target.displayName() + " wanted Java " + major
+                    + " but it is not available yet: " + safeExceptionMessage(ex));
+            }
+            return BuildJavaChoice.current();
+        }
+
+        private int preferredBuildJavaMajor(Path buildDir, List<BuildCommand> commands, int current) {
+            int gradleVersionChoice = javaForGradleWrapper(buildDir, current);
+            if (gradleVersionChoice > 0) {
+                return gradleVersionChoice;
+            }
+            int ciChoice = javaFromCiHints(buildDir);
+            if (ciChoice > 0 && ciChoice != current) {
+                return closestManagedJava(ciChoice, current);
+            }
+            int buildFileChoice = javaFromBuildFiles(buildDir);
+            if (buildFileChoice > 0 && buildFileChoice != current && isMavenBuild(commands)) {
+                return closestManagedJava(buildFileChoice, current);
+            }
+            return current;
+        }
+
+        private String buildJavaReason(Path buildDir, List<BuildCommand> commands, int current, int chosen) {
+            String gradleVersion = gradleWrapperVersion(buildDir);
+            if (!gradleVersion.isBlank()) {
+                return "Gradle wrapper " + gradleVersion + " should not run on Java " + current;
+            }
+            int ci = javaFromCiHints(buildDir);
+            if (ci > 0) {
+                return "CI requests Java " + ci;
+            }
+            int buildFile = javaFromBuildFiles(buildDir);
+            if (buildFile > 0 && isMavenBuild(commands)) {
+                return "build files request Java " + buildFile;
+            }
+            return "Java " + chosen + " is a safer build runtime than Java " + current;
+        }
+
+        private boolean isMavenBuild(List<BuildCommand> commands) {
+            for (BuildCommand command : commands) {
+                if (isMavenCommand(command.command)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private int javaForGradleWrapper(Path buildDir, int current) {
+            String version = gradleWrapperVersion(buildDir);
+            if (version.isBlank()) {
+                return 0;
+            }
+            int[] parts = versionParts(version);
+            int major = parts[0];
+            int minor = parts[1];
+            if (major <= 0) {
+                return 0;
+            }
+            int max = maxJavaForGradle(major, minor);
+            if (current <= max) {
+                return 0;
+            }
+            return closestManagedJava(Math.min(max, current - 1), current);
+        }
+
+        private String gradleWrapperVersion(Path buildDir) {
+            Path properties = buildDir.resolve(Paths.get("gradle", "wrapper", "gradle-wrapper.properties"));
+            if (!Files.isRegularFile(properties)) {
+                return "";
+            }
+            try {
+                String text = Files.readString(properties, StandardCharsets.UTF_8);
+                Matcher matcher = Pattern.compile("gradle-([0-9]+(?:\\.[0-9]+){0,2})-(?:bin|all)\\.zip").matcher(text);
+                return matcher.find() ? matcher.group(1) : "";
+            } catch (IOException ex) {
+                return "";
+            }
+        }
+
+        private int maxJavaForGradle(int major, int minor) {
+            if (major >= 9) {
+                return 25;
+            }
+            if (major == 8) {
+                if (minor >= 14) {
+                    return 24;
+                }
+                if (minor >= 10) {
+                    return 23;
+                }
+                if (minor >= 7) {
+                    return 22;
+                }
+                if (minor >= 5) {
+                    return 21;
+                }
+                return 20;
+            }
+            if (major == 7) {
+                return minor >= 3 ? 17 : 16;
+            }
+            return 11;
+        }
+
+        private int javaFromCiHints(Path buildDir) {
+            Path workflows = buildDir.resolve(".github").resolve("workflows");
+            if (!Files.isDirectory(workflows)) {
+                return 0;
+            }
+            try (var stream = Files.walk(workflows, 2)) {
+                List<Path> files = stream
+                    .filter(Files::isRegularFile)
+                    .filter(path -> {
+                        String name = lower(path.getFileName().toString());
+                        return name.endsWith(".yml") || name.endsWith(".yaml");
+                    })
+                    .sorted()
+                    .limit(12)
+                    .toList();
+                for (Path file : files) {
+                    int version = firstJavaVersionInText(Files.readString(file, StandardCharsets.UTF_8));
+                    if (version > 0) {
+                        return version;
+                    }
+                }
+            } catch (IOException ignored) {
+                return 0;
+            }
+            return 0;
+        }
+
+        private int javaFromBuildFiles(Path buildDir) {
+            for (String name : List.of("build.gradle", "build.gradle.kts", "pom.xml")) {
+                Path file = buildDir.resolve(name);
+                if (!Files.isRegularFile(file)) {
+                    continue;
+                }
+                try {
+                    int version = firstJavaVersionInText(Files.readString(file, StandardCharsets.UTF_8));
+                    if (version > 0) {
+                        return version;
+                    }
+                } catch (IOException ignored) {
+                    return 0;
+                }
+            }
+            return 0;
+        }
+
+        private int firstJavaVersionInText(String text) {
+            String value = firstNonBlank(text, "");
+            List<Pattern> patterns = List.of(
+                Pattern.compile("(?i)java-version\\s*[:=]\\s*['\"]?([0-9]{2})"),
+                Pattern.compile("(?i)JavaLanguageVersion\\.of\\s*\\(\\s*([0-9]{2})\\s*\\)"),
+                Pattern.compile("(?i)targetJavaVersion\\s*=\\s*([0-9]{2})"),
+                Pattern.compile("(?i)(?:sourceCompatibility|targetCompatibility)\\s*=\\s*(?:JavaVersion\\.VERSION_)?([0-9]{2})"),
+                Pattern.compile("(?i)options\\.release\\.set\\s*\\(?\\s*([0-9]{2})"),
+                Pattern.compile("(?i)<maven\\.compiler\\.(?:release|source|target)>\\s*([0-9]{2})\\s*</maven\\.compiler\\.(?:release|source|target)>")
+            );
+            for (Pattern pattern : patterns) {
+                Matcher matcher = pattern.matcher(value);
+                if (matcher.find()) {
+                    int version = intValue(matcher.group(1), 0);
+                    if (version >= 8 && version <= 30) {
+                        return version;
+                    }
+                }
+            }
+            return 0;
+        }
+
+        private int closestManagedJava(int requested, int current) {
+            if (requested <= 0 || requested == current) {
+                return current;
+            }
+            if (MANAGED_BUILD_JAVA_FALLBACKS.contains(requested)) {
+                return requested;
+            }
+            List<Integer> sorted = new ArrayList<>(MANAGED_BUILD_JAVA_FALLBACKS);
+            sorted.sort(Comparator.reverseOrder());
+            for (int candidate : sorted) {
+                if (candidate <= requested) {
+                    return candidate;
+                }
+            }
+            return sorted.isEmpty() ? current : sorted.get(sorted.size() - 1);
+        }
+
+        private int[] versionParts(String version) {
+            String[] raw = firstNonBlank(version, "").split("\\.");
+            int major = raw.length > 0 ? intValue(raw[0], 0) : 0;
+            int minor = raw.length > 1 ? intValue(raw[1], 0) : 0;
+            return new int[] { major, minor };
+        }
+
+        private JavaRetryResult retryWithManagedJava(String repoName, String commit, Path buildDir, TargetConfig target,
+                                                     BuildCommand command, Instant deadline, String originalOutput, int alreadyTriedMajor) {
+            JavaRetryResult result = new JavaRetryResult();
+            for (int major : preferredManagedJavaFallbacks(originalOutput)) {
+                if (major == alreadyTriedMajor) {
+                    continue;
+                }
+                Path selectedJavaHome = null;
+                try {
+                    Optional<Path> javaHome = ManagedJava.home(config, major);
+                    if (javaHome.isEmpty()) {
+                        result.failureSummary = "managed/local Java " + major + " is not available";
+                        continue;
+                    }
+                    selectedJavaHome = javaHome.get();
+                    Log.warn("Build command for " + target.displayName()
+                        + " appears incompatible with Java " + Runtime.version().feature()
+                        + "; retrying once with Java " + major + " from " + selectedJavaHome + ".");
+                    Log.info("Building " + repoName + "@" + shortHash(commit)
+                        + " with " + String.join(" ", command.command)
+                        + " (Java " + major + " compatibility retry)");
+                    runBuildProcess(command, buildDir, remainingBuildTimeout(deadline), false, selectedJavaHome);
+                    result.jar = findBuiltJar(buildDir, target);
+                    return result;
+                } catch (BuildProcessException ex) {
+                    if (isDependencyResolutionFailure(ex.output)
+                        && attemptDependencyRescue(repoName, buildDir, target, ex.output)) {
+                        Log.warn("Retrying Java " + major + " source build for " + target.displayName()
+                            + " after installing rescued dependencies into the temporary Maven repo.");
+                        try {
+                            runBuildProcess(command, buildDir, remainingBuildTimeout(deadline), true, selectedJavaHome);
+                            result.jar = findBuiltJar(buildDir, target);
+                            return result;
+                        } catch (BuildProcessException retryEx) {
+                            ex = retryEx;
+                        } catch (Exception retryEx) {
+                            result.failureSummary = "Java " + major + " retry after dependency rescue could not run: "
+                                + safeExceptionMessage(retryEx);
+                            result.details = result.failureSummary;
+                            return result;
+                        }
+                    }
+                    result.failureSummary = "Java " + major + " retry failed: " + shortBuildFailureSummary(ex.output);
+                    result.details = result.failureSummary + System.lineSeparator() + ex.output;
+                    if (!isJavaBuildToolCompatibilityFailure(ex.output)) {
+                        return result;
+                    }
+                } catch (Exception ex) {
+                    result.failureSummary = "Java " + major + " retry could not run: " + safeExceptionMessage(ex);
+                    result.details = result.failureSummary;
+                }
+            }
+            return result;
+        }
+
+        private List<Integer> preferredManagedJavaFallbacks(String output) {
+            String text = lower(output);
+            if (text.contains("java 25") || text.contains("25.0.") || text.contains("major version 69")) {
+                return MANAGED_BUILD_JAVA_FALLBACKS;
+            }
+            return MANAGED_BUILD_JAVA_FALLBACKS;
+        }
+
+        private boolean isJavaBuildToolCompatibilityFailure(String output) {
+            String text = lower(output);
+            return text.contains("unsupported class file major version")
+                || text.contains("unsupported major.minor version")
+                || text.contains("invalid source release")
+                || text.contains("invalid target release")
+                || text.contains("could not target platform")
+                || text.contains("* what went wrong: 25.")
+                || text.contains("java 25") && text.contains("gradle")
+                || text.contains("this version of gradle") && text.contains("java");
+        }
+
         private boolean attemptDependencyRescue(String repoName, Path buildDir, TargetConfig target, String output) {
             String text = firstNonBlank(output, "");
-            if (!looksLikeMavenDependencyFailure(text)) {
+            if (!looksLikeMavenDependencyFailure(text) && !looksLikeGradleDependencyFailure(text)) {
                 return false;
             }
             boolean rescued = false;
@@ -6844,6 +7417,15 @@ public final class AutoUpdater {
                 || text.contains("the following artifacts could not be resolved")
                 || text.contains("couldn't download artifact")
                 || text.contains("failed to read artifact descriptor"));
+        }
+
+        private boolean looksLikeGradleDependencyFailure(String output) {
+            String text = lower(output);
+            return text.contains("could not resolve all dependencies")
+                || text.contains("could not determine the dependencies")
+                || text.contains("could not resolve ")
+                || text.contains("could not get resource")
+                || text.contains("received status code");
         }
 
         private String missingArtifactVersion(String output, String groupId, String artifactId) {
@@ -7076,6 +7658,32 @@ public final class AutoUpdater {
         private void repairSourceBuildFiles(Path buildDir, TargetConfig target) {
             repairHardcodedBuildOutputPaths(buildDir, target);
             prepareMavenBuildRescue(buildDir, target);
+            prepareGradleBuildRescue(buildDir, target);
+        }
+
+        private void prepareGradleBuildRescue(Path buildDir, TargetConfig target) {
+            for (String filename : List.of("build.gradle", "build.gradle.kts")) {
+                Path gradle = buildDir.resolve(filename);
+                if (!Files.isRegularFile(gradle)) {
+                    continue;
+                }
+                try {
+                    String original = Files.readString(gradle, StandardCharsets.UTF_8);
+                    String text = original;
+                    List<String> changes = new ArrayList<>();
+                    if (text.contains("repositories {") && !text.contains("mavenLocal()")) {
+                        text = text.replaceFirst("repositories\\s*\\{", "repositories {\n    mavenLocal()");
+                        changes.add("added mavenLocal for updater-rescued dependencies");
+                    }
+                    if (!text.equals(original)) {
+                        Files.writeString(gradle, text, StandardCharsets.UTF_8, StandardOpenOption.TRUNCATE_EXISTING);
+                        Log.info("Prepared Gradle source build for " + target.displayName() + ": " + String.join("; ", changes) + ".");
+                    }
+                } catch (IOException ex) {
+                    Log.warn("Could not prepare Gradle build rescue for " + target.displayName()
+                        + ": " + safeExceptionMessage(ex));
+                }
+            }
         }
 
         private void prepareMavenBuildRescue(Path buildDir, TargetConfig target) {
@@ -7618,11 +8226,7 @@ public final class AutoUpdater {
             if (hasGradleWrapper) {
                 gradleExecutable = gradlew.toString();
             } else if (hasGradleBuild) {
-                if (!commandExists("gradle")) {
-                    throw new MissingBuildToolException("Gradle is required to build " + sourceDir
-                        + " because it has Gradle build files but no Gradle wrapper or Gradle executable was found");
-                }
-                gradleExecutable = "gradle";
+                gradleExecutable = ManagedGradle.executable(config);
             }
             Map<String, BuildCommand> commands = new LinkedHashMap<>();
             for (BuildCommand command : detectCiBuildCommands(sourceDir, mavenExecutable, gradleExecutable)) {
@@ -7632,7 +8236,7 @@ public final class AutoUpdater {
                 addMavenBuildCommands(commands, mavenExecutable, hasMavenWrapper ? "Maven wrapper default" : "Managed/system Maven default");
             }
             if (!gradleExecutable.isBlank()) {
-                addGradleBuildCommands(commands, gradleExecutable, sourceDir, hasGradleWrapper ? "Gradle wrapper default" : "system Gradle default");
+                addGradleBuildCommands(commands, gradleExecutable, sourceDir, hasGradleWrapper ? "Gradle wrapper default" : "Managed/system Gradle default");
             }
             return new ArrayList<>(commands.values());
         }
@@ -7801,7 +8405,11 @@ public final class AutoUpdater {
         }
 
         private void runBuildProcess(BuildCommand command, Path dir, Duration timeout, boolean refreshDependencies) throws Exception {
-            BuildInvocation invocation = buildInvocation(command, refreshDependencies);
+            runBuildProcess(command, dir, timeout, refreshDependencies, null);
+        }
+
+        private void runBuildProcess(BuildCommand command, Path dir, Duration timeout, boolean refreshDependencies, Path javaHome) throws Exception {
+            BuildInvocation invocation = buildInvocation(command, refreshDependencies, javaHome);
             runProcessForOutput(invocation.command, dir, timeout, invocation.environment, refreshDependencies);
         }
 
@@ -7851,9 +8459,14 @@ public final class AutoUpdater {
             return output.toString();
         }
 
-        private BuildInvocation buildInvocation(BuildCommand command, boolean refreshDependencies) throws IOException {
+        private BuildInvocation buildInvocation(BuildCommand command, boolean refreshDependencies, Path javaHome) throws IOException {
             List<String> result = new ArrayList<>(command.command);
             Map<String, String> environment = new HashMap<>();
+            if (javaHome != null) {
+                Path bin = javaHome.resolve("bin");
+                environment.put("JAVA_HOME", javaHome.toString());
+                environment.put("PATH", bin + java.io.File.pathSeparator + firstNonBlank(System.getenv("PATH"), ""));
+            }
             if (isMavenCommand(result)) {
                 Path repo = config.resolve(config.cacheDir).resolve("build-home").resolve("maven").resolve("repository");
                 Files.createDirectories(repo);
@@ -7863,8 +8476,11 @@ public final class AutoUpdater {
                 }
             } else if (isGradleCommand(result)) {
                 Path gradleHome = config.resolve(config.cacheDir).resolve("build-home").resolve("gradle");
+                Path mavenRepo = config.resolve(config.cacheDir).resolve("build-home").resolve("maven").resolve("repository");
                 Files.createDirectories(gradleHome);
+                Files.createDirectories(mavenRepo);
                 environment.put("GRADLE_USER_HOME", gradleHome.toString());
+                addGradleArgIfMissing(result, "-Dmaven.repo.local=" + mavenRepo);
                 if (refreshDependencies && !result.contains("--refresh-dependencies")) {
                     result.add("--refresh-dependencies");
                 }
@@ -7878,6 +8494,13 @@ public final class AutoUpdater {
                 if (existing.equals(arg) || existing.startsWith(key + "=")) {
                     return;
                 }
+            }
+            command.add(1, arg);
+        }
+
+        private void addGradleArgIfMissing(List<String> command, String arg) {
+            if (command.contains(arg)) {
+                return;
             }
             command.add(1, arg);
         }
@@ -7905,10 +8528,12 @@ public final class AutoUpdater {
                 || text.contains("failed to collect dependencies")
                 || text.contains("could not transfer artifact")
                 || text.contains("could not transfer metadata")
+                || text.contains("could not get resource")
                 || text.contains("the following artifacts could not be resolved")
                 || text.contains("non-resolvable parent pom")
                 || text.contains("status code: 403")
-                || text.contains("status code: 521");
+                || text.contains("status code: 521")
+                || text.contains("received status code 521");
         }
 
         private boolean isCorruptDependencyCacheFailure(String output) {
@@ -8057,6 +8682,26 @@ public final class AutoUpdater {
             }
         }
 
+        private static final class BuildJavaChoice {
+            final int major;
+            final Path javaHome;
+
+            BuildJavaChoice(int major, Path javaHome) {
+                this.major = major;
+                this.javaHome = javaHome;
+            }
+
+            static BuildJavaChoice current() {
+                return new BuildJavaChoice(Runtime.version().feature(), null);
+            }
+        }
+
+        private static final class JavaRetryResult {
+            Path jar;
+            String failureSummary = "";
+            String details = "";
+        }
+
         private static final class BuildProcessException extends IOException {
             final String output;
             final boolean refreshed;
@@ -8126,6 +8771,8 @@ public final class AutoUpdater {
             if (!Files.isRegularFile(executable)) {
                 throw new IOException("Managed Maven download did not produce expected executable: " + executable);
             }
+            deleteQuietly(zip);
+            deleteQuietly(sha);
             if (!windows) {
                 executable.toFile().setExecutable(true);
             }
@@ -8163,7 +8810,10 @@ public final class AutoUpdater {
                     .header("User-Agent", config.userAgent)
                     .GET()
                     .build();
-                HttpResponse<InputStream> response = HttpClient.newHttpClient()
+                HttpResponse<InputStream> response = HttpClient.newBuilder()
+                    .followRedirects(HttpClient.Redirect.ALWAYS)
+                    .connectTimeout(Duration.ofSeconds(30))
+                    .build()
                     .send(request, HttpResponse.BodyHandlers.ofInputStream());
                 int status = response.statusCode();
                 if (status < 200 || status >= 300) {
@@ -8234,6 +8884,237 @@ public final class AutoUpdater {
                 }
             }
         }
+
+        private static void deleteQuietly(Path path) {
+            try {
+                Files.deleteIfExists(path);
+            } catch (IOException ignored) {
+                // A cached archive is disposable; leave it alone if another process has it open.
+            }
+        }
+    }
+
+    private static final class ManagedGradle {
+        private ManagedGradle() {
+        }
+
+        static String executable(AppConfig config) throws IOException {
+            boolean windows = System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("win");
+            String envHome = firstNonBlank(System.getenv("GRADLE_HOME"));
+            if (!envHome.isBlank()) {
+                Path envExe = Paths.get(envHome).resolve("bin").resolve(windows ? "gradle.bat" : "gradle");
+                if (Files.isRegularFile(envExe)) {
+                    return envExe.toString();
+                }
+            }
+            String pathExe = ManagedMaven.commandOnPath("gradle", windows);
+            if (!pathExe.isBlank()) {
+                return pathExe;
+            }
+            return ensureManaged(config, windows).toString();
+        }
+
+        private static Path ensureManaged(AppConfig config, boolean windows) throws IOException {
+            Path toolsDir = config.resolve(config.cacheDir).resolve("tools").resolve("gradle");
+            Path installDir = toolsDir.resolve("gradle-" + MANAGED_GRADLE_VERSION);
+            Path executable = installDir.resolve("bin").resolve(windows ? "gradle.bat" : "gradle");
+            if (Files.isRegularFile(executable)) {
+                return executable;
+            }
+
+            Files.createDirectories(toolsDir);
+            String filename = "gradle-" + MANAGED_GRADLE_VERSION + "-bin.zip";
+            URI zipUri = URI.create("https://services.gradle.org/distributions/" + filename);
+            URI shaUri = URI.create(zipUri + ".sha256");
+            Path zip = toolsDir.resolve(filename);
+            Path sha = toolsDir.resolve(filename + ".sha256");
+
+            Log.info("Managed Gradle " + MANAGED_GRADLE_VERSION + " is not cached; downloading to " + toolsDir + ".");
+            ManagedMaven.download(config, zipUri, zip);
+            ManagedMaven.download(config, shaUri, sha);
+            verifySha256(zip, sha);
+
+            if (Files.exists(installDir)) {
+                ManagedMaven.deleteRecursively(installDir);
+            }
+            ManagedMaven.unzip(zip, toolsDir);
+            if (!Files.isRegularFile(executable)) {
+                throw new IOException("Managed Gradle download did not produce expected executable: " + executable);
+            }
+            ManagedMaven.deleteQuietly(zip);
+            ManagedMaven.deleteQuietly(sha);
+            if (!windows) {
+                executable.toFile().setExecutable(true);
+            }
+            Log.info("Managed Gradle ready: " + executable);
+            return executable;
+        }
+
+        private static void verifySha256(Path zip, Path shaFile) throws IOException {
+            String expected = expectedSha256(shaFile);
+            String actual;
+            try {
+                actual = sha256(zip);
+            } catch (Exception ex) {
+                throw new IOException("Could not calculate SHA-256 for managed Gradle download", ex);
+            }
+            if (!actual.equalsIgnoreCase(expected)) {
+                Files.deleteIfExists(zip);
+                throw new IOException("Managed Gradle SHA-256 mismatch: expected " + expected + " but got " + actual);
+            }
+        }
+
+        private static String expectedSha256(Path shaFile) throws IOException {
+            String text = Files.readString(shaFile, StandardCharsets.UTF_8);
+            for (String token : text.split("\\s+")) {
+                if (token.matches("[A-Fa-f0-9]{64}")) {
+                    return token;
+                }
+            }
+            throw new IOException("Managed Gradle SHA-256 file did not contain a valid hash: " + shaFile);
+        }
+    }
+
+    private static final class ManagedJava {
+        private ManagedJava() {
+        }
+
+        static Optional<Path> home(AppConfig config, int major) throws IOException {
+            Optional<Path> local = localHome(major);
+            if (local.isPresent()) {
+                return local;
+            }
+            return Optional.of(ensureManaged(config, major));
+        }
+
+        private static Optional<Path> localHome(int major) {
+            for (String name : List.of("JAVA" + major + "_HOME", "JDK" + major + "_HOME")) {
+                Path home = envJavaHome(name);
+                if (home != null) {
+                    return Optional.of(home);
+                }
+            }
+            return Optional.empty();
+        }
+
+        private static Path envJavaHome(String name) {
+            String value = firstNonBlank(System.getenv(name), "");
+            if (value.isBlank()) {
+                return null;
+            }
+            Path home = Paths.get(value);
+            Path java = home.resolve("bin").resolve(isWindows() ? "java.exe" : "java");
+            return Files.isRegularFile(java) ? home : null;
+        }
+
+        private static Path ensureManaged(AppConfig config, int major) throws IOException {
+            Path toolsDir = config.resolve(config.cacheDir).resolve("tools").resolve("java");
+            Path markerDir = toolsDir.resolve("temurin-" + major);
+            Path existing = findJavaHome(markerDir);
+            if (existing != null) {
+                return existing;
+            }
+            Files.createDirectories(markerDir);
+            JavaDownload download = resolveDownload(config, major);
+            Path archive = markerDir.resolve("temurin-" + major + ".zip");
+            Log.info("Managed Java " + major + " is not cached; downloading to " + markerDir + ".");
+            ManagedMaven.download(config, download.link, archive);
+            if (!download.checksum.isBlank()) {
+                String actual;
+                try {
+                    actual = sha256(archive);
+                } catch (Exception ex) {
+                    throw new IOException("Could not calculate SHA-256 for managed Java download", ex);
+                }
+                if (!actual.equalsIgnoreCase(download.checksum)) {
+                    Files.deleteIfExists(archive);
+                    throw new IOException("Managed Java " + major + " SHA-256 mismatch: expected "
+                        + download.checksum + " but got " + actual);
+                }
+            }
+            ManagedMaven.unzip(archive, markerDir);
+            Path home = findJavaHome(markerDir);
+            if (home == null) {
+                throw new IOException("Managed Java " + major + " download did not contain a usable java executable");
+            }
+            ManagedMaven.deleteQuietly(archive);
+            if (!isWindows()) {
+                home.resolve("bin").resolve("java").toFile().setExecutable(true);
+            }
+            Log.info("Managed Java " + major + " ready: " + home);
+            return home;
+        }
+
+        private static JavaDownload resolveDownload(AppConfig config, int major) throws IOException {
+            String os = isWindows() ? "windows" : lower(System.getProperty("os.name", "")).contains("mac") ? "mac" : "linux";
+            String arch = System.getProperty("os.arch", "").toLowerCase(Locale.ROOT).contains("aarch64") ? "aarch64" : "x64";
+            URI uri = URI.create("https://api.adoptium.net/v3/assets/latest/" + major
+                + "/hotspot?architecture=" + arch
+                + "&image_type=jdk&os=" + os
+                + "&vendor=eclipse");
+            try {
+                HttpRequest request = HttpRequest.newBuilder(uri)
+                    .timeout(Duration.ofSeconds(45))
+                    .header("User-Agent", config.userAgent)
+                    .header("Accept", "application/json")
+                    .GET()
+                    .build();
+                HttpResponse<String> response = HttpClient.newBuilder()
+                    .followRedirects(HttpClient.Redirect.ALWAYS)
+                    .connectTimeout(Duration.ofSeconds(30))
+                    .build()
+                    .send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+                if (response.statusCode() < 200 || response.statusCode() >= 300) {
+                    throw new IOException("Adoptium API failed with HTTP " + response.statusCode() + " for Java " + major);
+                }
+                Object json = new JsonParser(response.body()).parse();
+                if (!(json instanceof List<?> list) || list.isEmpty()) {
+                    throw new IOException("Adoptium API returned no Java " + major + " downloads");
+                }
+                Map<String, Object> root = asMap(list.get(0));
+                Map<String, Object> binary = asMap(root.get("binary"));
+                Map<String, Object> pkg = asMap(binary.get("package"));
+                String link = stringValue(pkg.get("link"));
+                if (link.isBlank()) {
+                    throw new IOException("Adoptium API returned Java " + major + " without a download link");
+                }
+                return new JavaDownload(URI.create(link), stringValue(pkg.get("checksum")));
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrupted while resolving managed Java " + major, ex);
+            }
+        }
+
+        private static Path findJavaHome(Path root) throws IOException {
+            if (!Files.isDirectory(root)) {
+                return null;
+            }
+            String javaName = isWindows() ? "java.exe" : "java";
+            try (var stream = Files.walk(root, 4)) {
+                return stream
+                    .filter(Files::isRegularFile)
+                    .filter(path -> path.getFileName().toString().equalsIgnoreCase(javaName))
+                    .filter(path -> path.getParent() != null && path.getParent().getFileName().toString().equalsIgnoreCase("bin"))
+                    .map(path -> path.getParent().getParent())
+                    .filter(Objects::nonNull)
+                    .findFirst()
+                    .orElse(null);
+            }
+        }
+
+        private static boolean isWindows() {
+            return lower(System.getProperty("os.name", "")).contains("win");
+        }
+
+        private static final class JavaDownload {
+            final URI link;
+            final String checksum;
+
+            JavaDownload(URI link, String checksum) {
+                this.link = link;
+                this.checksum = firstNonBlank(checksum, "");
+            }
+        }
     }
 
     private static final class GithubReleaseResolver implements DownloadResolver {
@@ -8301,6 +9182,17 @@ public final class AutoUpdater {
             HttpRequest request = builder.GET().build();
             HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
             int status = response.statusCode();
+            if (status < 200 || status >= 300) {
+                if (status == 401) {
+                    Optional<HttpResponse<String>> unauthenticated = retryGithubUnauthenticated(
+                        config, client, uri, Duration.ofSeconds(45), "application/vnd.github+json",
+                        "GitHub releases " + repo.owner + "/" + repo.name);
+                    if (unauthenticated.isPresent()) {
+                        response = unauthenticated.get();
+                        status = response.statusCode();
+                    }
+                }
+            }
             if (status < 200 || status >= 300) {
                 if (status == 403 || status == 429) {
                     pauseGithubFromResponse(config, response);
@@ -9552,10 +10444,20 @@ public final class AutoUpdater {
         if (value == null || value.isBlank()) {
             return "\"\"";
         }
+        value = value.replace("\r", "\\r").replace("\n", "\\n");
         if (value.matches("[A-Za-z0-9_./:@?=&%+,-]+")) {
             return value;
         }
         return "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
+    }
+
+    private static String lockText(String value, int maxChars) {
+        String cleaned = firstNonBlank(value, "")
+            .replace("\r", "\\r")
+            .replace("\n", "\\n")
+            .replaceAll("\\s+", " ")
+            .trim();
+        return abbreviate(cleaned, maxChars);
     }
 
     private static String quoteYamlKey(String value) {
@@ -9574,6 +10476,17 @@ public final class AutoUpdater {
             }
         }
         return "";
+    }
+
+    private static String safeExceptionMessage(Throwable ex) {
+        if (ex == null) {
+            return "unknown error";
+        }
+        String message = firstNonBlank(ex.getMessage(), ex.getLocalizedMessage());
+        if (!message.isBlank()) {
+            return message;
+        }
+        return ex.getClass().getSimpleName().isBlank() ? ex.getClass().getName() : ex.getClass().getSimpleName();
     }
 
     private static String abbreviate(String value, int maxChars) {
@@ -9606,6 +10519,14 @@ public final class AutoUpdater {
         return value == null || value.isBlank() || isAutoValue(value) || isNotFoundSourceValue(value);
     }
 
+    private static boolean isLikelySyncedPath(Path path) {
+        String normalized = normalizeSlashes(path.toAbsolutePath().normalize().toString()).toLowerCase(Locale.ROOT);
+        return normalized.contains("/onedrive/")
+            || normalized.contains("/onedrive - ")
+            || normalized.contains("/dropbox/")
+            || normalized.contains("/google drive/");
+    }
+
     private static boolean sourcesMatchLoosely(String a, String b) {
         String left = normalizeSlashes(firstNonBlank(a, "")).toLowerCase(Locale.ROOT);
         String right = normalizeSlashes(firstNonBlank(b, "")).toLowerCase(Locale.ROOT);
@@ -9626,11 +10547,47 @@ public final class AutoUpdater {
         if (uri == null || !lower(uri.getHost()).equals("api.github.com")) {
             return;
         }
+        if (config != null && config.githubTokenDisabled) {
+            return;
+        }
         String token = githubTokenValue(config);
         if (!token.isBlank()) {
             builder.header("Authorization", "Bearer " + token);
             builder.header("X-GitHub-Api-Version", "2022-11-28");
         }
+    }
+
+    private static Optional<HttpResponse<String>> retryGithubUnauthenticated(
+        AppConfig config,
+        HttpClient client,
+        URI uri,
+        Duration timeout,
+        String accept,
+        String context
+    ) throws IOException, InterruptedException {
+        if (config == null || client == null || uri == null || !lower(uri.getHost()).equals("api.github.com")) {
+            return Optional.empty();
+        }
+        if (!githubTokenStatus(config).hasToken() || config.githubTokenDisabled) {
+            return Optional.empty();
+        }
+        config.githubTokenDisabled = true;
+        if (!config.githubTokenRejectedLogged) {
+            Log.warn("GitHub rejected the configured token with HTTP 401; retrying public GitHub API calls without the token for this run.");
+            config.githubTokenRejectedLogged = true;
+        }
+        HttpRequest request = HttpRequest.newBuilder(uri)
+            .timeout(timeout)
+            .header("User-Agent", config.userAgent)
+            .header("Accept", firstNonBlank(accept, "application/json"))
+            .GET()
+            .build();
+        HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        if (response.statusCode() >= 200 && response.statusCode() < 300) {
+            Log.info("GitHub API retry without token succeeded for " + context + ".");
+            return Optional.of(response);
+        }
+        return Optional.empty();
     }
 
     private static String githubTokenValue(AppConfig config) {
