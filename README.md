@@ -23,7 +23,6 @@ plugins/
 - Hangar plugin downloads.
 - GitHub release jar downloads.
 - Modrinth plugin downloads.
-- SpigotMC downloads
 - Direct jar URLs and local jar paths.
 - searchable stable `installAs` filenames.
 - Backup and staging folders.
@@ -46,7 +45,7 @@ userAgent: "Auto-Updater/0.3.0 (contact: your-email@example.com)"
 discovery:
   enabled: true
   mode: suggest
-  sourcePriority: github-release, hangar, modrinth, spigot
+  sourcePriority: github-release, hangar, modrinth
   checkAlternateSourcesWhenOutdated: true
   outdatedThresholdDays: 14
   autoSwitchSource: true

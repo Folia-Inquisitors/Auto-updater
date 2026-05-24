@@ -1,0 +1,400 @@
+package dev.autoupdater;
+
+final class ExampleConfig {
+    private ExampleConfig() {
+    }
+
+    static String text(String version) {
+        return """
+            # Auto-Updater
+            # Run with: java -jar auto-updater.jar run
+            # The editable config is first. Detailed notes are at the bottom.
+
+            mode: hosted-safe
+            onFailure: keep-current
+            userAgent: "Auto-Updater/%s (contact: your-email@example.com)"
+            githubToken: env:GITHUB_TOKEN
+            diagnosticsFile: updater.diagnostics.log
+
+            discovery:
+              enabled: true
+              mode: suggest
+              sourcePriority: github-release, hangar, modrinth
+              checkAlternateSourcesWhenOutdated: true
+              outdatedThresholdDays: 14
+              autoSwitchSource: true
+              saveDiscoveredSources: true
+              scanInstalledPlugins: true
+
+            buildFromSource:
+              enabled: auto
+              onlyTrusted: true
+              preferHostedIfSameVersion: true
+              trustedGithubOrgs: PaperMC, GeyserMC, ViaVersion
+              trustedGithubRepos: Inquisitors-transfers/MyCustomPlugin, A4Papers/ChatFilter
+
+            failureMemory:
+              enabled: true
+              retryBadAfter: never
+
+            validation:
+              enabled: true
+              minAutoInstallScore: 90
+              minTrustedSourceScore: 85
+              rejectOnPluginNameMismatch: true
+              rejectOnPluginFingerprintMismatch: true
+              rejectWrongPlatform: true
+
+            duplicates:
+              enabled: true
+              action: quarantine
+              directory: backups/duplicates
+
+            server:
+              name: auto
+              # source: auto detects an existing server jar. If this is a first
+              # install with no server jar yet, use a PaperMC URL from the examples above.
+              source: auto
+              type: auto
+              installAs: auto
+              gameVersion: auto
+              changeVersion: false
+              java: java
+              javaArgs: "-Xms16G -Xmx32G"
+              args: ""
+
+            plugins:
+              - name: ViaVersion
+                source: https://github.com/ViaVersion/ViaVersion
+                type: auto
+                autoUpdate: true
+                githubRepo: ViaVersion/ViaVersion
+                platform: paper
+                fallbackSources: https://hangar.papermc.io/ViaVersion/ViaVersion/versions, https://modrinth.com/plugin/viaversion/versions
+                installAs: plugins/ViaVersion.jar
+                required: false
+
+              - name: ViaBackwards
+                source: https://github.com/ViaVersion/ViaBackwards
+                type: auto
+                autoUpdate: true
+                githubRepo: ViaVersion/ViaBackwards
+                platform: paper
+                fallbackSources: https://hangar.papermc.io/ViaVersion/ViaBackwards/versions, https://modrinth.com/plugin/viabackwards/versions
+                installAs: plugins/ViaBackwards.jar
+                required: false
+
+              - name: ViaRewind
+                source: https://github.com/ViaVersion/ViaRewind
+                type: auto
+                autoUpdate: true
+                githubRepo: ViaVersion/ViaRewind
+                platform: paper
+                fallbackSources: https://hangar.papermc.io/ViaVersion/ViaRewind/versions, https://modrinth.com/plugin/viarewind/versions
+                installAs: plugins/ViaRewind.jar
+                required: false
+
+              # Optional Modrinth example:
+              # - name: FancyHolograms
+              #   source: https://modrinth.com/plugin/fancyholograms/versions
+              #   type: auto
+              #   loader: paper
+              #   installAs: plugins/FancyHolograms.jar
+              #   required: false
+
+            restart:
+              enabled: true
+              interval: 7d
+              stopCommand: stop
+              gracefulStopSeconds: 60
+              warnings:
+                - before: 2h
+                  command: "say Server restart in 2 hours for updates."
+                - before: 30m
+                  command: "say Server restart in 30 minutes for updates."
+                - before: 5m
+                  command: "say Server restart in 5 minutes for updates."
+                - before: 1m
+                  command: "say Server restart in 1 minute for updates."
+
+            # ---------------------------------------------------------------------------
+            # Config Notes
+            # ---------------------------------------------------------------------------
+            #
+            # mode
+            #   hosted-safe:
+            #     Recommended for hosted panels and normal servers.
+            #     Downloads ready-made jars first. It will only run Git/Gradle/Maven when
+            #     buildFromSource.enabled is true/auto and the repo is trusted.
+            #   auto:
+            #     Allows auto-detection features. In this version, updates still use
+            #     hosted/downloaded jars only.
+            #
+            # onFailure
+            #   keep-current:
+            #     Recommended. If an update fails and an old jar exists, keep using it.
+            #     This helps the server still start when a download site is down.
+            #   stop:
+            #     Stop startup if a required update cannot be completed.
+            #
+            # startup rollback
+            #   After installing plugin updates, Auto-Updater watches early server console
+            #   output for load failures that mention an updated plugin. If one is found,
+            #   it restores the previous jar backup, restarts once, and keeps the server on
+            #   the last jar that actually loaded. If no previous jar existed, it removes
+            #   the failed new jar.
+            #
+            # userAgent
+            #   Sent to download APIs. PaperMC asks automated clients to include a real
+            #   contact string, so replace your-email@example.com.
+            #
+            # diagnosticsFile
+            #   Appended with useful diagnostics, such as GitHub HTTP 403 rate-limit
+            #   headers and response bodies.
+            #
+            # githubToken
+            #   Optional. Use env:GITHUB_TOKEN or env:GH_TOKEN to raise GitHub API
+            #   limits without storing the token directly in updater.yml.
+            #   On startup the updater prints the visible token source and current
+            #   GitHub core/search limits without printing the token itself.
+            #
+            # discovery.enabled
+            #   Turns discovery reporting on or off.
+            #
+            # discovery.mode
+            #   suggest:
+            #     Report suggestions without rewriting your config.
+            #     If saveDiscoveredSources is true, confident missing plugin sources can
+            #     still be written back.
+            #
+            # discovery.sourcePriority
+            #   Preferred order when choosing good discovered plugin sources.
+            #   Supported source families: github-release, hangar, modrinth.
+            #   Spigot/Spiget is intentionally unsupported because its metadata is too
+            #   weak for reliable authorship, jar identity, and Folia compatibility checks.
+            #
+            # discovery.checkAlternateSourcesWhenOutdated
+            #   If true, discovery compares version strings where APIs expose them and
+            #   rejects sources that look clearly older than the installed plugin jar.
+            #
+            # discovery.outdatedThresholdDays
+            #   How old a source can look before discovery treats it as stale.
+            #
+            # discovery.autoSwitchSource
+            #   If true, plugins with no source can use the best discovered hosted source
+            #   automatically for that run, with other strong matches added as fallbacks.
+            #   Existing unsupported Spigot primaries are moved to a better proven source
+            #   or marked Not Found.
+            #
+            # discovery.saveDiscoveredSources
+            #   If true, auto-switched plugin sources are written back into this config.
+            #   Existing plugin entries are patched by installAs/name. Newly scanned plugins
+            #   are appended under plugins: with the discovered source and fallbacks.
+            #   When no reliable source is found, source is written as "Not Found"; the
+            #   updater skips installs for that plugin but retries discovery next run.
+            #
+            # discovery.scanInstalledPlugins
+            #   If true, scans plugins/ for jars that are not already listed.
+            #   It can fill name, installAs, platform, and required.
+            #   It also searches GitHub, Hangar, and Modrinth for likely update
+            #   sources, then prints the best YAML entry it can safely suggest.
+            #
+            # buildFromSource.enabled
+            #   false:
+            #     Never clone or compile Git repositories.
+            #   auto:
+            #     Recommended if this machine has Git plus Gradle/Maven available.
+            #     Try hosted jars first. If hosted sources fail or none exist, clone a
+            #     trusted GitHub repo and auto-detect Gradle/Maven build commands.
+            #   true:
+            #     Allow configured Git source builds whenever a target source/type asks for it.
+            #
+            # buildFromSource.onlyTrusted
+            #   If true, source builds are only allowed for trusted GitHub orgs/repos.
+            #
+            # buildFromSource.preferHostedIfSameVersion
+            #   If true, hosted jars are preferred before compiling. This keeps normal
+            #   updates fast and avoids build scripts when a ready-made jar exists.
+            #
+            # buildFromSource.trustedGithubOrgs / trustedGithubRepos
+            #   GitHub orgs/repos you explicitly trust for future source builds.
+            #
+            # failureMemory.enabled
+            #   If true, records plugin updates that failed startup in updater.lock.yml.
+            #   Future runs skip the same bad jar hash instead of installing it again.
+            #
+            # failureMemory.retryBadAfter
+            #   never:
+            #     Recommended. Do not retry the same bad jar unless the version/hash changes.
+            #   Duration like 14d:
+            #     Allow retrying the same remembered bad jar after that much time.
+            #
+            # validation.enabled
+            #   true:
+            #     Recommended. Downloads are checked in cache/staging before replacing
+            #     the live jar.
+            #
+            # validation.minAutoInstallScore
+            #   Minimum metadata match score for auto-discovered or fallback sources.
+            #   90 means only very strong matches install automatically.
+            #
+            # validation.minTrustedSourceScore
+            #   Minimum metadata match score for explicitly configured/trusted sources.
+            #   85 gives trusted sources a little room for normal metadata changes.
+            #
+            # validation.rejectOnPluginNameMismatch
+            #   If true, reject a downloaded jar when its plugin.yml/paper-plugin.yml
+            #   or velocity-plugin.json says it is clearly a different plugin.
+            #
+            # validation.rejectOnPluginFingerprintMismatch
+            #   If true, reject same-name jars when stronger identity hints disagree,
+            #   such as installed authors/main package vs downloaded authors/main package
+            #   or a GitHub/Hangar owner that does not match the installed jar author.
+            #
+            # validation.rejectWrongPlatform
+            #   If true, reject wrong-platform jars before install. Example: do not
+            #   install a Velocity/Fabric/NeoForge jar into a Folia/Paper plugins folder.
+            #   On Folia, it also prevents downgrading support: if the installed jar has
+            #   folia-supported: true, a replacement jar must keep that flag.
+            #
+            # duplicates.enabled
+            #   If true, Auto-Updater scans the plugins folder before startup, and also
+            #   after updates, for another jar with the exact same internal plugin id/name.
+            #
+            # duplicates.action
+            #   quarantine:
+            #     Recommended. Move duplicate jars to duplicates.directory instead of
+            #     deleting them. This prevents Folia/Paper ambiguous plugin-name errors.
+            #
+            # duplicates.directory
+            #   Where duplicate jars are moved. They are kept with a timestamped filename
+            #   so you can restore them manually if needed.
+            #
+            # server.name
+            #   Display name. Use auto to derive Paper, Folia, Velocity, etc.
+            #
+            # server.source
+            #   Where the server jar comes from.
+            #   auto:
+            #     Detects an existing paper.jar, folia.jar, velocity.jar, or waterfall.jar
+            #     and maps it to the matching PaperMC download source.
+            #   PaperMC examples:
+            #     https://papermc.io/downloads/folia
+            #     https://papermc.io/downloads/paper
+            #     https://papermc.io/downloads/velocity
+            #
+            # server.type
+            #   auto:
+            #     Recommended. Detects the source type from the URL.
+            #   papermc:
+            #     Treats source as PaperMC server software.
+            #
+            # server.installAs
+            #   Final server jar path/name. installAs: auto uses the detected jar name.
+            #
+            # server.gameVersion
+            #   auto:
+            #     On first install, lock the newest available PaperMC version in
+            #     updater.lock.yml. Future runs keep that locked version when
+            #     changeVersion is false.
+            #   Exact version:
+            #     Use a specific Minecraft/server version you intentionally want.
+            #
+            # server.changeVersion
+            #   false:
+            #     Recommended. Stay on the configured or locked gameVersion.
+            #   true:
+            #     Allow the server jar to jump to the newest available version.
+            #
+            # server.java
+            #   Java command used to launch the server. Usually java.
+            #
+            # server.javaArgs
+            #   JVM options/memory for the launched server.
+            #   If your host panel controls memory, set this to "".
+            #
+            # server.args
+            #   Extra arguments after the server jar name. Usually "".
+            #
+            # plugins[].name
+            #   Friendly display name. It does not have to match the jar filename.
+            #
+            # plugins[].source
+            #   Where the plugin jar comes from.
+            #   GitHub release example: https://github.com/ViaVersion/ViaVersion
+            #   Hangar example: https://hangar.papermc.io/ViaVersion/ViaVersion/versions
+            #   Modrinth example: https://modrinth.com/plugin/fancyholograms/versions
+            #   Direct jar example: https://example.com/MyPlugin.jar
+            #
+            # plugins[].type
+            #   auto:
+            #     Recommended. Detects the source type from the URL.
+            #   github-release:
+            #     Download the newest release jar from a GitHub repository.
+            #   hangar:
+            #     Download from Hangar.
+            #   modrinth:
+            #     Download from Modrinth.
+            #   geysermc:
+            #     Use GeyserMC download endpoints.
+            #   direct:
+            #     Use a direct jar URL or local jar path.
+            #
+            # plugins[].githubRepo
+            #   Optional repo hint like Owner/Repo. Useful for discovery and GitHub sources.
+            #
+            # plugins[].autoUpdate
+            #   true:
+            #     Default. Auto-Updater may discover, download, replace, and roll back this
+            #     plugin using installAs.
+            #   false:
+            #     Keep the entry so discovery knows the plugin exists, but never replace
+            #     this jar or auto-switch its source.
+            #
+            # plugins[].platform
+            #   Platform for Hangar/GeyserMC downloads. Common: paper, velocity, waterfall.
+            #   For Folia plugins, paper is usually the closest platform.
+            #
+            # plugins[].loader
+            #   Modrinth loader filter. Examples: paper, velocity, fabric.
+            #
+            # plugins[].versionType
+            #   Optional Modrinth release type: release, beta, or alpha.
+            #
+            # plugins[].channel
+            #   Optional Hangar channel filter. If omitted, Release builds are preferred.
+            #
+            # plugins[].fallbackSources
+            #   Comma-separated backup sources to try if the main source fails.
+            #
+            # plugins[].installAs
+            #   Final plugin jar path/name, such as plugins/ViaVersion.jar.
+            #
+            # plugins[].required
+            #   false:
+            #     If update fails and no old jar exists, the server may still start without
+            #     this plugin.
+            #   true:
+            #     If update fails and no old jar exists, stop startup.
+            #   Either way, if an old jar exists and onFailure is keep-current, the updater
+            #   keeps the previous jar.
+            #
+            # restart.enabled
+            #   Turns scheduled restarts on or off.
+            #
+            # restart.interval
+            #   How often to restart. Examples: 7d, 12h, 30m.
+            #
+            # restart.stopCommand
+            #   Console command sent when it is time to stop.
+            #   Folia/Paper usually use stop. Velocity usually uses shutdown.
+            #
+            # restart.gracefulStopSeconds
+            #   Seconds to wait after sending stopCommand before forcing the process closed.
+            #
+            # restart.warnings
+            #   Console commands sent before restart. before accepts values like 2h, 30m,
+            #   5m, or 1m.
+            """.formatted(version);
+    }
+}

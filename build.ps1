@@ -44,7 +44,7 @@ if (Test-Path $JarPath) {
 $manifestPath = Join-Path $BuildDir "MANIFEST.MF"
 $manifest = @(
     "Manifest-Version: 1.0"
-    "Main-Class: dev.velocityupdater.VelocityAutoUpdater"
+    "Main-Class: dev.autoupdater.AutoUpdater"
     "Implementation-Version: 0.3.0"
     ""
 ) -join "`r`n"

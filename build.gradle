@@ -3,7 +3,7 @@ plugins {
     id 'java'
 }
 
-group = 'dev.velocityupdater'
+group = 'dev.autoupdater'
 version = '0.3.0'
 
 java {
@@ -12,7 +12,7 @@ java {
 }
 
 application {
-    mainClass = 'dev.velocityupdater.VelocityAutoUpdater'
+    mainClass = 'dev.autoupdater.AutoUpdater'
 }
 
 tasks.withType(JavaCompile).configureEach {

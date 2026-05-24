@@ -2,6 +2,9 @@ build/
 .gradle/
 backups/
 cache/
+dist/backups/
+dist/cache/
+dist/plugins/
 smoke-output/
 *.log
 updater.yml

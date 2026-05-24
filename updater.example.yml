@@ -10,7 +10,7 @@ userAgent: "Auto-Updater/0.3.0 (contact: your-email@example.com)"
 discovery:
   enabled: true
   mode: suggest
-  sourcePriority: github-release, hangar, modrinth, spigot
+  sourcePriority: github-release, hangar, modrinth
   checkAlternateSourcesWhenOutdated: true
   outdatedThresholdDays: 14
   autoSwitchSource: true
@@ -92,13 +92,6 @@ plugins:
   #   installAs: plugins/FancyHolograms.jar
   #   required: false
 
-  # Optional Spigot/Spiget example:
-  # - name: EpicHomes
-  #   source: https://www.spigotmc.org/resources/epichomes-26-1-x-support.109590/
-  #   type: auto
-  #   installAs: plugins/EpicHomes.jar
-  #   required: false
-
 restart:
   enabled: true
   interval: 7d
@@ -156,7 +149,9 @@ restart:
 #
 # discovery.sourcePriority
 #   Preferred order when choosing good discovered plugin sources.
-#   Supported source families: github-release, hangar, modrinth, spigot.
+#   Supported source families: github-release, hangar, modrinth.
+#   Spigot/Spiget is intentionally unsupported because its metadata is too weak
+#   for reliable authorship, jar identity, and Folia compatibility checks.
 #
 # discovery.checkAlternateSourcesWhenOutdated
 #   If true, discovery compares version strings where APIs expose them and
@@ -178,7 +173,7 @@ restart:
 # discovery.scanInstalledPlugins
 #   If true, scans plugins/ for jars that are not already listed.
 #   It can fill name, installAs, platform, and required.
-#   It also searches GitHub, Hangar, Modrinth, and Spigot for likely update
+#   It also searches GitHub, Hangar, and Modrinth for likely update
 #   sources, then prints the best YAML entry it can safely suggest.
 #
 # buildFromSource.enabled
@@ -301,7 +296,6 @@ restart:
 #   GitHub release example: https://github.com/ViaVersion/ViaVersion
 #   Hangar example: https://hangar.papermc.io/ViaVersion/ViaVersion/versions
 #   Modrinth example: https://modrinth.com/plugin/fancyholograms/versions
-#   Spigot example: https://www.spigotmc.org/resources/epichomes-26-1-x-support.109590/
 #   Direct jar example: https://example.com/MyPlugin.jar
 #
 # plugins[].type
@@ -313,8 +307,6 @@ restart:
 #     Download from Hangar.
 #   modrinth:
 #     Download from Modrinth.
-#   spigot:
-#     Download from Spigot through Spiget when available without login.
 #   geysermc:
 #     Use GeyserMC download endpoints.
 #   direct:
