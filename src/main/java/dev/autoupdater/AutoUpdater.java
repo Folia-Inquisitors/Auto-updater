@@ -2371,6 +2371,15 @@ public final class AutoUpdater {
                     lines.add("    descriptorPath: " + quoteYaml(proof.descriptorPath));
                     lines.add("    pluginId: " + quoteYaml(proof.pluginId));
                     lines.add("    mainClass: " + quoteYaml(proof.mainClass));
+                    if (!proof.forkRepo.isBlank()) {
+                        lines.add("    forkRepo: " + quoteYaml(proof.forkRepo));
+                    }
+                    if (!proof.upstreamRepo.isBlank()) {
+                        lines.add("    upstreamRepo: " + quoteYaml(proof.upstreamRepo));
+                    }
+                    if (!proof.proofReason.isBlank()) {
+                        lines.add("    proofReason: " + quoteYaml(proof.proofReason));
+                    }
                     lines.add("    verifiedAt: " + quoteYaml(proof.verifiedAt));
                 }
             }
@@ -2538,6 +2547,24 @@ public final class AutoUpdater {
             clearDiscoveryState(target);
         }
 
+        void enrichSourceProof(TargetConfig target, ForkLineage lineage, String reason) {
+            if (target == null || lineage == null || !lineage.isFork()) {
+                return;
+            }
+            SourceProof proof = sourceProofs.get(lockKey(target.installAs));
+            if (proof == null) {
+                return;
+            }
+            proof.forkRepo = lineage.repo;
+            proof.upstreamRepo = firstNonBlank(lineage.sourceRepo, lineage.parentRepo);
+            proof.proofReason = firstNonBlank(reason, lineage.describe());
+            if (proof.proof.equals("descriptor-match") || proof.proof.endsWith("jar-descriptor-match")
+                || proof.proof.equals("raw-descriptor-match")) {
+                proof.proof = "descriptor-matched-fork";
+            }
+            sourceProofs.put(lockKey(proof.installAs), proof);
+        }
+
         Optional<RejectedSourceProof> activeRejectedSourceProof(TargetConfig target, String source, String type, String project) {
             if (target == null || source.isBlank()) {
                 return Optional.empty();
@@ -2633,6 +2660,9 @@ public final class AutoUpdater {
         String descriptorPath = "";
         String pluginId = "";
         String mainClass = "";
+        String forkRepo = "";
+        String upstreamRepo = "";
+        String proofReason = "";
         String verifiedAt = "";
 
         SourceProof(String installAs) {
@@ -2665,6 +2695,18 @@ public final class AutoUpdater {
                 case "mainclass":
                 case "main_class":
                     mainClass = value;
+                    break;
+                case "forkrepo":
+                case "fork_repo":
+                    forkRepo = value;
+                    break;
+                case "upstreamrepo":
+                case "upstream_repo":
+                    upstreamRepo = value;
+                    break;
+                case "proofreason":
+                case "proof_reason":
+                    proofReason = value;
                     break;
                 case "verifiedat":
                 case "verified_at":
@@ -2948,6 +2990,39 @@ public final class AutoUpdater {
             this.reason = reason;
             this.score = score;
             this.priority = priority;
+        }
+    }
+
+    private static final class ForkLineage {
+        final String repo;
+        final String parentRepo;
+        final String sourceRepo;
+        final boolean fork;
+
+        ForkLineage(String repo, String parentRepo, String sourceRepo, boolean fork) {
+            this.repo = firstNonBlank(repo, "");
+            this.parentRepo = firstNonBlank(parentRepo, "");
+            this.sourceRepo = firstNonBlank(sourceRepo, "");
+            this.fork = fork;
+        }
+
+        boolean isFork() {
+            return fork && (!parentRepo.isBlank() || !sourceRepo.isBlank());
+        }
+
+        String describe() {
+            if (!isFork()) {
+                return "";
+            }
+            List<String> parts = new ArrayList<>();
+            parts.add(repo);
+            if (!parentRepo.isBlank() && !parts.get(parts.size() - 1).equalsIgnoreCase(parentRepo)) {
+                parts.add(parentRepo);
+            }
+            if (!sourceRepo.isBlank() && !parts.get(parts.size() - 1).equalsIgnoreCase(sourceRepo)) {
+                parts.add(sourceRepo);
+            }
+            return "GitHub fork lineage: " + String.join(" -> ", parts);
         }
     }
 
@@ -3351,6 +3426,7 @@ public final class AutoUpdater {
                         DiscoveryCandidate candidate = discovered.get(i);
                         Log.info("Alternate source: " + candidate.type + " -> " + candidate.source
                             + " (score " + candidate.score + ", latest=" + firstNonBlank(candidate.latestVersion, "unknown") + ")");
+                        Log.info("Alternate why: " + candidate.reason);
                     }
                 }
                 boolean autoSwitched = false;
@@ -5045,6 +5121,16 @@ public final class AutoUpdater {
                 score += 45;
                 ownerSignal = new SourceOwnerSignal(0, false, "");
                 descriptorReason = "; source descriptor matches installed plugin";
+                Optional<ForkLineage> forkLineage = forkLineageForCandidate(target, type, source, projectHint, download);
+                if (forkLineage.isPresent()) {
+                    score += 10;
+                    String lineage = forkLineage.get().describe();
+                    descriptorReason += "; accepted as descriptor-proven fork"
+                        + (lineage.isBlank() ? "" : " (" + lineage + ")");
+                    lockState.enrichSourceProof(target, forkLineage.get(),
+                        "descriptor/package match; " + firstNonBlank(lineage, "fork lineage detected"));
+                    writeLockQuietly();
+                }
             } else if (descriptorEvidence == SourceDescriptorEvidence.MISMATCH) {
                 score -= 100;
                 descriptorReason = "; source descriptors did not match installed plugin";
@@ -5080,6 +5166,70 @@ public final class AutoUpdater {
             String ownerReason = ownerSignal.reason.isBlank() ? "" : "; " + ownerSignal.reason;
             String fullReason = reason + "; name match score " + match + ownerReason + descriptorReason + versionReason;
             return new DiscoveryCandidate(type, source, projectHint, latestVersion, label, fullReason, score, priority);
+        }
+
+        private Optional<ForkLineage> forkLineageForCandidate(TargetConfig target, String type, String source,
+                                                              String projectHint, ResolvedDownload download) {
+            try {
+                GithubRepo repo = null;
+                if (isGithubLikeSource(type, source, projectHint)) {
+                    repo = githubRepoFromSourceParts(source, projectHint);
+                }
+                if (repo == null && lower(type).equals("modrinth")) {
+                    String modrinthSource = modrinthProjectSourceUrl(projectHint);
+                    if (modrinthSource.contains("github.com/")) {
+                        repo = repoFromGithubUrl(modrinthSource);
+                    }
+                }
+                if (repo == null && download != null && download.label.contains("github.com/")) {
+                    repo = repoFromGithubUrl(download.label);
+                }
+                if (repo == null) {
+                    return Optional.empty();
+                }
+                ForkLineage lineage = githubForkLineage(repo, target);
+                return lineage.isFork() ? Optional.of(lineage) : Optional.empty();
+            } catch (Exception ex) {
+                return Optional.empty();
+            }
+        }
+
+        private String modrinthProjectSourceUrl(String projectHint) {
+            String project = firstNonBlank(projectHint, "");
+            if (project.startsWith("modrinth/")) {
+                project = project.substring("modrinth/".length());
+            }
+            if (project.isBlank() || project.contains("/")) {
+                return "";
+            }
+            try {
+                URI uri = URI.create("https://api.modrinth.com/v2/project/" + urlEncode(project));
+                Object json = getJson(uri, "Modrinth project metadata");
+                Map<String, Object> root = asMap(json);
+                return firstNonBlank(
+                    stringValue(root.get("source_url")),
+                    stringValue(root.get("issues_url")),
+                    stringValue(root.get("wiki_url"))
+                );
+            } catch (Exception ex) {
+                return "";
+            }
+        }
+
+        private ForkLineage githubForkLineage(GithubRepo repo, TargetConfig target) throws Exception {
+            URI uri = URI.create("https://api.github.com/repos/" + urlEncode(repo.owner) + "/" + urlEncode(repo.name));
+            Object json = getJson(uri, "GitHub repo metadata", target);
+            Map<String, Object> root = asMap(json);
+            boolean fork = Boolean.TRUE.equals(root.get("fork"));
+            String fullName = firstNonBlank(stringValue(root.get("full_name")), repo.owner + "/" + repo.name);
+            Map<String, Object> parent = asMap(root.get("parent"));
+            Map<String, Object> source = asMap(root.get("source"));
+            return new ForkLineage(
+                fullName,
+                stringValue(parent.get("full_name")),
+                stringValue(source.get("full_name")),
+                fork
+            );
         }
 
         private SourceDescriptorEvidence githubSourceDescriptorEvidence(TargetConfig target, String type, String source, String projectHint) {
