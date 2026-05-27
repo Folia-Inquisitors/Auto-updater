@@ -536,6 +536,10 @@ public final class AutoUpdater {
             return status() + ", " + pluginStatus;
         }
 
+        boolean runBudgetReached(String resource) {
+            return resource.equals("search") ? searchUsed >= maxSearchPerRun : coreUsed >= maxCorePerRun;
+        }
+
         String limits() {
             return "search " + maxSearchPerRun + "/run and " + maxSearchPerPlugin + "/plugin, core "
                 + maxCorePerRun + "/run and " + maxCorePerPlugin + "/plugin";
@@ -625,6 +629,16 @@ public final class AutoUpdater {
                 }
             }
             return true;
+        }
+    }
+
+    private static final class DescriptorRankingSignal {
+        final int scoreDelta;
+        final String reason;
+
+        DescriptorRankingSignal(int scoreDelta, String reason) {
+            this.scoreDelta = scoreDelta;
+            this.reason = firstNonBlank(reason, "");
         }
     }
 
@@ -2377,6 +2391,9 @@ public final class AutoUpdater {
                     if (!proof.upstreamRepo.isBlank()) {
                         lines.add("    upstreamRepo: " + quoteYaml(proof.upstreamRepo));
                     }
+                    if (proof.foliaSupported != null) {
+                        lines.add("    foliaSupported: " + quoteYaml(Boolean.toString(proof.foliaSupported)));
+                    }
                     if (!proof.proofReason.isBlank()) {
                         lines.add("    proofReason: " + quoteYaml(proof.proofReason));
                     }
@@ -2542,6 +2559,7 @@ public final class AutoUpdater {
             proof.descriptorPath = descriptor.descriptorPath;
             proof.pluginId = firstNonBlank(descriptor.id, descriptor.name);
             proof.mainClass = descriptor.mainClass;
+            proof.foliaSupported = descriptor.foliaSupported;
             proof.verifiedAt = Instant.now().toString();
             sourceProofs.put(lockKey(proof.installAs), proof);
             clearDiscoveryState(target);
@@ -2662,6 +2680,7 @@ public final class AutoUpdater {
         String mainClass = "";
         String forkRepo = "";
         String upstreamRepo = "";
+        Boolean foliaSupported = null;
         String proofReason = "";
         String verifiedAt = "";
 
@@ -2703,6 +2722,12 @@ public final class AutoUpdater {
                 case "upstreamrepo":
                 case "upstream_repo":
                     upstreamRepo = value;
+                    break;
+                case "foliasupported":
+                case "folia_supported":
+                    if (!value.isBlank()) {
+                        foliaSupported = parseOptionalBoolean(value);
+                    }
                     break;
                 case "proofreason":
                 case "proof_reason":
@@ -3268,6 +3293,7 @@ public final class AutoUpdater {
         private final LockState lockState;
         private final Set<String> writtenDiagnostics = new HashSet<>();
         private final Set<String> githubBudgetWarnings = new HashSet<>();
+        private final Set<String> githubBudgetLimitedPlugins = new HashSet<>();
         private final Map<String, List<PluginJarInfo>> githubDescriptorCache = new HashMap<>();
         private final Set<String> discoveryFound = new HashSet<>();
         private final Set<String> discoveryDeferred = new HashSet<>();
@@ -3382,9 +3408,14 @@ public final class AutoUpdater {
                         }
                         Optional<SourceProof> proof = lockState.activeSourceProof(target);
                         if (proof.isPresent() && sourcesMatchLoosely(proof.get().source, target.source)) {
-                            Log.info("Current source is already descriptor-proven for " + target.displayName()
-                                + "; skipping network discovery.");
-                            continue;
+                            if (shouldRefreshRememberedSourceProof(target, proof.get())) {
+                                Log.info("Current source proof for " + target.displayName()
+                                    + " predates Folia support proof; refreshing discovery before trusting it.");
+                            } else {
+                                Log.info("Current source is already descriptor-proven for " + target.displayName()
+                                    + "; skipping network discovery.");
+                                continue;
+                            }
                         }
                     } catch (IllegalArgumentException ex) {
                         Log.warn("Current source is unsupported for " + target.displayName() + ": " + ex.getMessage());
@@ -3395,6 +3426,7 @@ public final class AutoUpdater {
                     Log.info("Current source: none");
                 }
                 boolean restoredFromProof = applyRememberedSourceProof(target);
+                boolean refreshingStaleProof = false;
                 if (restoredFromProof) {
                     Log.info("Using remembered source proof for " + target.displayName() + ": " + target.source);
                     if (!needsDiscoveredSource(target)) {
@@ -3403,12 +3435,18 @@ public final class AutoUpdater {
                         continue;
                     }
                 }
+                Optional<SourceProof> activeProofForRefresh = lockState.activeSourceProof(target);
+                if (activeProofForRefresh.isPresent()) {
+                    refreshingStaleProof = shouldRefreshRememberedSourceProof(target, activeProofForRefresh.get());
+                }
                 if (shouldDeferMissingSourceDiscovery(target)) {
                     continue;
                 }
                 List<DiscoveryCandidate> discovered = discoverSourceCandidates(target);
                 DiscoveryCandidate best = discovered.isEmpty() ? null : discovered.get(0);
                 if (best != null) {
+                    clearDeferredSummary(target);
+                    clearDiscoveryState(target);
                     Log.info("Best discovered source: " + best.type + " -> " + best.source
                         + " (score " + best.score + ", latest=" + firstNonBlank(best.latestVersion, "unknown") + ")");
                     Log.info("Why: " + best.reason);
@@ -3434,6 +3472,10 @@ public final class AutoUpdater {
                     if (best != null && needsDiscoveredSource(target)) {
                         Log.info("autoSwitchSource will use " + best.source + " for " + target.displayName() + ".");
                         applyDiscoveredSource(target, discovered);
+                        autoSwitched = true;
+                    } else if (best != null && refreshingStaleProof && !sameDiscoverySource(target.source, best.source)) {
+                        migratePrimarySource(target, best, discovered,
+                            "stale Folia source proof", "refreshed source proof with Folia support evidence", true);
                         autoSwitched = true;
                     } else if (best != null && maybeMigrateConfiguredSource(target, best, discovered)) {
                         autoSwitched = true;
@@ -3588,6 +3630,7 @@ public final class AutoUpdater {
             migrateUnsupportedSpigotPrimarySources();
             migrateMismatchedPrimarySources();
             migrateKnownStaleDiscoveredSources();
+            refreshStaleRememberedSourceProofs();
             for (TargetConfig target : allTargets()) {
                 if (!target.enabled || target.server || !target.autoUpdate || !needsDiscoveredSource(target)) {
                     continue;
@@ -3661,6 +3704,14 @@ public final class AutoUpdater {
             writeLockQuietly();
         }
 
+        private void clearDeferredSummary(TargetConfig target) {
+            if (target == null) {
+                return;
+            }
+            String prefix = target.displayName() + " (";
+            discoveryDeferred.removeIf(item -> item.equals(target.displayName()) || item.startsWith(prefix));
+        }
+
         private void rememberDiscoveryNotFound(TargetConfig target, String reason) {
             lockState.rememberDiscoveryNotFound(target, reason);
             writeLockQuietly();
@@ -3712,6 +3763,11 @@ public final class AutoUpdater {
                 return false;
             }
             SourceProof remembered = proof.get();
+            if (shouldRefreshRememberedSourceProof(target, remembered)) {
+                Log.info("Not restoring remembered source proof for " + target.displayName()
+                    + " because the installed jar is Folia-compatible but the old proof did not record Folia support.");
+                return false;
+            }
             target.source = remembered.source;
             target.sourceOrigin = SOURCE_ORIGIN_DISCOVERED;
             target.type = remembered.type.equals("github-source") ? "github-source" : "auto";
@@ -3724,6 +3780,62 @@ public final class AutoUpdater {
             target.sourceDiscoveredThisRun = true;
             clearDiscoveryState(target);
             return true;
+        }
+
+        private void refreshStaleRememberedSourceProofs() {
+            if (!config.discovery.enabled || !config.discovery.autoSwitchSource) {
+                return;
+            }
+            for (TargetConfig target : allTargets()) {
+                if (!target.enabled || target.server || !target.autoUpdate || needsDiscoveredSource(target)) {
+                    continue;
+                }
+                if (shouldProtectConfiguredSource(target, "Folia proof refresh")) {
+                    continue;
+                }
+                Optional<SourceProof> proof = lockState.activeSourceProof(target);
+                if (proof.isEmpty() || !sourcesMatchLoosely(proof.get().source, target.source)
+                    || !shouldRefreshRememberedSourceProof(target, proof.get())) {
+                    continue;
+                }
+                config.githubBudget.beginPlugin(target);
+                Log.info("Refreshing discovered source proof for " + target.displayName()
+                    + " because the installed jar is Folia-compatible and the remembered proof lacks Folia support evidence.");
+                List<DiscoveryCandidate> discovered = discoverSourceCandidates(target);
+                if (discovered.isEmpty()) {
+                    if (githubRateLimited) {
+                        Log.warn("Folia proof refresh deferred for " + target.displayName()
+                            + " because " + githubUnavailableReason() + " prevented a complete source check.");
+                        rememberDiscoveryDeferred(target, githubDeferredReason(), discoveryRetryAfter());
+                    }
+                    continue;
+                }
+                applyDiscoveredSource(target, discovered);
+            }
+        }
+
+        private boolean shouldRefreshRememberedSourceProof(TargetConfig target, SourceProof proof) {
+            if (target == null || proof == null) {
+                return false;
+            }
+            PluginJarInfo installed = installedPluginInfo(target);
+            if (installed == null || !Boolean.TRUE.equals(installed.foliaSupported)) {
+                return false;
+            }
+            if (Boolean.TRUE.equals(proof.foliaSupported)) {
+                return false;
+            }
+            if (!proof.forkRepo.isBlank() || !proof.upstreamRepo.isBlank()) {
+                return false;
+            }
+            String proofText = lower(String.join(" ",
+                firstNonBlank(proof.proof, ""),
+                firstNonBlank(proof.source, ""),
+                firstNonBlank(proof.type, ""),
+                firstNonBlank(proof.repo, ""),
+                firstNonBlank(proof.proofReason, "")
+            ));
+            return !proofText.contains("folia");
         }
 
         private void writeLockQuietly() {
@@ -3810,15 +3922,7 @@ public final class AutoUpdater {
                 }
                 String plugin = lower(target.displayName());
                 String source = lower(canonicalDiscoverySource(target.source));
-                if (plugin.equals("betterrtp") && source.contains("hangar.papermc.io/ronan/betterrtp")) {
-                    forceDiscoveredSource(
-                        target,
-                        "https://github.com/RonanPlugins/BetterRTP",
-                        "github-source",
-                        "RonanPlugins/BetterRTP",
-                        "migrated BetterRTP away from stale Hangar metadata to descriptor-verified GitHub source"
-                    );
-                } else if (plugin.equals("votifier") && source.contains("github.com/ichbinjoe/votifier")) {
+                if (plugin.equals("votifier") && source.contains("github.com/ichbinjoe/votifier")) {
                     forceDiscoveredSource(
                         target,
                         "https://github.com/NuVotifier/NuVotifier",
@@ -4120,6 +4224,7 @@ public final class AutoUpdater {
             List<DiscoveryCandidate> candidates = new ArrayList<>();
             Set<String> seen = new HashSet<>();
             addKnownOfficialSourceCandidates(target, candidates, seen);
+            addConfiguredFallbackCandidates(target, candidates, seen);
             if (target.detectedWebsite != null && !target.detectedWebsite.isBlank()) {
                 addWebsiteCandidate(target, target.detectedWebsite, candidates, seen, 0);
             }
@@ -4173,10 +4278,62 @@ public final class AutoUpdater {
                 }
             }
             candidates.sort(Comparator
-                .comparingInt((DiscoveryCandidate c) -> discoverySortPriority(c))
-                .thenComparing(Comparator.comparingInt((DiscoveryCandidate c) -> c.score).reversed())
+                .comparingInt((DiscoveryCandidate c) -> c.score).reversed()
+                .thenComparingInt((DiscoveryCandidate c) -> discoverySortPriority(c))
                 .thenComparing(c -> c.type));
             return candidates;
+        }
+
+        private void addConfiguredFallbackCandidates(TargetConfig target, List<DiscoveryCandidate> candidates, Set<String> seen) {
+            int priority = -6;
+            for (String fallback : target.fallbackSources) {
+                if (fallback == null || fallback.isBlank()) {
+                    continue;
+                }
+                String type = lower(firstNonBlank(detectType(fallback, target), "auto"));
+                if (isManualOnlySourceType(type)) {
+                    continue;
+                }
+                String projectHint = "";
+                GithubRepo repo = repoFromGithubText(fallback);
+                if (repo != null) {
+                    projectHint = repo.owner + "/" + repo.name;
+                }
+                try {
+                    if (type.equals("modrinth") || type.equals("hangar")) {
+                        TargetConfig candidateTarget = target.copyWithSource(fallback);
+                        ResolvedDownload download = type.equals("modrinth")
+                            ? new ModrinthResolver(config, client).resolve(candidateTarget)
+                            : new HangarResolver(config, client).resolve(candidateTarget);
+                        addCandidates(List.of(candidateFromResolved(
+                            target,
+                            type,
+                            fallback,
+                            firstNonBlank(candidateTarget.project, projectHint),
+                            latestFromDownload(download),
+                            download.label,
+                            priority,
+                            "configured fallback source",
+                            download
+                        )), candidates, seen);
+                    } else {
+                        addCandidates(List.of(candidateFromResolved(
+                            target,
+                            type,
+                            fallback,
+                            projectHint,
+                            "",
+                            firstNonBlank(projectHint, fallback),
+                            priority,
+                            "configured fallback source"
+                        )), candidates, seen);
+                    }
+                } catch (Exception ex) {
+                    Log.info("Could not verify fallback source for " + target.displayName()
+                        + " from " + fallback + ": " + ex.getMessage());
+                }
+                priority++;
+            }
         }
 
         private List<String> normalizedDiscoveryPriority() {
@@ -4225,7 +4382,15 @@ public final class AutoUpdater {
                         + " because " + hintType + " sources are manual-only.");
                     continue;
                 }
-                addCandidates(List.of(candidateFromSourceHint(target, hint, hintType)), candidates, seen);
+                DiscoveryCandidate candidate = candidateFromSourceHint(target, hint, hintType);
+                addCandidates(List.of(candidate), candidates, seen);
+                if (candidate.reason.contains("source descriptor matches installed plugin")
+                    && isGithubLikeSource(hintType, hint.source, hint.project)) {
+                    GithubRepo repo = githubRepoFromSourceParts(hint.source, hint.project);
+                    if (repo != null) {
+                        addCandidates(discoverGithubForkNeighborhood(target, repo, hint.priority, true), candidates, seen);
+                    }
+                }
                 if (!hint.githubRepo.isBlank() && (target.githubRepo == null || target.githubRepo.isBlank()
                     || sourceOwnerSignal(target.detectedAuthors, "github-release", target.githubRepo, target.githubRepo, target.githubRepo).conflict)) {
                     target.githubRepo = hint.githubRepo;
@@ -4257,16 +4422,20 @@ public final class AutoUpdater {
                         + " from " + hint.source + ": " + ex.getMessage());
                 }
             }
-            return new DiscoveryCandidate(
+            DiscoveryCandidate candidate = candidateFromResolved(
+                target,
                 firstNonBlank(hint.type, "auto"),
                 hint.source,
                 hint.project,
                 "",
                 label,
-                reason,
-                hint.score,
-                hint.priority
+                hint.priority,
+                reason
             );
+            if (candidate.reason.contains("source descriptor matches installed plugin")) {
+                return withScore(candidate, Math.max(candidate.score, hint.score));
+            }
+            return candidate;
         }
 
         private DiscoveryCandidate withScore(DiscoveryCandidate candidate, int score) {
@@ -4357,7 +4526,10 @@ public final class AutoUpdater {
             List<DiscoveryCandidate> candidates = new ArrayList<>();
             if (target.githubRepo != null && !target.githubRepo.isBlank()) {
                 latestGithubCandidate(target, repoFromGithubValue(target.githubRepo), priority, "configured githubRepo").ifPresent(candidates::add);
-                if (!candidates.isEmpty()) {
+                boolean refreshNeedsForkSearch = lockState.activeSourceProof(target)
+                    .map(proof -> shouldRefreshRememberedSourceProof(target, proof))
+                    .orElse(false);
+                if (!candidates.isEmpty() && !refreshNeedsForkSearch) {
                     return candidates;
                 }
             }
@@ -4415,11 +4587,26 @@ public final class AutoUpdater {
 
         private List<DiscoveryCandidate> discoverTargetedGithubSources(TargetConfig target, int priority, boolean allowReleaseLookup) {
             List<DiscoveryCandidate> candidates = new ArrayList<>();
+            Set<String> forkNeighborhoods = new HashSet<>();
             for (GithubRepo repo : likelyGithubRepos(target)) {
+                if (isGithubPluginBudgetLimited(target)) {
+                    break;
+                }
+                String repoKey = lower(repo.owner + "/" + repo.name);
+                if (forkNeighborhoods.add(repoKey)) {
+                    candidates.addAll(discoverGithubForkNeighborhood(target, repo, priority, allowReleaseLookup));
+                }
                 List<GithubRepo> matchedRepos = matchingGithubRepoVariants(target, repo, allowReleaseLookup);
                 for (GithubRepo matchedRepo : matchedRepos) {
+                    if (isGithubPluginBudgetLimited(target)) {
+                        break;
+                    }
                     String source = githubSourceUrl(matchedRepo);
                     String repoName = matchedRepo.owner + "/" + matchedRepo.name;
+                    String matchedKey = lower(matchedRepo.owner + "/" + matchedRepo.name);
+                    if (forkNeighborhoods.add(matchedKey)) {
+                        candidates.addAll(discoverGithubForkNeighborhood(target, matchedRepo, priority, allowReleaseLookup));
+                    }
                     Optional<DiscoveryCandidate> latest = allowReleaseLookup
                         ? latestGithubCandidate(target, matchedRepo, priority, "targeted GitHub repo descriptor match")
                         : Optional.empty();
@@ -4442,6 +4629,128 @@ public final class AutoUpdater {
                 }
             }
             return candidates;
+        }
+
+        private List<DiscoveryCandidate> discoverGithubForkNeighborhood(TargetConfig target, GithubRepo upstreamRepo,
+                                                                        int priority, boolean allowApiInspection) {
+            if (!allowApiInspection || githubAuthFailed || githubRateLimited || config.githubRateLimit.isPaused()
+                || isGithubPluginBudgetLimited(target)) {
+                return Collections.emptyList();
+            }
+            if (!shouldSearchGithubForkNeighborhood(target)) {
+                return Collections.emptyList();
+            }
+            List<DiscoveryCandidate> candidates = new ArrayList<>();
+            try {
+                URI uri = URI.create("https://api.github.com/repos/" + urlEncode(upstreamRepo.owner) + "/" + urlEncode(upstreamRepo.name)
+                    + "/forks?sort=newest&per_page=100");
+                Object json = getJson(uri, "GitHub fork neighborhood", target);
+                if (!(json instanceof List<?> forks)) {
+                    return candidates;
+                }
+                for (Object item : forks) {
+                    Map<String, Object> fork = asMap(item);
+                    if (Boolean.TRUE.equals(fork.get("archived")) || Boolean.TRUE.equals(fork.get("disabled"))) {
+                        continue;
+                    }
+                    String fullName = stringValue(fork.get("full_name"));
+                    GithubRepo forkRepo = repoFromGithubValue(fullName);
+                    if (forkRepo == null || !looksLikeUsefulForkCandidate(target, forkRepo, fork)) {
+                        continue;
+                    }
+                    Optional<GithubRepo> matchedFork = githubCommonRawDescriptorMatch(target, forkRepo);
+                    if (matchedFork.isEmpty()) {
+                        matchedFork = githubArchiveDescriptorMatch(target, forkRepo);
+                    }
+                    if (matchedFork.isEmpty() && githubSourceDescriptorEvidence(
+                        target,
+                        "github-source",
+                        githubSourceUrl(forkRepo),
+                        forkRepo.owner + "/" + forkRepo.name
+                    ) == SourceDescriptorEvidence.MATCH) {
+                        matchedFork = Optional.of(forkRepo);
+                    }
+                    if (matchedFork.isEmpty()) {
+                        continue;
+                    }
+                    GithubRepo repo = matchedFork.get();
+                    String repoName = repo.owner + "/" + repo.name;
+                    candidates.add(candidateFromResolved(
+                        target,
+                        "github-source",
+                        githubSourceUrl(repo),
+                        repoName,
+                        "",
+                        repoName,
+                        priority + 1,
+                        "GitHub fork neighborhood descriptor match from " + upstreamRepo.owner + "/" + upstreamRepo.name
+                    ));
+                }
+            } catch (Exception ex) {
+                if (!githubRateLimited && !config.githubRateLimit.isPaused() && !isGithubPluginBudgetLimited(target)
+                    && !isExpectedMissingGithubProbe(ex)) {
+                    Log.info("GitHub fork neighborhood lookup failed for " + upstreamRepo.owner + "/" + upstreamRepo.name
+                        + ": " + ex.getMessage());
+                }
+            }
+            return candidates;
+        }
+
+        private Optional<GithubRepo> githubArchiveDescriptorMatch(TargetConfig target, GithubRepo repo) {
+            try {
+                List<PluginJarInfo> descriptors = githubRepoArchiveDescriptors(repo);
+                if (descriptors.isEmpty()) {
+                    return Optional.empty();
+                }
+                PluginJarInfo installed = installedPluginInfo(target);
+                for (PluginJarInfo descriptor : descriptors) {
+                    if (pluginDescriptorMatchesTarget(installed, target, descriptor)) {
+                        rememberSourceProof(target, githubSourceUrl(repo), "github-source", repo, descriptor, "archive-descriptor-match");
+                        return Optional.of(repo);
+                    }
+                }
+            } catch (Exception ex) {
+                if (!isGithubPluginBudgetLimited(target) && !isExpectedMissingGithubProbe(ex)) {
+                    Log.info("Could not inspect GitHub fork source archive for " + repo.owner + "/" + repo.name
+                        + ": " + ex.getMessage());
+                }
+            }
+            return Optional.empty();
+        }
+
+        private boolean shouldSearchGithubForkNeighborhood(TargetConfig target) {
+            PluginJarInfo installed = installedPluginInfo(target);
+            if (installed != null && Boolean.TRUE.equals(installed.foliaSupported)) {
+                return true;
+            }
+            String text = lower(String.join(" ",
+                firstNonBlank(target.name, ""),
+                firstNonBlank(target.detectedPluginId, ""),
+                firstNonBlank(target.installAs, ""),
+                firstNonBlank(target.detectedMainClass, "")
+            ));
+            return text.contains("folia");
+        }
+
+        private boolean looksLikeUsefulForkCandidate(TargetConfig target, GithubRepo repo, Map<String, Object> fork) {
+            String text = lower(String.join(" ",
+                repo.owner,
+                repo.name,
+                stringValue(fork.get("description")),
+                stringValue(fork.get("full_name")),
+                firstNonBlank(target.name, ""),
+                firstNonBlank(target.detectedPluginId, "")
+            ));
+            if (text.contains("folia") || text.contains("inquisitor")) {
+                return true;
+            }
+            PluginJarInfo installed = installedPluginInfo(target);
+            if (installed != null && Boolean.TRUE.equals(installed.foliaSupported)) {
+                return false;
+            }
+            String targetName = normalizeIdentity(firstNonBlank(target.detectedPluginId, target.name, stripJarName(target.installAs)));
+            String repoName = normalizeIdentity(repo.name);
+            return !targetName.isBlank() && (repoName.equals(targetName) || targetName.contains(repoName) || repoName.contains(targetName));
         }
 
         private List<GithubRepo> matchingGithubRepoVariants(TargetConfig target, GithubRepo repo, boolean allowApiInspection) {
@@ -5121,6 +5430,10 @@ public final class AutoUpdater {
                 score += 45;
                 ownerSignal = new SourceOwnerSignal(0, false, "");
                 descriptorReason = "; source descriptor matches installed plugin";
+                Optional<PluginJarInfo> matchingDescriptor = matchingCandidateDescriptor(target, type, source, projectHint, download);
+                DescriptorRankingSignal foliaSignal = foliaDescriptorRankingSignal(target, matchingDescriptor);
+                score += foliaSignal.scoreDelta;
+                descriptorReason += foliaSignal.reason;
                 Optional<ForkLineage> forkLineage = forkLineageForCandidate(target, type, source, projectHint, download);
                 if (forkLineage.isPresent()) {
                     score += 10;
@@ -5166,6 +5479,81 @@ public final class AutoUpdater {
             String ownerReason = ownerSignal.reason.isBlank() ? "" : "; " + ownerSignal.reason;
             String fullReason = reason + "; name match score " + match + ownerReason + descriptorReason + versionReason;
             return new DiscoveryCandidate(type, source, projectHint, latestVersion, label, fullReason, score, priority);
+        }
+
+        private Optional<PluginJarInfo> matchingCandidateDescriptor(TargetConfig target, String type, String source,
+                                                                    String projectHint, ResolvedDownload download) {
+            try {
+                if (type.equals("modrinth") || type.equals("hangar")) {
+                    if (download == null || download.uri == null) {
+                        return Optional.empty();
+                    }
+                    Path jar = cachedHostedCandidateJar(type, projectHint, download);
+                    PluginJarInfo candidate = readPluginJarInfo(jar);
+                    PluginJarInfo installed = installedPluginInfo(target);
+                    return candidate.hasDescriptor && pluginDescriptorMatchesTarget(installed, target, candidate)
+                        ? Optional.of(candidate)
+                        : Optional.empty();
+                }
+                if (isGithubLikeSource(type, source, projectHint)) {
+                    GithubRepo repo = githubRepoFromSourceParts(source, projectHint);
+                    if (repo == null) {
+                        return Optional.empty();
+                    }
+                    Optional<PluginJarInfo> rawDescriptor = matchingGithubRawDescriptor(target, repo);
+                    if (rawDescriptor.isPresent()) {
+                        return rawDescriptor;
+                    }
+                    PluginJarInfo installed = installedPluginInfo(target);
+                    for (PluginJarInfo descriptor : githubRepoDescriptors(target, repo)) {
+                        if (pluginDescriptorMatchesTarget(installed, target, descriptor)) {
+                            return Optional.of(descriptor);
+                        }
+                    }
+                }
+            } catch (Exception ignored) {
+                // Descriptor evidence already decided whether this candidate is usable.
+            }
+            return Optional.empty();
+        }
+
+        private Optional<PluginJarInfo> matchingGithubRawDescriptor(TargetConfig target, GithubRepo repo) {
+            List<String> paths = likelyGithubDescriptorPaths(target, repo);
+            List<String> branches = likelyGithubBranches(target, repo);
+            PluginJarInfo installed = installedPluginInfo(target);
+            for (String branch : branches) {
+                GithubRepo branchRepo = branch.isBlank() ? new GithubRepo(repo.owner, repo.name) : new GithubRepo(repo.owner, repo.name, branch);
+                for (String path : paths) {
+                    try {
+                        Optional<String> text = fetchGithubRawOptional(branchRepo, path);
+                        if (text.isEmpty()) {
+                            continue;
+                        }
+                        PluginJarInfo info = parsePluginDescriptor(path, text.get());
+                        if (info.hasDescriptor && pluginDescriptorMatchesTarget(installed, target, info)) {
+                            return Optional.of(info);
+                        }
+                    } catch (Exception ignored) {
+                        // Keep probing likely descriptor paths.
+                    }
+                }
+            }
+            return Optional.empty();
+        }
+
+        private DescriptorRankingSignal foliaDescriptorRankingSignal(TargetConfig target, Optional<PluginJarInfo> candidateDescriptor) {
+            PluginJarInfo installed = installedPluginInfo(target);
+            if (installed == null || !Boolean.TRUE.equals(installed.foliaSupported)) {
+                return new DescriptorRankingSignal(0, "");
+            }
+            if (candidateDescriptor.isEmpty()) {
+                return new DescriptorRankingSignal(-10, "; installed jar is Folia-compatible but candidate descriptor could not be re-read for Folia proof");
+            }
+            PluginJarInfo candidate = candidateDescriptor.get();
+            if (Boolean.TRUE.equals(candidate.foliaSupported)) {
+                return new DescriptorRankingSignal(30, "; preserves installed Folia support");
+            }
+            return new DescriptorRankingSignal(-25, "; source descriptor matches identity but does not prove Folia support");
         }
 
         private Optional<ForkLineage> forkLineageForCandidate(TargetConfig target, String type, String source,
@@ -5425,7 +5813,7 @@ public final class AutoUpdater {
                     paths.add(module + "/" + descriptor);
                 }
             }
-            return paths.stream().distinct().limit(8).toList();
+            return paths.stream().distinct().limit(40).toList();
         }
 
         private List<String> likelyGithubBranches(TargetConfig target, GithubRepo repo) {
@@ -5792,20 +6180,35 @@ public final class AutoUpdater {
             if (config.githubBudget.tryUse(target, resource)) {
                 return;
             }
-            githubRateLimited = true;
+            if (config.githubBudget.runBudgetReached(resource) || target == null) {
+                githubRateLimited = true;
+            }
             Instant retry = Instant.now().plus(DISCOVERY_NOT_FOUND_BACKOFF);
+            boolean alreadyResolved = target != null && target.sourceDiscoveredThisRun;
             if (target != null && !target.server) {
-                rememberDiscoveryDeferred(target, "GitHub API budget reached", retry);
+                githubBudgetLimitedPlugins.add(pluginBudgetKey(target));
+                if (!alreadyResolved) {
+                    rememberDiscoveryDeferred(target, "GitHub API budget reached", retry);
+                }
             }
             String message = "GitHub " + resource + " API budget reached"
                 + (target == null ? "" : " for " + target.displayName())
-                + " (" + config.githubBudget.status(target) + "); deferring further GitHub discovery.";
+                + " (" + config.githubBudget.status(target) + "); "
+                + (alreadyResolved ? "skipping extra GitHub inspection after a source was already selected." : "deferring further GitHub discovery.");
             String warningKey = normalizedConfigPath((target == null ? "" : firstNonBlank(target.installAs, target.displayName()))
                 + "|" + resource);
             if (githubBudgetWarnings.add(warningKey)) {
                 Log.warn(message);
             }
             throw new IOException(message);
+        }
+
+        private boolean isGithubPluginBudgetLimited(TargetConfig target) {
+            return target != null && githubBudgetLimitedPlugins.contains(pluginBudgetKey(target));
+        }
+
+        private String pluginBudgetKey(TargetConfig target) {
+            return normalizedConfigPath(firstNonBlank(target.installAs, target.displayName()));
         }
 
         private String githubBudgetResource(String apiName, URI uri) {
@@ -6432,6 +6835,11 @@ public final class AutoUpdater {
                 return false;
             }
             if (hosted.plan.type.equals("git") || hosted.plan.type.equals("github-source")) {
+                return false;
+            }
+            if (isManualConfiguredSource(target) && !lower(firstNonBlank(target.type, "")).equals("github-source")) {
+                Log.info("Decision for " + target.displayName() + ": using hosted jar because the configured source is manual; "
+                    + "newer Git commits are not built unless the entry explicitly uses type=github-source.");
                 return false;
             }
             if (hosted.download.publishedAt == null || latestCommit.isEmpty()) {
