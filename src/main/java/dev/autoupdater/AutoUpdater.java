@@ -3653,6 +3653,8 @@ public final class AutoUpdater {
         private final List<PendingRejectedSourceProof> pendingRejectedSourceProofs = new ArrayList<>();
         private final Map<String, String> testGithubRawResponses = new HashMap<>();
         private final Map<String, Object> testJsonResponses = new HashMap<>();
+        private final Map<String, Integer> testJsonFailureAfterHits = new HashMap<>();
+        private final Map<String, Integer> testJsonHitCounts = new HashMap<>();
         private final List<String> testDiscoveryTrace = new ArrayList<>();
         private int sourceProofCaptureDepth = 0;
         private boolean githubRateLimited = false;
@@ -5257,6 +5259,7 @@ public final class AutoUpdater {
                     continue;
                 }
                 rememberSourceProof(target, source, "github-source", repo, descriptor.get(), "preferred-owner-raw-descriptor-match");
+                enrichPreferredForkSourceProof(target, source, repo);
                 candidates.add(candidateFromResolved(
                     target,
                     "github-source",
@@ -5354,7 +5357,7 @@ public final class AutoUpdater {
             PluginJarInfo installed = installedPluginInfo(target);
             for (String branch : likelyGithubBranches(target, repo)) {
                 GithubRepo branchRepo = branch.isBlank() ? new GithubRepo(repo.owner, repo.name) : new GithubRepo(repo.owner, repo.name, branch);
-                for (String path : preferredGithubDescriptorPaths(target, repo)) {
+                for (String path : likelyGithubDescriptorPaths(target, repo)) {
                     try {
                         Optional<String> text = fetchGithubRawOptional(branchRepo, path);
                         if (text.isEmpty()) {
@@ -5370,20 +5373,6 @@ public final class AutoUpdater {
                 }
             }
             return Optional.empty();
-        }
-
-        private List<String> preferredGithubDescriptorPaths(TargetConfig target, GithubRepo repo) {
-            List<String> paths = new ArrayList<>(List.of(
-                "plugin.yml",
-                "paper-plugin.yml",
-                "src/main/resources/plugin.yml",
-                "src/main/resources/paper-plugin.yml"
-            ));
-            for (String module : likelyGithubModuleNames(target, repo).stream().limit(8).toList()) {
-                paths.add(module + "/src/main/resources/plugin.yml");
-                paths.add(module + "/src/main/resources/paper-plugin.yml");
-            }
-            return paths.stream().distinct().limit(24).toList();
         }
 
         private boolean preferredGithubForkDescriptorMatches(PluginJarInfo installed, TargetConfig target, PluginJarInfo candidate) {
@@ -5449,6 +5438,24 @@ public final class AutoUpdater {
                         + ": " + ex.getMessage());
                 }
                 return false;
+            }
+        }
+
+        private void enrichPreferredForkSourceProof(TargetConfig target, String source, GithubRepo repo) {
+            try {
+                ForkLineage lineage = githubForkLineage(repo, target);
+                if (lineage.isFork()) {
+                    enrichSourceProof(target, source, lineage,
+                        "preferred-owner fork lineage; " + firstNonBlank(lineage.describe(), repo.owner + "/" + repo.name));
+                }
+            } catch (Exception ex) {
+                if (isGithubPluginBudgetLimited(target) || githubRateLimited || config.githubRateLimit.isPaused() || githubAuthFailed) {
+                    Log.info("Preferred fork lineage enrichment skipped for " + target.displayName()
+                        + " because GitHub budget or rate limits prevented checking " + repo.owner + "/" + repo.name + ".");
+                } else if (!isExpectedMissingGithubProbe(ex)) {
+                    Log.info("Preferred fork lineage check failed for " + repo.owner + "/" + repo.name
+                        + ": " + ex.getMessage());
+                }
             }
         }
 
@@ -6432,8 +6439,12 @@ public final class AutoUpdater {
             Map<String, Object> root = asMap(json);
             boolean fork = Boolean.TRUE.equals(root.get("fork"));
             String fullName = firstNonBlank(stringValue(root.get("full_name")), repo.owner + "/" + repo.name);
-            Map<String, Object> parent = asMap(root.get("parent"));
-            Map<String, Object> source = asMap(root.get("source"));
+            Map<String, Object> parent = root.get("parent") instanceof Map<?, ?> parentMap
+                ? asMap(parentMap)
+                : Collections.emptyMap();
+            Map<String, Object> source = root.get("source") instanceof Map<?, ?> sourceMap
+                ? asMap(sourceMap)
+                : Collections.emptyMap();
             return new ForkLineage(
                 fullName,
                 stringValue(parent.get("full_name")),
@@ -6890,6 +6901,11 @@ public final class AutoUpdater {
 
         private Object getJson(URI uri, String apiName, TargetConfig budgetTarget) throws Exception {
             if (testJsonResponses.containsKey(uri.toString())) {
+                int hits = testJsonHitCounts.merge(uri.toString(), 1, Integer::sum);
+                Integer failAfter = testJsonFailureAfterHits.get(uri.toString());
+                if (failAfter != null && hits > failAfter) {
+                    throw new IOException("test GitHub budget/rate limit after cached metadata");
+                }
                 return testJsonResponses.get(uri.toString());
             }
             boolean githubApi = isGithubApiUri(uri);

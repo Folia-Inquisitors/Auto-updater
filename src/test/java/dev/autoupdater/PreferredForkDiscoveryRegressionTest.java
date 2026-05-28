@@ -24,6 +24,11 @@ public final class PreferredForkDiscoveryRegressionTest {
         preferredOwnerDoesNotBeatDescriptorMismatch();
         preferredForkCannotDowngrade();
         foliaProofIsRequiredForPreferredFork();
+        preferredForkUsesExistingNestedDescriptorPaths();
+        preferredForkUsesSupportedVelocityDescriptorPath();
+        preferredForkLineageEnrichesSelectedSourceProof();
+        lineageUnavailableDoesNotRejectOtherwiseValidPreferredFork();
+        preferredOwnerForkLineageDoesNotOverrideMismatch();
         preferredProbeRunsBeforeForkSearch();
         githubBudgetDefersPreferredForkDiscovery();
         preferredOwnersParseFromYamlList();
@@ -158,6 +163,102 @@ public final class PreferredForkDiscoveryRegressionTest {
             "broad GitHub fork search ran even though preferred fork was strongly selected");
     }
 
+    private static void preferredForkUsesExistingNestedDescriptorPaths() throws Exception {
+        Path temp = Files.createTempDirectory("autoupdater-preferred-nested");
+        writePluginJar(temp.resolve("plugins/DemoPlugin.jar"), "DemoPlugin", "2.0.0", "com.example.demo.DemoPlugin", true);
+        Object updater = newInstance("dev.autoupdater.AutoUpdater$Updater", preferredForkConfig(temp));
+        TargetConfig target = target("DemoPlugin", temp);
+        target.source = "Not Found";
+        addRaw(updater, "Folia-Inquisitors", "DemoPlugin", "src/main/resources/paper-plugin.yml",
+            descriptor("DemoPlugin", "2.1.0", "com.example.demo.DemoPlugin", true));
+        addRepoMetadata(updater, "Folia-Inquisitors", "DemoPlugin", false, false);
+
+        @SuppressWarnings("unchecked")
+        List<Object> candidates = (List<Object>) invoke(updater, "discoverTargetedGithubSources",
+            new Class<?>[] { TargetConfig.class, int.class, boolean.class }, target, 0, true);
+        require(!candidates.isEmpty(), "preferred fork was not found through nested module paper-plugin.yml");
+    }
+
+    private static void preferredForkUsesSupportedVelocityDescriptorPath() throws Exception {
+        Path temp = Files.createTempDirectory("autoupdater-preferred-velocity-path");
+        writePluginJar(temp.resolve("plugins/DemoPlugin.jar"), "DemoPlugin", "2.0.0", "com.example.demo.DemoPlugin", true);
+        Object updater = newInstance("dev.autoupdater.AutoUpdater$Updater", preferredForkConfig(temp));
+        TargetConfig target = target("DemoPlugin", temp);
+        target.source = "Not Found";
+        addRaw(updater, "Folia-Inquisitors", "DemoPlugin", "src/main/resources/bungee.yml",
+            descriptor("DemoPlugin", "2.1.0", "com.example.demo.DemoPlugin", true));
+        addRepoMetadata(updater, "Folia-Inquisitors", "DemoPlugin", false, false);
+
+        @SuppressWarnings("unchecked")
+        List<Object> candidates = (List<Object>) invoke(updater, "discoverTargetedGithubSources",
+            new Class<?>[] { TargetConfig.class, int.class, boolean.class }, target, 0, true);
+        require(!candidates.isEmpty(), "preferred fork did not reuse existing supported bungee descriptor path");
+    }
+
+    private static void preferredForkLineageEnrichesSelectedSourceProof() throws Exception {
+        Path temp = Files.createTempDirectory("autoupdater-preferred-lineage");
+        writePluginJar(temp.resolve("plugins/DemoPlugin.jar"), "DemoPlugin", "2.0.0", "com.example.demo.DemoPlugin", true);
+        Object updater = newInstance("dev.autoupdater.AutoUpdater$Updater", preferredForkConfig(temp));
+        TargetConfig target = target("DemoPlugin", temp);
+        target.source = "Not Found";
+        addRaw(updater, "Folia-Inquisitors", "DemoPlugin", "plugin.yml",
+            descriptor("DemoPlugin", "2.1.0", "com.example.demo.DemoPlugin", true));
+        addRepoMetadata(updater, "Folia-Inquisitors", "DemoPlugin", false, false,
+            true, "Official/DemoPlugin", "Official/DemoPlugin");
+
+        @SuppressWarnings("unchecked")
+        List<Object> discovered = (List<Object>) invoke(updater, "discoverSourceCandidates",
+            new Class<?>[] { TargetConfig.class }, target);
+        require(!discovered.isEmpty(), "preferred fork with lineage was not discovered");
+        invoke(updater, "applyDiscoveredSource", new Class<?>[] { TargetConfig.class, List.class }, target, discovered);
+
+        String lock = Files.readString(temp.resolve("updater.lock.yml"), StandardCharsets.UTF_8);
+        require(lock.contains("source: https://github.com/Folia-Inquisitors/DemoPlugin"),
+            "lineage test active proof does not point to selected fork");
+        require(lock.contains("forkRepo: Folia-Inquisitors/DemoPlugin"),
+            "selected preferred fork proof did not retain forkRepo lineage");
+        require(lock.contains("upstreamRepo: Official/DemoPlugin"),
+            "selected preferred fork proof did not retain upstreamRepo lineage");
+    }
+
+    private static void lineageUnavailableDoesNotRejectOtherwiseValidPreferredFork() throws Exception {
+        Path temp = Files.createTempDirectory("autoupdater-preferred-lineage-unavailable");
+        writePluginJar(temp.resolve("plugins/DemoPlugin.jar"), "DemoPlugin", "2.0.0", "com.example.demo.DemoPlugin", true);
+        Object updater = newInstance("dev.autoupdater.AutoUpdater$Updater", preferredForkConfig(temp));
+        TargetConfig target = target("DemoPlugin", temp);
+        target.source = "Not Found";
+        addRaw(updater, "Folia-Inquisitors", "DemoPlugin", "plugin.yml",
+            descriptor("DemoPlugin", "2.1.0", "com.example.demo.DemoPlugin", true));
+        addRepoMetadata(updater, "Folia-Inquisitors", "DemoPlugin", false, false,
+            true, "Official/DemoPlugin", "Official/DemoPlugin");
+        @SuppressWarnings("unchecked")
+        Map<String, Integer> failAfter = (Map<String, Integer>) getField(updater, "testJsonFailureAfterHits");
+        failAfter.put("https://api.github.com/repos/Folia-Inquisitors/DemoPlugin", 1);
+        setField(updater, "githubRateLimited", true);
+
+        @SuppressWarnings("unchecked")
+        List<Object> discovered = (List<Object>) invoke(updater, "discoverTargetedGithubSources",
+            new Class<?>[] { TargetConfig.class, int.class, boolean.class }, target, 0, true);
+        require(!discovered.isEmpty(), "lineage unavailability rejected an otherwise valid preferred fork");
+    }
+
+    private static void preferredOwnerForkLineageDoesNotOverrideMismatch() throws Exception {
+        Path temp = Files.createTempDirectory("autoupdater-preferred-mismatch-fork");
+        writePluginJar(temp.resolve("plugins/DemoPlugin.jar"), "DemoPlugin", "2.0.0", "com.example.demo.DemoPlugin", true);
+        Object updater = newInstance("dev.autoupdater.AutoUpdater$Updater", preferredForkConfig(temp));
+        TargetConfig target = target("DemoPlugin", temp);
+        target.source = "Not Found";
+        addRaw(updater, "Folia-Inquisitors", "DemoPlugin", "plugin.yml",
+            descriptor("OtherPlugin", "2.1.0", "com.other.OtherPlugin", true));
+        addRepoMetadata(updater, "Folia-Inquisitors", "DemoPlugin", false, false,
+            true, "Official/DemoPlugin", "Official/DemoPlugin");
+
+        @SuppressWarnings("unchecked")
+        List<Object> candidates = (List<Object>) invoke(updater, "discoverTargetedGithubSources",
+            new Class<?>[] { TargetConfig.class, int.class, boolean.class }, target, 0, true);
+        require(candidates.isEmpty(), "fork lineage/preferred owner overrode descriptor mismatch");
+    }
+
     private static void githubBudgetDefersPreferredForkDiscovery() throws Exception {
         Path temp = Files.createTempDirectory("autoupdater-preferred-budget");
         writePluginJar(temp.resolve("plugins/DemoPlugin.jar"), "DemoPlugin", "2.0.0", "com.example.demo.DemoPlugin", true);
@@ -230,12 +331,28 @@ public final class PreferredForkDiscoveryRegressionTest {
     }
 
     private static void addRepoMetadata(Object updater, String owner, String repo, boolean archived, boolean disabled) throws Exception {
+        addRepoMetadata(updater, owner, repo, archived, disabled, false, "", "");
+    }
+
+    private static void addRepoMetadata(Object updater, String owner, String repo, boolean archived, boolean disabled,
+                                        boolean fork, String parentRepo, String sourceRepo) throws Exception {
         @SuppressWarnings("unchecked")
         Map<String, Object> json = (Map<String, Object>) getField(updater, "testJsonResponses");
         Map<String, Object> root = new LinkedHashMap<>();
         root.put("full_name", owner + "/" + repo);
         root.put("archived", archived);
         root.put("disabled", disabled);
+        root.put("fork", fork);
+        if (!parentRepo.isBlank()) {
+            Map<String, Object> parent = new LinkedHashMap<>();
+            parent.put("full_name", parentRepo);
+            root.put("parent", parent);
+        }
+        if (!sourceRepo.isBlank()) {
+            Map<String, Object> source = new LinkedHashMap<>();
+            source.put("full_name", sourceRepo);
+            root.put("source", source);
+        }
         json.put("https://api.github.com/repos/" + owner + "/" + repo, root);
     }
 
