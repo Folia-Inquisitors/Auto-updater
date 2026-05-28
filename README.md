@@ -19,7 +19,7 @@ plugins/
 ## What It Supports
 
 - Folia, Paper, Velocity, and other PaperMC downloads.
-- `changeVersion: false` for safer server jar updates within the same configured version.
+- `changeVersion: false` for safer server jar updates within the same configured version, while still accepting newer PaperMC builds for that version.
 - Hangar plugin downloads.
 - GitHub release jar downloads.
 - Modrinth plugin downloads.
@@ -28,12 +28,22 @@ plugins/
 - Backup and staging folders.
 - Scheduled restarts with warning commands.
 - Explicit fallback sources.
-- Fallback on prevous working version if fails to load.
+- Fallback on previous working version if fails to load.
 - Discovery policy reporting with trusted GitHub org/repo settings.
 - Saves discovered plugin sources back into `updater.yml`.
 - Per-plugin `autoUpdate` opt-out.
 - Failure memory for plugin jars that fail startup.
 - Trusted Git source build fallback with Gradle/Maven auto-detection.
+
+## Config Notes
+
+- `discovery.enabled: false` disables normal `check`, `update`, and `run` discovery side effects, including installed-plugin auto-add, missing-source auto-switching, stale discovered-source rewrites, and stale proof refresh. The explicit `discover` command can still run discovery.
+- `server.pinBuild` is optional. Leave it blank for normal PaperMC behavior: `updater.lock.yml` remembers the last installed build for rollback, but newer builds within the locked `gameVersion` can still install. Set `pinBuild` only when you intentionally want one exact Paper/Folia/Velocity build.
+- `type: github-source` on a plugin primary source means "build this Git repo first." Hosted fallback sources are only tried after that primary Git build fails or is skipped.
+- `sourceOrigin` records ownership of plugin sources: `manual` means user-owned, `discovered` means machine-selected with an active matching source proof, `discovered-unverified` means machine-selected without descriptor proof, and `unresolved` means discovery has not found a reliable source yet.
+- `discovery.preferredOwners` defaults to empty. Add GitHub owners such as `Folia-Inquisitors` or `Inquisitors-transfers` when you intentionally use a Folia/custom fork ecosystem. Preferred owners are search hints only: they are probed before broad GitHub search for missing or weak sources, but they do not override manual sources or bypass descriptor validation, Folia proof, or downgrade protection.
+- Boolean config values are strict. Use `true/false`, `yes/no`, `on/off`, or `1/0`; typos stop parsing instead of silently disabling safety settings.
+- On Folia, auto-discovered plugin updates must prove Folia support with `folia-supported: true`. Manual sources may still install generic Paper/Bukkit jars, but the updater warns.
 
 ## Default Config
 
@@ -51,6 +61,9 @@ discovery:
   autoSwitchSource: true
   saveDiscoveredSources: true
   scanInstalledPlugins: true
+  # preferredOwners:
+  #   - Folia-Inquisitors
+  #   - Inquisitors-transfers
 
 buildFromSource:
   enabled: auto
@@ -70,6 +83,7 @@ server:
   installAs: auto
   gameVersion: auto
   changeVersion: false
+  pinBuild: ""
   java: java
   javaArgs: "-Xms16G -Xmx32G"
   args: ""

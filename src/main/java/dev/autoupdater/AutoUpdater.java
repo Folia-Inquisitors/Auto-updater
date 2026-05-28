@@ -335,7 +335,7 @@ public final class AutoUpdater {
         }
 
         private void autoAddInstalledPlugins() {
-            if (!discovery.scanInstalledPlugins) {
+            if (!discovery.enabled || !discovery.scanInstalledPlugins) {
                 return;
             }
             Path pluginDir = resolve(Paths.get("plugins"));
@@ -500,6 +500,7 @@ public final class AutoUpdater {
         boolean autoSwitchSource = true;
         boolean saveDiscoveredSources = true;
         boolean scanInstalledPlugins = true;
+        List<String> preferredOwners = new ArrayList<>();
     }
 
     private static final class GithubRateLimitState {
@@ -988,6 +989,7 @@ public final class AutoUpdater {
             stripUtf8Bom(lines);
             String section = "";
             String restartSubsection = "";
+            String discoverySubsection = "";
             TargetConfig currentPlugin = null;
             SourceHint currentSourceHint = null;
             RestartWarning currentWarning = null;
@@ -1006,6 +1008,7 @@ public final class AutoUpdater {
                     currentSourceHint = null;
                     currentWarning = null;
                     restartSubsection = "";
+                    discoverySubsection = "";
                     KeyValue kv = keyValue(line, lineNo);
                     if (kv.value.isEmpty()) {
                         section = lower(kv.key);
@@ -1021,7 +1024,23 @@ public final class AutoUpdater {
                         applyTarget(config.server, keyValue(line, lineNo));
                         break;
                     case "discovery":
-                        applyDiscovery(config.discovery, keyValue(line, lineNo));
+                        if (line.equals("preferredOwners:") || line.equals("preferred_owners:")) {
+                            discoverySubsection = "preferredowners";
+                        } else if (discoverySubsection.equals("preferredowners")) {
+                            if (indent <= 2 && !line.startsWith("- ")) {
+                                discoverySubsection = "";
+                                applyDiscovery(config.discovery, keyValue(line, lineNo));
+                            } else if (line.startsWith("- ")) {
+                                String owner = ConfigParser.unquote(line.substring(2).trim());
+                                if (!owner.isBlank()) {
+                                    config.discovery.preferredOwners.add(owner);
+                                }
+                            } else {
+                                throw new IllegalArgumentException("Discovery preferredOwners entry before '-' at line " + lineNo);
+                            }
+                        } else {
+                            applyDiscovery(config.discovery, keyValue(line, lineNo));
+                        }
                         break;
                     case "buildfromsource":
                     case "build_from_source":
@@ -1075,7 +1094,11 @@ public final class AutoUpdater {
                             restartSubsection = "warnings";
                             currentWarning = null;
                         } else if (restartSubsection.equals("warnings")) {
-                            if (line.startsWith("- ")) {
+                            if (indent <= 2 && !line.startsWith("- ")) {
+                                restartSubsection = "";
+                                currentWarning = null;
+                                applyRestart(config.restart, keyValue(line, lineNo));
+                            } else if (line.startsWith("- ")) {
                                 currentWarning = new RestartWarning();
                                 config.restart.warnings.add(currentWarning);
                                 String rest = line.substring(2).trim();
@@ -1140,7 +1163,7 @@ public final class AutoUpdater {
                     break;
                 case "discoversources":
                 case "discover_sources":
-                    config.discovery.enabled = parseBoolean(kv.value);
+                    config.discovery.enabled = parseBooleanStrict(kv.key, kv.value);
                     break;
                 default:
                     throw new IllegalArgumentException("Unknown config key: " + kv.key);
@@ -1153,21 +1176,21 @@ public final class AutoUpdater {
                     target.name = kv.value;
                     break;
                 case "enabled":
-                    target.enabled = parseBoolean(kv.value);
+                    target.enabled = parseBooleanStrict(kv.key, kv.value);
                     break;
                 case "autoupdate":
                 case "auto_update":
-                    target.autoUpdate = parseBoolean(kv.value);
+                    target.autoUpdate = parseBooleanStrict(kv.key, kv.value);
                     break;
                 case "required":
-                    target.required = parseBoolean(kv.value);
+                    target.required = parseBooleanStrict(kv.key, kv.value);
                     break;
                 case "source":
                     target.source = kv.value;
                     break;
                 case "sourceorigin":
                 case "source_origin":
-                    target.sourceOrigin = kv.value;
+                    target.sourceOrigin = parseSourceOriginStrict(kv.value);
                     break;
                 case "fallbacksources":
                 case "fallback_sources":
@@ -1199,10 +1222,15 @@ public final class AutoUpdater {
                     break;
                 case "changeversion":
                 case "change_version":
-                    target.changeVersion = parseBoolean(kv.value);
+                    target.changeVersion = parseBooleanStrict(kv.key, kv.value);
                     break;
                 case "channel":
                     target.channel = kv.value;
+                    break;
+                case "pinbuild":
+                case "pin_build":
+                case "build":
+                    target.pinBuild = kv.value;
                     break;
                 case "installas":
                 case "install_as":
@@ -1226,7 +1254,7 @@ public final class AutoUpdater {
         private static void applyDiscovery(DiscoveryConfig discovery, KeyValue kv) {
             switch (lower(kv.key)) {
                 case "enabled":
-                    discovery.enabled = parseBoolean(kv.value);
+                    discovery.enabled = parseBooleanStrict(kv.key, kv.value);
                     break;
                 case "mode":
                     discovery.mode = kv.value;
@@ -1237,7 +1265,7 @@ public final class AutoUpdater {
                     break;
                 case "checkalternatesourceswhenoutdated":
                 case "check_alternate_sources_when_outdated":
-                    discovery.checkAlternateSourcesWhenOutdated = parseBoolean(kv.value);
+                    discovery.checkAlternateSourcesWhenOutdated = parseBooleanStrict(kv.key, kv.value);
                     break;
                 case "outdatedthresholddays":
                 case "outdated_threshold_days":
@@ -1245,15 +1273,19 @@ public final class AutoUpdater {
                     break;
                 case "autoswitchsource":
                 case "auto_switch_source":
-                    discovery.autoSwitchSource = parseBoolean(kv.value);
+                    discovery.autoSwitchSource = parseBooleanStrict(kv.key, kv.value);
                     break;
                 case "savediscoveredsources":
                 case "save_discovered_sources":
-                    discovery.saveDiscoveredSources = parseBoolean(kv.value);
+                    discovery.saveDiscoveredSources = parseBooleanStrict(kv.key, kv.value);
                     break;
                 case "scaninstalledplugins":
                 case "scan_installed_plugins":
-                    discovery.scanInstalledPlugins = parseBoolean(kv.value);
+                    discovery.scanInstalledPlugins = parseBooleanStrict(kv.key, kv.value);
+                    break;
+                case "preferredowners":
+                case "preferred_owners":
+                    discovery.preferredOwners = parseList(kv.value);
                     break;
                 case "allowspigotdiscovery":
                 case "allow_spigot_discovery":
@@ -1309,15 +1341,15 @@ public final class AutoUpdater {
         private static void applyBuildFromSource(BuildFromSourceConfig build, KeyValue kv) {
             switch (lower(kv.key)) {
                 case "enabled":
-                    build.enabled = kv.value;
+                    build.enabled = parseBuildFromSourceEnabledStrict(kv.value);
                     break;
                 case "onlytrusted":
                 case "only_trusted":
-                    build.onlyTrusted = parseBoolean(kv.value);
+                    build.onlyTrusted = parseBooleanStrict(kv.key, kv.value);
                     break;
                 case "preferhostedifsameversion":
                 case "prefer_hosted_if_same_version":
-                    build.preferHostedIfSameVersion = parseBoolean(kv.value);
+                    build.preferHostedIfSameVersion = parseBooleanStrict(kv.key, kv.value);
                     break;
                 case "trustedgithuborgs":
                 case "trusted_github_orgs":
@@ -1335,7 +1367,7 @@ public final class AutoUpdater {
         private static void applyFailureMemory(FailureMemoryConfig failureMemory, KeyValue kv) {
             switch (lower(kv.key)) {
                 case "enabled":
-                    failureMemory.enabled = parseBoolean(kv.value);
+                    failureMemory.enabled = parseBooleanStrict(kv.key, kv.value);
                     break;
                 case "retrybadafter":
                 case "retry_bad_after":
@@ -1349,7 +1381,7 @@ public final class AutoUpdater {
         private static void applyValidation(ValidationConfig validation, KeyValue kv) {
             switch (lower(kv.key)) {
                 case "enabled":
-                    validation.enabled = parseBoolean(kv.value);
+                    validation.enabled = parseBooleanStrict(kv.key, kv.value);
                     break;
                 case "minautoinstallscore":
                 case "min_auto_install_score":
@@ -1361,15 +1393,15 @@ public final class AutoUpdater {
                     break;
                 case "rejectonpluginnamemismatch":
                 case "reject_on_plugin_name_mismatch":
-                    validation.rejectOnPluginNameMismatch = parseBoolean(kv.value);
+                    validation.rejectOnPluginNameMismatch = parseBooleanStrict(kv.key, kv.value);
                     break;
                 case "rejectonpluginfingerprintmismatch":
                 case "reject_on_plugin_fingerprint_mismatch":
-                    validation.rejectOnPluginFingerprintMismatch = parseBoolean(kv.value);
+                    validation.rejectOnPluginFingerprintMismatch = parseBooleanStrict(kv.key, kv.value);
                     break;
                 case "rejectwrongplatform":
                 case "reject_wrong_platform":
-                    validation.rejectWrongPlatform = parseBoolean(kv.value);
+                    validation.rejectWrongPlatform = parseBooleanStrict(kv.key, kv.value);
                     break;
                 default:
                     throw new IllegalArgumentException("Unknown validation key: " + kv.key);
@@ -1379,7 +1411,7 @@ public final class AutoUpdater {
         private static void applyDuplicates(DuplicateConfig duplicates, KeyValue kv) {
             switch (lower(kv.key)) {
                 case "enabled":
-                    duplicates.enabled = parseBoolean(kv.value);
+                    duplicates.enabled = parseBooleanStrict(kv.key, kv.value);
                     break;
                 case "action":
                     duplicates.action = kv.value;
@@ -1395,7 +1427,7 @@ public final class AutoUpdater {
         private static void applyRestart(RestartConfig restart, KeyValue kv) {
             switch (lower(kv.key)) {
                 case "enabled":
-                    restart.enabled = parseBoolean(kv.value);
+                    restart.enabled = parseBooleanStrict(kv.key, kv.value);
                     break;
                 case "interval":
                     restart.interval = parseDuration(kv.value);
@@ -1420,7 +1452,7 @@ public final class AutoUpdater {
         private static void applySelfUpdate(SelfUpdateConfig selfUpdate, KeyValue kv) {
             switch (lower(kv.key)) {
                 case "enabled":
-                    selfUpdate.enabled = parseBoolean(kv.value);
+                    selfUpdate.enabled = parseBooleanStrict(kv.key, kv.value);
                     break;
                 case "source":
                     selfUpdate.source = kv.value;
@@ -1452,6 +1484,38 @@ public final class AutoUpdater {
                 default:
                     throw new IllegalArgumentException("Unknown warning key: " + kv.key);
             }
+        }
+
+        private static boolean parseBooleanStrict(String fieldName, String value) {
+            String v = lower(value);
+            if (v.equals("true") || v.equals("yes") || v.equals("on") || v.equals("1")) {
+                return true;
+            }
+            if (v.equals("false") || v.equals("no") || v.equals("off") || v.equals("0")) {
+                return false;
+            }
+            throw new IllegalArgumentException(fieldName + " must be a boolean (true/false/yes/no/on/off/1/0), found: " + value);
+        }
+
+        private static String parseBuildFromSourceEnabledStrict(String value) {
+            String v = lower(value);
+            if (v.equals("auto")) {
+                return "auto";
+            }
+            parseBooleanStrict("buildFromSource.enabled", value);
+            return v;
+        }
+
+        private static String parseSourceOriginStrict(String value) {
+            String origin = lower(firstNonBlank(value, ""));
+            if (origin.isBlank()
+                || origin.equals(SOURCE_ORIGIN_MANUAL)
+                || origin.equals(SOURCE_ORIGIN_DISCOVERED)
+                || origin.equals(SOURCE_ORIGIN_DISCOVERED_UNVERIFIED)
+                || origin.equals(SOURCE_ORIGIN_UNRESOLVED)) {
+                return origin;
+            }
+            throw new IllegalArgumentException("sourceOrigin must be manual, discovered, discovered-unverified, or unresolved; found: " + value);
         }
 
         private static KeyValue keyValue(String line, int lineNo) {
@@ -2284,6 +2348,7 @@ public final class AutoUpdater {
         String serverProject = "";
         String serverGameVersion = "";
         String serverBuild = "";
+        final Map<String, BadServerBuild> badServerBuilds = new LinkedHashMap<>();
         final Map<String, BadPluginVersion> badPluginVersions = new LinkedHashMap<>();
         final Map<String, BadSourceBuild> badSourceBuilds = new LinkedHashMap<>();
         final Map<String, DiscoveryState> discoveryStates = new LinkedHashMap<>();
@@ -2299,6 +2364,7 @@ public final class AutoUpdater {
             try {
                 List<String> lines = Files.readAllLines(lock, StandardCharsets.UTF_8);
                 String section = "";
+                BadServerBuild currentBadServer = null;
                 BadPluginVersion currentBad = null;
                 BadSourceBuild currentBadBuild = null;
                 DiscoveryState currentDiscovery = null;
@@ -2312,6 +2378,7 @@ public final class AutoUpdater {
                     }
                     int indent = ConfigParser.countIndent(noComment);
                     if (indent == 0) {
+                        currentBadServer = null;
                         currentBad = null;
                         currentBadBuild = null;
                         currentDiscovery = null;
@@ -2340,6 +2407,20 @@ public final class AutoUpdater {
                         continue;
                     }
 
+                    if (section.equals("badserverbuilds") && indent == 2) {
+                        KeyValue kv = ConfigParser.keyValue(line, 0);
+                        if (kv.value.isEmpty()) {
+                            String key = ConfigParser.unquote(kv.key);
+                            currentBadServer = new BadServerBuild(key);
+                            state.badServerBuilds.put(serverBuildLockKey(currentBadServer.project, currentBadServer.gameVersion, currentBadServer.build), currentBadServer);
+                        }
+                        continue;
+                    }
+                    if (section.equals("badserverbuilds") && indent >= 4 && currentBadServer != null) {
+                        KeyValue kv = ConfigParser.keyValue(line, 0);
+                        currentBadServer.apply(kv.key, kv.value);
+                        continue;
+                    }
                     if (section.equals("badpluginversions") && indent == 2) {
                         KeyValue kv = ConfigParser.keyValue(line, 0);
                         if (kv.value.isEmpty()) {
@@ -2430,6 +2511,17 @@ public final class AutoUpdater {
             if (!serverBuild.isBlank()) {
                 lines.add("serverBuild: " + quoteYaml(serverBuild));
             }
+            if (!badServerBuilds.isEmpty()) {
+                lines.add("badServerBuilds:");
+                for (BadServerBuild bad : badServerBuilds.values()) {
+                    lines.add("  " + quoteYamlKey(serverBuildLockKey(bad.project, bad.gameVersion, bad.build)) + ":");
+                    lines.add("    project: " + quoteYaml(bad.project));
+                    lines.add("    gameVersion: " + quoteYaml(bad.gameVersion));
+                    lines.add("    build: " + quoteYaml(bad.build));
+                    lines.add("    reason: " + quoteYaml(bad.reason));
+                    lines.add("    failedAt: " + quoteYaml(bad.failedAt));
+                }
+            }
             if (!badPluginVersions.isEmpty()) {
                 lines.add("badPluginVersions:");
                 for (BadPluginVersion bad : badPluginVersions.values()) {
@@ -2503,6 +2595,34 @@ public final class AutoUpdater {
                 }
             }
             Files.write(lock, lines, StandardCharsets.UTF_8);
+        }
+
+        Optional<BadServerBuild> activeBadServerBuild(AppConfig config, String project, String gameVersion, String build) {
+            if (!config.failureMemory.enabled || project.isBlank() || gameVersion.isBlank() || build.isBlank()) {
+                return Optional.empty();
+            }
+            BadServerBuild bad = badServerBuilds.get(serverBuildLockKey(project, gameVersion, build));
+            if (bad != null && !retryWindowExpired(config, bad.failedAt)) {
+                return Optional.of(bad);
+            }
+            for (BadServerBuild remembered : badServerBuilds.values()) {
+                if (remembered.matches(project, gameVersion, build) && !retryWindowExpired(config, remembered.failedAt)) {
+                    return Optional.of(remembered);
+                }
+            }
+            return Optional.empty();
+        }
+
+        void rememberBadServerBuild(InstalledUpdate update, String reason) {
+            if (update == null || !update.target.server || update.serverBuild.isBlank()) {
+                return;
+            }
+            String project = firstNonBlank(update.serverProject, update.target.project, inferPaperMcProject(update.target));
+            String gameVersion = firstNonBlank(update.serverGameVersion, update.version, update.target.gameVersion);
+            BadServerBuild bad = new BadServerBuild(project, gameVersion, update.serverBuild);
+            bad.reason = reason;
+            bad.failedAt = Instant.now().toString();
+            badServerBuilds.put(serverBuildLockKey(bad.project, bad.gameVersion, bad.build), bad);
         }
 
         Optional<BadPluginVersion> activeBadPlugin(AppConfig config, TargetConfig target, ResolvedDownload download, String sha256) {
@@ -2757,6 +2877,10 @@ public final class AutoUpdater {
         private static String sourceBuildLockKey(String repo) {
             return lower(firstNonBlank(repo, "")).replace("\\", "/");
         }
+
+        private static String serverBuildLockKey(String project, String gameVersion, String build) {
+            return lower(firstNonBlank(project, "") + "/" + firstNonBlank(gameVersion, "") + "/" + firstNonBlank(build, ""));
+        }
     }
 
     private static final class SourceProof {
@@ -2951,6 +3075,59 @@ public final class AutoUpdater {
                 default:
                     break;
             }
+        }
+    }
+
+    private static final class BadServerBuild {
+        String project = "";
+        String gameVersion = "";
+        String build = "";
+        String reason = "";
+        String failedAt = "";
+
+        BadServerBuild(String key) {
+            String[] parts = firstNonBlank(key, "").split("/", 3);
+            if (parts.length == 3) {
+                project = parts[0];
+                gameVersion = parts[1];
+                build = parts[2];
+            }
+        }
+
+        BadServerBuild(String project, String gameVersion, String build) {
+            this.project = firstNonBlank(project, "");
+            this.gameVersion = firstNonBlank(gameVersion, "");
+            this.build = firstNonBlank(build, "");
+        }
+
+        void apply(String key, String value) {
+            switch (lower(key)) {
+                case "project":
+                    project = value;
+                    break;
+                case "gameversion":
+                case "game_version":
+                    gameVersion = value;
+                    break;
+                case "build":
+                    build = value;
+                    break;
+                case "reason":
+                    reason = value;
+                    break;
+                case "failedat":
+                case "failed_at":
+                    failedAt = value;
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        boolean matches(String project, String gameVersion, String build) {
+            return this.project.equalsIgnoreCase(project)
+                && this.gameVersion.equalsIgnoreCase(gameVersion)
+                && this.build.equalsIgnoreCase(build);
         }
     }
 
@@ -3222,6 +3399,9 @@ public final class AutoUpdater {
         final String source;
         final String version;
         final String sha256;
+        final String serverProject;
+        final String serverGameVersion;
+        final String serverBuild;
         final ServerLockSnapshot previousServerLock;
 
         InstalledUpdate(TargetConfig target, Path targetPath, Path backupPath, String source, String version, String sha256) {
@@ -3230,12 +3410,21 @@ public final class AutoUpdater {
 
         InstalledUpdate(TargetConfig target, Path targetPath, Path backupPath, String source, String version,
                         String sha256, ServerLockSnapshot previousServerLock) {
+            this(target, targetPath, backupPath, source, version, sha256, "", "", "", previousServerLock);
+        }
+
+        InstalledUpdate(TargetConfig target, Path targetPath, Path backupPath, String source, String version,
+                        String sha256, String serverProject, String serverGameVersion, String serverBuild,
+                        ServerLockSnapshot previousServerLock) {
             this.target = target;
             this.targetPath = targetPath;
             this.backupPath = backupPath;
             this.source = firstNonBlank(source, "");
             this.version = firstNonBlank(version, "");
             this.sha256 = firstNonBlank(sha256, "");
+            this.serverProject = firstNonBlank(serverProject, "");
+            this.serverGameVersion = firstNonBlank(serverGameVersion, "");
+            this.serverBuild = firstNonBlank(serverBuild, "");
             this.previousServerLock = previousServerLock;
         }
 
@@ -3462,6 +3651,9 @@ public final class AutoUpdater {
         private final Set<String> discoveryProviderFailures = new HashSet<>();
         private final List<PendingSourceProof> pendingSourceProofs = new ArrayList<>();
         private final List<PendingRejectedSourceProof> pendingRejectedSourceProofs = new ArrayList<>();
+        private final Map<String, String> testGithubRawResponses = new HashMap<>();
+        private final Map<String, Object> testJsonResponses = new HashMap<>();
+        private final List<String> testDiscoveryTrace = new ArrayList<>();
         private int sourceProofCaptureDepth = 0;
         private boolean githubRateLimited = false;
         private boolean githubAuthFailed = false;
@@ -3530,6 +3722,9 @@ public final class AutoUpdater {
             Log.info("Auto-switch source: " + config.discovery.autoSwitchSource);
             Log.info("Save discovered sources: " + config.discovery.saveDiscoveredSources);
             Log.info("Scan installed plugins: " + config.discovery.scanInstalledPlugins);
+            Log.info("Preferred fork owners: " + (config.discovery.preferredOwners.isEmpty()
+                ? "none"
+                : String.join(", ", config.discovery.preferredOwners)));
             Log.info("Spigot/Spiget/Jenkins sources: manual download only; never discovered automatically");
             Log.info("Build from source: " + config.buildFromSource.enabled
                 + ", onlyTrusted=" + config.buildFromSource.onlyTrusted
@@ -3547,7 +3742,7 @@ public final class AutoUpdater {
                 Log.info("Trusted GitHub repos: " + String.join(", ", config.buildFromSource.trustedGithubRepos));
             }
             markManualSourceOrigins();
-            migrateKnownStaleDiscoveredSources();
+            migrateKnownStaleDiscoveredSourcesIfAutoSwitchEnabled();
 
             for (TargetConfig target : allTargets()) {
                 if (!target.enabled || target.server) {
@@ -3787,7 +3982,7 @@ public final class AutoUpdater {
         }
 
         private void autoSwitchMissingPluginSources() {
-            if (!config.discovery.autoSwitchSource) {
+            if (!config.discovery.enabled || !config.discovery.autoSwitchSource) {
                 return;
             }
             markManualSourceOrigins();
@@ -4201,6 +4396,12 @@ public final class AutoUpdater {
                         "migrated Votifier to the NuVotifier source repo"
                     );
                 }
+            }
+        }
+
+        private void migrateKnownStaleDiscoveredSourcesIfAutoSwitchEnabled() {
+            if (config.discovery.autoSwitchSource) {
+                migrateKnownStaleDiscoveredSources();
             }
         }
 
@@ -4947,6 +5148,12 @@ public final class AutoUpdater {
 
         private List<DiscoveryCandidate> discoverTargetedGithubSources(TargetConfig target, int priority, boolean allowReleaseLookup) {
             List<DiscoveryCandidate> candidates = new ArrayList<>();
+            if (shouldProbePreferredGithubForkSources(target)) {
+                candidates.addAll(discoverPreferredGithubForkSources(target, priority, allowReleaseLookup));
+                if (!candidates.isEmpty() || isGithubPluginBudgetLimited(target)) {
+                    return candidates;
+                }
+            }
             Set<String> forkNeighborhoods = new HashSet<>();
             for (GithubRepo repo : likelyGithubRepos(target)) {
                 if (isGithubPluginBudgetLimited(target)) {
@@ -4991,8 +5198,263 @@ public final class AutoUpdater {
             return candidates;
         }
 
+        private boolean shouldProbePreferredGithubForkSources(TargetConfig target) {
+            if (target == null || target.server || config.discovery.preferredOwners.isEmpty()) {
+                return false;
+            }
+            if (isManualConfiguredSource(target)) {
+                return false;
+            }
+            String origin = lower(firstNonBlank(target.sourceOrigin, ""));
+            if (needsDiscoveredSource(target) || origin.equals(SOURCE_ORIGIN_UNRESOLVED)) {
+                return true;
+            }
+            PluginJarInfo installed = installedPluginInfo(target);
+            if (installed != null && Boolean.TRUE.equals(installed.foliaSupported)) {
+                return true;
+            }
+            return installedPluginLooksFoliaCustomOrSnapshot(target, installed);
+        }
+
+        private boolean installedPluginLooksFoliaCustomOrSnapshot(TargetConfig target, PluginJarInfo installed) {
+            String text = lower(String.join(" ",
+                installed == null ? "" : firstNonBlank(installed.version, ""),
+                installed == null ? "" : firstNonBlank(installed.name, installed.id, ""),
+                firstNonBlank(target.detectedVersion, ""),
+                firstNonBlank(target.name, ""),
+                firstNonBlank(target.detectedPluginId, ""),
+                firstNonBlank(target.installAs, "")
+            ));
+            return text.contains("folia")
+                || text.contains("snapshot")
+                || text.matches(".*\\d+-[0-9a-f]{6,}.*")
+                || text.matches(".*\\+[0-9a-f]{6,}.*");
+        }
+
+        private List<DiscoveryCandidate> discoverPreferredGithubForkSources(TargetConfig target, int priority, boolean allowReleaseLookup) {
+            List<DiscoveryCandidate> candidates = new ArrayList<>();
+            Set<String> seen = new HashSet<>();
+            for (GithubRepo repo : preferredOwnerRepoCandidates(target)) {
+                if (isGithubPluginBudgetLimited(target)) {
+                    Log.warn("Preferred fork discovery deferred for " + target.displayName()
+                        + " because GitHub budget was limited before preferred-owner probes completed.");
+                    break;
+                }
+                String repoName = repo.owner + "/" + repo.name;
+                testDiscoveryTrace.add("preferred:" + repoName);
+                Optional<PluginJarInfo> descriptor = preferredGithubRawDescriptorMatch(target, repo);
+                if (descriptor.isEmpty()) {
+                    continue;
+                }
+                if (!preferredGithubForkDescriptorAcceptable(target, descriptor.get())) {
+                    continue;
+                }
+                if (!githubRepoSelectableForPreferredFork(target, repo, allowReleaseLookup)) {
+                    continue;
+                }
+                String source = githubSourceUrl(repo);
+                if (!seen.add(lower(source))) {
+                    continue;
+                }
+                rememberSourceProof(target, source, "github-source", repo, descriptor.get(), "preferred-owner-raw-descriptor-match");
+                candidates.add(candidateFromResolved(
+                    target,
+                    "github-source",
+                    source,
+                    repoName,
+                    firstNonBlank(descriptor.get().version, ""),
+                    repoName,
+                    Math.max(0, priority - 1),
+                    "preferred-owner GitHub repo descriptor match"
+                ));
+            }
+            return candidates;
+        }
+
+        private List<GithubRepo> preferredOwnerRepoCandidates(TargetConfig target) {
+            Map<String, GithubRepo> repos = new LinkedHashMap<>();
+            for (String owner : config.discovery.preferredOwners) {
+                String cleanOwner = cleanGithubPathPart(owner);
+                if (cleanOwner.isBlank()) {
+                    continue;
+                }
+                for (String repoName : preferredGithubRepoNames(target)) {
+                    addLikelyGithubRepo(repos, new GithubRepo(cleanOwner, repoName));
+                }
+            }
+            return new ArrayList<>(repos.values());
+        }
+
+        private List<String> preferredGithubRepoNames(TargetConfig target) {
+            List<String> bases = new ArrayList<>();
+            for (String value : Arrays.asList(
+                target.detectedPluginId,
+                target.name,
+                stripJarName(target.installAs),
+                cleanSearchTerm(target.detectedPluginId),
+                cleanSearchTerm(target.name),
+                cleanSearchTerm(stripJarName(target.installAs))
+            )) {
+                addPreferredGithubRepoRawBase(bases, value);
+                addPreferredGithubRepoBase(bases, value);
+                addAddonBaseRepoName(bases, value);
+            }
+            List<String> names = new ArrayList<>();
+            for (String base : bases) {
+                addPreferredGithubRepoName(names, base);
+                addPreferredGithubRepoName(names, base + "-Folia");
+                addPreferredGithubRepoName(names, base + "Folia");
+                String noSeparators = base.replaceAll("[_\\-\\s]+", "");
+                if (!noSeparators.equals(base)) {
+                    addPreferredGithubRepoName(names, noSeparators);
+                    addPreferredGithubRepoName(names, noSeparators + "-Folia");
+                    addPreferredGithubRepoName(names, noSeparators + "Folia");
+                }
+            }
+            return names.stream().limit(36).toList();
+        }
+
+        private void addPreferredGithubRepoBase(List<String> names, String value) {
+            String cleaned = cleanGithubPathPart(cleanSearchTerm(value));
+            if (cleaned.isBlank() || normalizeIdentity(cleaned).length() < 3) {
+                return;
+            }
+            addPreferredGithubRepoName(names, cleaned);
+        }
+
+        private void addPreferredGithubRepoRawBase(List<String> names, String value) {
+            String cleaned = cleanGithubPathPart(value);
+            if (cleaned.isBlank() || normalizeIdentity(cleaned).length() < 3) {
+                return;
+            }
+            addPreferredGithubRepoName(names, cleaned);
+        }
+
+        private void addPreferredGithubRepoName(List<String> names, String value) {
+            String cleaned = cleanGithubPathPart(value);
+            if (cleaned.isBlank()) {
+                return;
+            }
+            String normalized = normalizeIdentity(cleaned);
+            if (normalized.length() < 3
+                || normalized.equals("plugin")
+                || normalized.equals("minecraft")
+                || normalized.equals("bukkit")
+                || normalized.equals("paper")
+                || normalized.equals("spigot")
+                || normalized.equals("folia")) {
+                return;
+            }
+            if (names.stream().noneMatch(existing -> existing.equalsIgnoreCase(cleaned))) {
+                names.add(cleaned);
+            }
+        }
+
+        private Optional<PluginJarInfo> preferredGithubRawDescriptorMatch(TargetConfig target, GithubRepo repo) {
+            PluginJarInfo installed = installedPluginInfo(target);
+            for (String branch : likelyGithubBranches(target, repo)) {
+                GithubRepo branchRepo = branch.isBlank() ? new GithubRepo(repo.owner, repo.name) : new GithubRepo(repo.owner, repo.name, branch);
+                for (String path : preferredGithubDescriptorPaths(target, repo)) {
+                    try {
+                        Optional<String> text = fetchGithubRawOptional(branchRepo, path);
+                        if (text.isEmpty()) {
+                            continue;
+                        }
+                        PluginJarInfo info = parsePluginDescriptor(path, text.get());
+                        if (info.hasDescriptor && preferredGithubForkDescriptorMatches(installed, target, info)) {
+                            return Optional.of(info);
+                        }
+                    } catch (Exception ignored) {
+                        // Preferred-owner probes are cheap hints; keep trying bounded raw descriptor paths.
+                    }
+                }
+            }
+            return Optional.empty();
+        }
+
+        private List<String> preferredGithubDescriptorPaths(TargetConfig target, GithubRepo repo) {
+            List<String> paths = new ArrayList<>(List.of(
+                "plugin.yml",
+                "paper-plugin.yml",
+                "src/main/resources/plugin.yml",
+                "src/main/resources/paper-plugin.yml"
+            ));
+            for (String module : likelyGithubModuleNames(target, repo).stream().limit(8).toList()) {
+                paths.add(module + "/src/main/resources/plugin.yml");
+                paths.add(module + "/src/main/resources/paper-plugin.yml");
+            }
+            return paths.stream().distinct().limit(24).toList();
+        }
+
+        private boolean preferredGithubForkDescriptorMatches(PluginJarInfo installed, TargetConfig target, PluginJarInfo candidate) {
+            if (candidate == null || !candidate.hasDescriptor) {
+                return false;
+            }
+            Set<String> installedNames = new HashSet<>();
+            if (installed != null) {
+                installedNames.addAll(pluginIdentityValues(installed).stream().map(AutoUpdater::normalizeIdentity).toList());
+            }
+            installedNames.add(normalizeIdentity(firstNonBlank(target.detectedPluginId, "")));
+            installedNames.add(normalizeIdentity(firstNonBlank(target.name, "")));
+            installedNames.add(normalizeIdentity(jarIdentityHint(target.installAs)));
+            installedNames.remove("");
+
+            Set<String> candidateNames = pluginIdentityValues(candidate).stream()
+                .map(AutoUpdater::normalizeIdentity)
+                .filter(value -> !value.isBlank())
+                .collect(Collectors.toSet());
+            if (Collections.disjoint(installedNames, candidateNames)) {
+                return false;
+            }
+
+            String installedMain = installed == null ? "" : firstNonBlank(installed.mainClass, target.detectedMainClass);
+            return installedMain.isBlank()
+                || candidate.mainClass.isBlank()
+                || installedMain.equalsIgnoreCase(candidate.mainClass)
+                || packageSimilarityScore(installedMain, candidate.mainClass) > 0;
+        }
+
+        private boolean preferredGithubForkDescriptorAcceptable(TargetConfig target, PluginJarInfo candidate) {
+            if (!preferredGithubForkDescriptorMatches(installedPluginInfo(target), target, candidate)) {
+                return false;
+            }
+            if (inferPaperMcProject(config.server).equals("folia") && !Boolean.TRUE.equals(candidate.foliaSupported)) {
+                return false;
+            }
+            String localVersion = firstNonBlank(target.detectedVersion, installedPluginInfo(target) == null ? "" : installedPluginInfo(target).version);
+            return localVersion.isBlank()
+                || candidate.version.isBlank()
+                || comparePluginVersions(candidate.version, localVersion) != VersionOrder.OLDER;
+        }
+
+        private boolean githubRepoSelectableForPreferredFork(TargetConfig target, GithubRepo repo, boolean allowApiInspection) {
+            if (!allowApiInspection) {
+                Log.warn("Preferred fork discovery deferred for " + target.displayName()
+                    + " because GitHub API inspection is unavailable before checking " + repo.owner + "/" + repo.name + ".");
+                rememberDiscoveryDeferred(target, "preferred fork discovery deferred by GitHub budget", discoveryRetryAfter());
+                return false;
+            }
+            try {
+                URI uri = URI.create("https://api.github.com/repos/" + urlEncode(repo.owner) + "/" + urlEncode(repo.name));
+                Object json = getJson(uri, "GitHub preferred fork repo metadata", target);
+                Map<String, Object> root = asMap(json);
+                return !Boolean.TRUE.equals(root.get("archived")) && !Boolean.TRUE.equals(root.get("disabled"));
+            } catch (Exception ex) {
+                if (isGithubPluginBudgetLimited(target) || githubRateLimited || config.githubRateLimit.isPaused() || githubAuthFailed) {
+                    Log.warn("Preferred fork discovery deferred for " + target.displayName()
+                        + " because GitHub budget was limited before checking " + repo.owner + "/" + repo.name + ".");
+                    rememberDiscoveryDeferred(target, "preferred fork discovery deferred by GitHub budget", discoveryRetryAfter());
+                } else if (!isExpectedMissingGithubProbe(ex)) {
+                    Log.info("Preferred fork metadata check failed for " + repo.owner + "/" + repo.name
+                        + ": " + ex.getMessage());
+                }
+                return false;
+            }
+        }
+
         private List<DiscoveryCandidate> discoverGithubForkNeighborhood(TargetConfig target, GithubRepo upstreamRepo,
                                                                         int priority, boolean allowApiInspection) {
+            testDiscoveryTrace.add("forks:" + upstreamRepo.owner + "/" + upstreamRepo.name);
             if (!allowApiInspection || githubAuthFailed || githubRateLimited || config.githubRateLimit.isPaused()
                 || isGithubPluginBudgetLimited(target)) {
                 return Collections.emptyList();
@@ -5781,6 +6243,7 @@ public final class AutoUpdater {
             int score = 35 + match - (priority * 3);
             SourceOwnerSignal ownerSignal = sourceOwnerSignal(target.detectedAuthors, type, source, projectHint, label);
             SourceDescriptorEvidence descriptorEvidence = reason.contains("targeted GitHub repo descriptor match")
+                || reason.contains("preferred-owner GitHub repo descriptor match")
                 ? SourceDescriptorEvidence.MATCH
                 : (type.equals("modrinth") || type.equals("hangar"))
                     ? hostedJarDescriptorEvidence(target, type, source, projectHint, download)
@@ -6383,6 +6846,9 @@ public final class AutoUpdater {
             String branch = ref.isBlank() ? "HEAD" : ref;
             URI uri = URI.create("https://raw.githubusercontent.com/" + urlEncode(repo.owner) + "/" + urlEncode(repo.name)
                 + "/" + encodePath(branch) + "/" + encodePath(path));
+            if (testGithubRawResponses.containsKey(uri.toString())) {
+                return Optional.ofNullable(testGithubRawResponses.get(uri.toString()));
+            }
             HttpRequest.Builder builder = HttpRequest.newBuilder(uri)
                 .timeout(DISCOVERY_RAW_TIMEOUT)
                 .header("User-Agent", config.userAgent);
@@ -6423,6 +6889,9 @@ public final class AutoUpdater {
         }
 
         private Object getJson(URI uri, String apiName, TargetConfig budgetTarget) throws Exception {
+            if (testJsonResponses.containsKey(uri.toString())) {
+                return testJsonResponses.get(uri.toString());
+            }
             boolean githubApi = isGithubApiUri(uri);
             if (githubApi) {
                 Optional<String> fresh = readGithubApiCache(config, uri, GITHUB_CACHE_FRESH);
@@ -7072,8 +7541,21 @@ public final class AutoUpdater {
             sources.addAll(target.fallbackSources);
             Exception last = null;
             Set<String> attemptedSources = new HashSet<>();
-            List<HostedCandidate> hostedCandidates = resolveFreshestHostedCandidates(target, sources);
             boolean gitBuildAttempted = false;
+            if (shouldBuildExplicitPrimarySourceFirst(target)) {
+                attemptedSources.add(canonicalSourceMatchKey(target.source));
+                gitBuildAttempted = true;
+                try {
+                    Log.info("Decision for " + target.displayName()
+                        + ": primary source is explicitly configured as " + lower(target.type) + ", so building it before hosted fallbacks.");
+                    return updateOneFromSource(target);
+                } catch (Exception ex) {
+                    last = ex;
+                    Log.warn("Primary Git source failed for " + target.displayName()
+                        + "; trying configured fallback source(s): " + safeExceptionMessage(ex));
+                }
+            }
+            List<HostedCandidate> hostedCandidates = resolveFreshestHostedCandidates(target, sources);
             if (!hostedCandidates.isEmpty()) {
                 Optional<Instant> latestCommit = latestGitHubCommitTime(target);
                 for (int i = 0; i < hostedCandidates.size(); i++) {
@@ -7135,6 +7617,14 @@ public final class AutoUpdater {
                 return Optional.empty();
             }
             throw last == null ? new IOException("No source configured for " + target.displayName()) : last;
+        }
+
+        private boolean shouldBuildExplicitPrimarySourceFirst(TargetConfig target) {
+            if (target == null || target.server || isMissingSourceValue(target.source)) {
+                return false;
+            }
+            String type = lower(firstNonBlank(target.type, ""));
+            return (type.equals("github-source") || type.equals("git")) && canBuildFromSource(target);
         }
 
         private boolean shouldTrySourceBuildFallback(TargetConfig target, List<String> triedSources) {
@@ -7210,9 +7700,17 @@ public final class AutoUpdater {
         }
 
         private TargetConfig sourceBuildTarget(TargetConfig target) {
-            TargetConfig copy = target.copyWithSource(firstNonBlank(target.githubRepo, target.source, ""));
+            TargetConfig copy = target.copyWithSource(sourceBuildSource(target));
             copy.type = "github-source";
             return copy;
+        }
+
+        private String sourceBuildSource(TargetConfig target) {
+            String source = firstNonBlank(target.source, "");
+            if (!githubRepoHintFromText(source).isBlank()) {
+                return source;
+            }
+            return firstNonBlank(target.githubRepo, target.project, source, "");
         }
 
         private boolean shouldBuildFromNewerGitSource(TargetConfig target, HostedCandidate hosted, Optional<Instant> latestCommit) {
@@ -7373,7 +7871,20 @@ public final class AutoUpdater {
         }
 
         private String gitRepoHint(TargetConfig target) {
-            String value = firstNonBlank(target.githubRepo, target.project, target.source, "");
+            String source = firstNonBlank(target.source, "");
+            String sourceRepo = githubRepoHintFromText(source);
+            if (!sourceRepo.isBlank()) {
+                return sourceRepo;
+            }
+            String configuredType = lower(firstNonBlank(target.type, ""));
+            if (isExplicitNonGithubUrl(source) && !configuredType.equals("github-source") && !configuredType.equals("git")) {
+                return "";
+            }
+            return githubRepoHintFromText(firstNonBlank(target.githubRepo, target.project, ""));
+        }
+
+        private String githubRepoHintFromText(String value) {
+            value = firstNonBlank(value, "");
             if (value.contains("github.com/")) {
                 try {
                     GithubRepo repo = repoFromGithubUrl(value);
@@ -7386,6 +7897,11 @@ public final class AutoUpdater {
                 return value.replace(".git", "");
             }
             return "";
+        }
+
+        private boolean isExplicitNonGithubUrl(String source) {
+            String value = lower(firstNonBlank(source, ""));
+            return (value.startsWith("http://") || value.startsWith("https://")) && !value.contains("github.com/");
         }
 
         private Optional<InstalledUpdate> updateOneFromSource(TargetConfig target) throws Exception {
@@ -7455,7 +7971,8 @@ public final class AutoUpdater {
             } catch (Exception ignored) {
                 // The jar already passed validation; keep the resolver version if rereading metadata fails.
             }
-            return Optional.of(new InstalledUpdate(target, targetPath, backupPath, target.source, installedVersion, newHash, previousServerLock));
+            return Optional.of(new InstalledUpdate(target, targetPath, backupPath, target.source, installedVersion, newHash,
+                download.project, download.gameVersion, download.build, previousServerLock));
         }
 
         private ServerLockSnapshot currentServerLockSnapshot() {
@@ -7501,11 +8018,17 @@ public final class AutoUpdater {
             if (config.validation.rejectWrongPlatform
                 && actualServerProject.equals("folia")
                 && (incoming.descriptorTypes.contains("paper") || incoming.descriptorTypes.contains("bukkit"))
-                && current != null
-                && Boolean.TRUE.equals(current.foliaSupported)
                 && !Boolean.TRUE.equals(incoming.foliaSupported)) {
-                throw new IOException("Downloaded jar for " + target.displayName()
-                    + " would downgrade Folia support; installed jar is marked Folia-compatible but the candidate is not");
+                if (current != null && Boolean.TRUE.equals(current.foliaSupported)) {
+                    throw new IOException("Downloaded jar for " + target.displayName()
+                        + " would downgrade Folia support; installed jar is marked Folia-compatible but the candidate is not");
+                }
+                if (!isManualConfiguredSource(target)) {
+                    throw new IOException("Downloaded jar for " + target.displayName()
+                        + " does not prove Folia support; auto-discovered Folia updates require folia-supported: true");
+                }
+                Log.warn("Downloaded jar for " + target.displayName()
+                    + " does not declare Folia support; allowing it because the source is manually configured.");
             }
 
             if (config.validation.rejectOnPluginNameMismatch && current != null && current.hasDescriptor) {
@@ -7553,9 +8076,24 @@ public final class AutoUpdater {
         }
 
         private int validationMinimum(TargetConfig target, SourcePlan plan) {
-            boolean trusted = !target.autoDiscovered && !target.sourceDiscoveredThisRun
+            boolean trusted = sourceOriginAllowsTrustedValidation(target)
                 && (isTrustedHostedSource(target, plan) || !target.fallbackSources.contains(target.source));
             return trusted ? config.validation.minTrustedSourceScore : config.validation.minAutoInstallScore;
+        }
+
+        private boolean sourceOriginAllowsTrustedValidation(TargetConfig target) {
+            if (target == null || target.autoDiscovered || target.sourceDiscoveredThisRun) {
+                return false;
+            }
+            String origin = lower(firstNonBlank(target.sourceOrigin, ""));
+            if (origin.isBlank() || origin.equals(SOURCE_ORIGIN_MANUAL)) {
+                return true;
+            }
+            if (origin.equals(SOURCE_ORIGIN_DISCOVERED)) {
+                Optional<SourceProof> proof = lockState.activeSourceProof(target);
+                return proof.isPresent() && sourcesMatchLoosely(proof.get().source, target.source);
+            }
+            return false;
         }
 
         private String pluginFingerprintMismatchReason(TargetConfig target, PluginJarInfo current,
@@ -7595,7 +8133,7 @@ public final class AutoUpdater {
                 String repo = gitRepoHint(target);
                 return !repo.isBlank() && isTrustedGithubRepo(repo);
             }
-            return !target.sourceDiscoveredThisRun && !target.autoDiscovered && target.source != null && !target.source.isBlank();
+            return sourceOriginAllowsTrustedValidation(target) && target.source != null && !target.source.isBlank();
         }
 
         private int validationScore(TargetConfig target, PluginJarInfo current, PluginJarInfo incoming, ResolvedDownload download) {
@@ -7759,15 +8297,24 @@ public final class AutoUpdater {
             try {
                 LockState lock = LockState.read(config);
                 int remembered = 0;
+                int rememberedServers = 0;
                 for (InstalledUpdate update : updates) {
-                    if (update != null && !update.target.server) {
+                    if (update != null && update.target.server) {
+                        lock.rememberBadServerBuild(update, reason);
+                        rememberedServers++;
+                    } else if (update != null) {
                         lock.rememberBadPlugin(update, reason);
                         remembered++;
                     }
                 }
-                if (remembered > 0) {
+                if (remembered > 0 || rememberedServers > 0) {
                     lock.write(config);
-                    Log.warn("Remembered " + remembered + " known-bad plugin update" + (remembered == 1 ? "" : "s") + " in updater.lock.yml.");
+                    if (remembered > 0) {
+                        Log.warn("Remembered " + remembered + " known-bad plugin update" + (remembered == 1 ? "" : "s") + " in updater.lock.yml.");
+                    }
+                    if (rememberedServers > 0) {
+                        Log.warn("Remembered " + rememberedServers + " known-bad server build" + (rememberedServers == 1 ? "" : "s") + " in updater.lock.yml.");
+                    }
                 }
             } catch (IOException ex) {
                 Log.warn("Could not write failure memory to updater.lock.yml: " + ex.getMessage());
@@ -7899,7 +8446,7 @@ public final class AutoUpdater {
             if (target.type != null && lower(target.type).equals("github-source")) {
                 return "github-source";
             }
-            if (lowerSource.contains("github.com/") || (target.githubRepo != null && !target.githubRepo.isBlank())) {
+            if (lowerSource.contains("github.com/")) {
                 return "github-release";
             }
             if (lowerSource.contains("download.geysermc.org/v2/")) {
@@ -7907,6 +8454,9 @@ public final class AutoUpdater {
             }
             if (lowerSource.startsWith("http://") || lowerSource.startsWith("https://")) {
                 return "direct";
+            }
+            if (target.githubRepo != null && !target.githubRepo.isBlank()) {
+                return "github-release";
             }
             if (target.server && (target.project != null || lower(target.displayName()).contains("velocity"))) {
                 return "papermc";
@@ -11155,10 +11705,8 @@ public final class AutoUpdater {
             String configuredVersion = lower(target.gameVersion).equals("auto") ? "" : firstNonBlank(target.gameVersion, "");
             String lockVersion = readLockValue(config, "serverGameVersion");
             String lockProject = readLockValue(config, "serverProject");
-            String lockBuild = readLockValue(config, "serverBuild");
             if (!lockProject.isBlank() && !lockProject.equalsIgnoreCase(project)) {
                 lockVersion = "";
-                lockBuild = "";
             }
             String lockedVersion = allowVersionChange ? "" : firstNonBlank(configuredVersion, lockVersion, "");
             if (!allowVersionChange && lockedVersion.isBlank()) {
@@ -11166,7 +11714,7 @@ public final class AutoUpdater {
             }
             if (!lockedVersion.isBlank()) {
                 Log.info("Using locked/configured " + project + " version: " + lockedVersion);
-                Optional<ResolvedDownload> download = loadBuild(project, lockedVersion, target, lockBuild);
+                Optional<ResolvedDownload> download = loadBuild(project, lockedVersion, target, firstNonBlank(target.pinBuild, ""));
                 if (download.isPresent()) {
                     return download.get();
                 }
@@ -11181,7 +11729,7 @@ public final class AutoUpdater {
             int attempts = Math.min(versions.size(), 15);
             for (int i = 0; i < attempts; i++) {
                 String version = versions.get(i);
-                Optional<ResolvedDownload> resolved = loadBuild(project, version, target, "");
+                Optional<ResolvedDownload> resolved = loadBuild(project, version, target, firstNonBlank(target.pinBuild, ""));
                 if (resolved.isPresent()) {
                     return resolved.get();
                 }
@@ -11220,7 +11768,7 @@ public final class AutoUpdater {
             return result;
         }
 
-        private Optional<ResolvedDownload> loadBuild(String project, String version, TargetConfig target, String preferredBuild) throws Exception {
+        private Optional<ResolvedDownload> loadBuild(String project, String version, TargetConfig target, String pinnedBuild) throws Exception {
             URI uri = URI.create("https://fill.papermc.io/v3/projects/" + project + "/versions/" + version + "/builds");
             Object json = getJson(uri);
             if (!(json instanceof List<?> builds) || builds.isEmpty()) {
@@ -11231,19 +11779,30 @@ public final class AutoUpdater {
             for (Object build : builds) {
                 maps.add(asMap(build));
             }
+            maps.sort(this::compareBuildsNewestFirst);
+            return selectBuild(project, version, target, pinnedBuild, maps);
+        }
 
-            String lockedBuild = firstNonBlank(preferredBuild, "");
-            if (!lockedBuild.isBlank()) {
+        private Optional<ResolvedDownload> selectBuild(String project, String version, TargetConfig target,
+                                                       String pinnedBuild, List<Map<String, Object>> maps) {
+            String explicitBuild = firstNonBlank(pinnedBuild, "");
+            if (!explicitBuild.isBlank()) {
                 for (Map<String, Object> build : maps) {
-                    if (lockedBuild.equalsIgnoreCase(buildNumber(build))) {
+                    if (explicitBuild.equalsIgnoreCase(buildNumber(build))) {
+                        if (isKnownBadServerBuild(project, version, buildNumber(build))) {
+                            Log.warn("Pinned " + project + " build " + explicitBuild
+                                + " is remembered as known-bad; refusing to reinstall it until failureMemory.retryBadAfter allows retry.");
+                            return Optional.empty();
+                        }
                         Optional<ResolvedDownload> download = downloadFromBuild(project, version, build);
                         if (download.isPresent()) {
-                            Log.info("Using locked " + project + " build: " + lockedBuild);
+                            Log.info("Using pinned " + project + " build: " + explicitBuild);
                             return download;
                         }
                     }
                 }
-                Log.warn("Locked " + project + " build " + lockedBuild + " was not downloadable; falling back to latest compatible build for " + version + ".");
+                Log.warn("Pinned " + project + " build " + explicitBuild + " was not downloadable.");
+                return Optional.empty();
             }
 
             List<String> channels = preferredChannels(target);
@@ -11251,6 +11810,9 @@ public final class AutoUpdater {
                 for (Map<String, Object> build : maps) {
                     String buildChannel = stringValue(build.get("channel"));
                     if (channel.equalsIgnoreCase(buildChannel)) {
+                        if (isKnownBadServerBuild(project, version, buildNumber(build))) {
+                            continue;
+                        }
                         Optional<ResolvedDownload> download = downloadFromBuild(project, version, build);
                         if (download.isPresent()) {
                             return download;
@@ -11260,6 +11822,9 @@ public final class AutoUpdater {
             }
 
             for (Map<String, Object> build : maps) {
+                if (isKnownBadServerBuild(project, version, buildNumber(build))) {
+                    continue;
+                }
                 Optional<ResolvedDownload> download = downloadFromBuild(project, version, build);
                 if (download.isPresent()) {
                     return download;
@@ -11318,6 +11883,22 @@ public final class AutoUpdater {
 
         private String buildNumber(Map<String, Object> build) {
             return firstNonBlank(stringValue(build.get("number")), stringValue(build.get("id")), "?");
+        }
+
+        private boolean isKnownBadServerBuild(String project, String version, String build) {
+            Optional<BadServerBuild> bad = LockState.read(config).activeBadServerBuild(config, project, version, build);
+            bad.ifPresent(value -> Log.warn("Skipping known-bad " + project + " " + version + " build " + build + "."));
+            return bad.isPresent();
+        }
+
+        private int compareBuildsNewestFirst(Map<String, Object> left, Map<String, Object> right) {
+            String a = buildNumber(left);
+            String b = buildNumber(right);
+            try {
+                return Long.compare(Long.parseLong(b), Long.parseLong(a));
+            } catch (NumberFormatException ignored) {
+                return compareVersionsNewestFirst(a, b);
+            }
         }
 
         private Object getJson(URI uri) throws Exception {
@@ -12058,6 +12639,7 @@ public final class AutoUpdater {
         if (config == null || client == null || uri == null || !lower(uri.getHost()).equals("api.github.com")) {
             return Optional.empty();
         }
+
         if (!githubTokenStatus(config).hasToken() || config.githubTokenDisabled) {
             return Optional.empty();
         }
@@ -13694,4 +14276,3 @@ public final class AutoUpdater {
     }
 
 }
-

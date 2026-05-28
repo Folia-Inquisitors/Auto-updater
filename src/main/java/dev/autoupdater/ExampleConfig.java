@@ -32,6 +32,11 @@ final class ExampleConfig {
               autoSwitchSource: true
               saveDiscoveredSources: true
               scanInstalledPlugins: true
+              # Optional search hints for Folia/custom fork ecosystems. The generic
+              # updater defaults this list to empty; uncomment example owners if wanted.
+              # preferredOwners:
+              #   - Folia-Inquisitors
+              #   - Inquisitors-transfers
 
             buildFromSource:
               enabled: auto
@@ -66,6 +71,7 @@ final class ExampleConfig {
               installAs: auto
               gameVersion: auto
               changeVersion: false
+              pinBuild: ""
               java: java
               javaArgs: "-Xms16G -Xmx32G"
               args: ""
@@ -129,6 +135,11 @@ final class ExampleConfig {
             # Config Notes
             # ---------------------------------------------------------------------------
             #
+            # Boolean values
+            #   Boolean config fields are strict. Use true/false, yes/no, on/off, or 1/0.
+            #   Typos such as ture or flase stop parsing instead of silently disabling
+            #   important safety settings.
+            #
             # mode
             #   hosted-safe:
             #     Recommended for hosted panels and normal servers.
@@ -175,7 +186,10 @@ final class ExampleConfig {
             #   GitHub core/search limits without printing the token itself.
             #
             # discovery.enabled
-            #   Turns discovery reporting on or off.
+            #   Turns normal-run discovery side effects on or off. When false,
+            #   check/update/run will not auto-add installed plugin jars, auto-switch
+            #   missing sources, rewrite stale discovered sources, or refresh source
+            #   proofs. The explicit discover command can still run discovery.
             #
             # discovery.mode
             #   suggest:
@@ -189,6 +203,14 @@ final class ExampleConfig {
             #   Spigot/Spiget is intentionally unsupported because its metadata is too
             #   weak for reliable authorship, jar identity, and Folia compatibility checks.
             #
+            # discovery.preferredOwners
+            #   Optional GitHub owners to probe before broad GitHub search when a Folia
+            #   server has a missing, weak, non-Folia, downgradey, or custom-looking source.
+            #   Preferred owners are search hints only. They do not override manual sources
+            #   and do not bypass descriptor validation, Folia proof, or downgrade checks.
+            #   Folia-Inquisitors and Inquisitors-transfers are examples for servers that
+            #   intentionally use those fork ecosystems.
+            #
             # discovery.checkAlternateSourcesWhenOutdated
             #   If true, discovery compares version strings where APIs expose them and
             #   rejects sources that look clearly older than the installed plugin jar.
@@ -201,6 +223,8 @@ final class ExampleConfig {
             #   automatically for that run, with other strong matches added as fallbacks.
             #   Existing unsupported Spigot primaries are moved to a better proven source
             #   or marked Not Found.
+            #   Known stale discovered-source corrections also require this to be true;
+            #   when false, discover mode reports/audits without replacing sources.
             #
             # discovery.saveDiscoveredSources
             #   If true, auto-switched plugin sources are written back into this config.
@@ -214,6 +238,7 @@ final class ExampleConfig {
             #   It can fill name, installAs, platform, and required.
             #   It also searches GitHub, Hangar, and Modrinth for likely update
             #   sources, then prints the best YAML entry it can safely suggest.
+            #   This setting is part of discovery.enabled during normal runs.
             #
             # buildFromSource.enabled
             #   false:
@@ -272,6 +297,9 @@ final class ExampleConfig {
             #   install a Velocity/Fabric/NeoForge jar into a Folia/Paper plugins folder.
             #   On Folia, it also prevents downgrading support: if the installed jar has
             #   folia-supported: true, a replacement jar must keep that flag.
+            #   Auto-discovered Folia plugin updates must also declare folia-supported:
+            #   true. Manual sources may install generic Paper/Bukkit jars, but the updater
+            #   logs a warning because Folia support is not proven.
             #
             # duplicates.enabled
             #   If true, Auto-Updater scans the plugins folder before startup, and also
@@ -318,9 +346,17 @@ final class ExampleConfig {
             #
             # server.changeVersion
             #   false:
-            #     Recommended. Stay on the configured or locked gameVersion.
+            #     Recommended. Stay on the configured or locked gameVersion, while
+            #     still allowing newer PaperMC builds inside that same gameVersion.
             #   true:
             #     Allow the server jar to jump to the newest available version.
+            #
+            # server.pinBuild
+            #   Optional PaperMC build pin. Leave blank for normal behavior, where
+            #   updater.lock.yml remembers the last installed build for rollback but
+            #   does not freeze future builds within the locked gameVersion.
+            #   Set a build number only when you intentionally want to stay on that
+            #   exact Paper/Folia/Velocity build.
             #
             # server.java
             #   Java command used to launch the server. Usually java.
@@ -342,11 +378,25 @@ final class ExampleConfig {
             #   Modrinth example: https://modrinth.com/plugin/fancyholograms/versions
             #   Direct jar example: https://example.com/MyPlugin.jar
             #
+            # plugins[].sourceOrigin
+            #   manual:
+            #     User-owned source. The updater protects it from automatic source rewrites.
+            #   discovered:
+            #     Machine-selected source with an active matching sourceProof in updater.lock.yml.
+            #   discovered-unverified:
+            #     Machine-selected source without descriptor proof. It stays machine-owned and
+            #     uses auto/discovered validation thresholds after reload.
+            #   unresolved:
+            #     Discovery has not found a reliable source yet.
+            #
             # plugins[].type
             #   auto:
             #     Recommended. Detects the source type from the URL.
             #   github-release:
             #     Download the newest release jar from a GitHub repository.
+            #   github-source:
+            #     Build the configured GitHub repository first. fallbackSources are used
+            #     only if that primary source build fails or is skipped as known-bad.
             #   hangar:
             #     Download from Hangar.
             #   modrinth:

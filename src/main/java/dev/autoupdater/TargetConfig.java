@@ -20,6 +20,7 @@ final class TargetConfig {
     String versionType;
     Boolean changeVersion;
     String channel;
+    String pinBuild;
     String installAs;
     String java = "java";
     String javaArgs = "";
@@ -62,6 +63,7 @@ final class TargetConfig {
         copy.versionType = versionType;
         copy.changeVersion = changeVersion;
         copy.channel = channel;
+        copy.pinBuild = pinBuild;
         copy.installAs = installAs;
         copy.java = java;
         copy.javaArgs = javaArgs;

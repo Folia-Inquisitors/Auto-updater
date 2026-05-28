@@ -12,5 +12,8 @@ public final class RegressionTestSuite {
         UnverifiedDiscoveredSourceRegressionTest.main(args);
         StartupRollbackPolicyRegressionTest.main(args);
         Utf8BomConfigRegressionTest.main(args);
+        ThirdInvariantPatchRegressionTest.main(args);
+        ParserPolicyRegressionTest.main(args);
+        PreferredForkDiscoveryRegressionTest.main(args);
     }
 }
