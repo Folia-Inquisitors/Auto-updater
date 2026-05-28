@@ -27,6 +27,7 @@ public final class PreferredForkDiscoveryRegressionTest {
         preferredForkUsesExistingNestedDescriptorPaths();
         preferredForkUsesSupportedVelocityDescriptorPath();
         preferredForkLineageEnrichesSelectedSourceProof();
+        repoHealthUnavailableDefersPreferredForkSelection();
         lineageUnavailableDoesNotRejectOtherwiseValidPreferredFork();
         preferredOwnerForkLineageDoesNotOverrideMismatch();
         preferredProbeRunsBeforeForkSearch();
@@ -221,6 +222,29 @@ public final class PreferredForkDiscoveryRegressionTest {
             "selected preferred fork proof did not retain upstreamRepo lineage");
     }
 
+    private static void repoHealthUnavailableDefersPreferredForkSelection() throws Exception {
+        Path temp = Files.createTempDirectory("autoupdater-preferred-health-unavailable");
+        writePluginJar(temp.resolve("plugins/DemoPlugin.jar"), "DemoPlugin", "2.0.0", "com.example.demo.DemoPlugin", true);
+        Object config = preferredForkConfig(temp);
+        Object budget = getField(config, "githubBudget");
+        setField(budget, "coreUsed", 28);
+        Object updater = newInstance("dev.autoupdater.AutoUpdater$Updater", config);
+        TargetConfig target = target("DemoPlugin", temp);
+        target.source = "Not Found";
+        addRaw(updater, "Folia-Inquisitors", "DemoPlugin", "plugin.yml",
+            descriptor("DemoPlugin", "2.1.0", "com.example.demo.DemoPlugin", true));
+
+        @SuppressWarnings("unchecked")
+        List<Object> candidates = (List<Object>) invoke(updater, "discoverTargetedGithubSources",
+            new Class<?>[] { TargetConfig.class, int.class, boolean.class }, target, 0, true);
+        @SuppressWarnings("unchecked")
+        java.util.Set<String> deferred = (java.util.Set<String>) getField(updater, "discoveryDeferred");
+        require(candidates.isEmpty(), "preferred fork was selected even though repo health metadata was unavailable");
+        require(deferred.stream().anyMatch(item -> item.contains("preferred fork discovery deferred")
+                || item.contains("GitHub API budget reached")),
+            "preferred fork repo-health deferral was not recorded");
+    }
+
     private static void lineageUnavailableDoesNotRejectOtherwiseValidPreferredFork() throws Exception {
         Path temp = Files.createTempDirectory("autoupdater-preferred-lineage-unavailable");
         writePluginJar(temp.resolve("plugins/DemoPlugin.jar"), "DemoPlugin", "2.0.0", "com.example.demo.DemoPlugin", true);
@@ -240,6 +264,11 @@ public final class PreferredForkDiscoveryRegressionTest {
         List<Object> discovered = (List<Object>) invoke(updater, "discoverTargetedGithubSources",
             new Class<?>[] { TargetConfig.class, int.class, boolean.class }, target, 0, true);
         require(!discovered.isEmpty(), "lineage unavailability rejected an otherwise valid preferred fork");
+        invoke(updater, "applyDiscoveredSource", new Class<?>[] { TargetConfig.class, List.class }, target, discovered);
+        String lock = Files.readString(temp.resolve("updater.lock.yml"), StandardCharsets.UTF_8);
+        require(lock.contains("source: https://github.com/Folia-Inquisitors/DemoPlugin"),
+            "lineage-unavailable proof does not point to selected preferred fork");
+        require(!lock.contains("forkRepo:"), "lineage-unavailable proof unexpectedly recorded fork lineage");
     }
 
     private static void preferredOwnerForkLineageDoesNotOverrideMismatch() throws Exception {
@@ -260,26 +289,7 @@ public final class PreferredForkDiscoveryRegressionTest {
     }
 
     private static void githubBudgetDefersPreferredForkDiscovery() throws Exception {
-        Path temp = Files.createTempDirectory("autoupdater-preferred-budget");
-        writePluginJar(temp.resolve("plugins/DemoPlugin.jar"), "DemoPlugin", "2.0.0", "com.example.demo.DemoPlugin", true);
-        Object config = preferredForkConfig(temp);
-        Object budget = getField(config, "githubBudget");
-        setField(budget, "coreUsed", 28);
-        Object updater = newInstance("dev.autoupdater.AutoUpdater$Updater", config);
-        TargetConfig target = target("DemoPlugin", temp);
-        target.source = "Not Found";
-        addRaw(updater, "Folia-Inquisitors", "DemoPlugin", "plugin.yml",
-            descriptor("DemoPlugin", "2.1.0", "com.example.demo.DemoPlugin", true));
-
-        @SuppressWarnings("unchecked")
-        List<Object> candidates = (List<Object>) invoke(updater, "discoverTargetedGithubSources",
-            new Class<?>[] { TargetConfig.class, int.class, boolean.class }, target, 0, true);
-        @SuppressWarnings("unchecked")
-        java.util.Set<String> deferred = (java.util.Set<String>) getField(updater, "discoveryDeferred");
-        require(candidates.isEmpty(), "preferred fork was selected despite exhausted GitHub budget");
-        require(deferred.stream().anyMatch(item -> item.contains("preferred fork discovery deferred")
-                || item.contains("GitHub API budget reached")),
-            "preferred fork budget deferral was not recorded");
+        repoHealthUnavailableDefersPreferredForkSelection();
     }
 
     private static void preferredOwnersParseFromYamlList() throws Exception {

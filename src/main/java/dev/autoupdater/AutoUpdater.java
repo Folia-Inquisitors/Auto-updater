@@ -5259,7 +5259,6 @@ public final class AutoUpdater {
                     continue;
                 }
                 rememberSourceProof(target, source, "github-source", repo, descriptor.get(), "preferred-owner-raw-descriptor-match");
-                enrichPreferredForkSourceProof(target, source, repo);
                 candidates.add(candidateFromResolved(
                     target,
                     "github-source",
@@ -5438,24 +5437,6 @@ public final class AutoUpdater {
                         + ": " + ex.getMessage());
                 }
                 return false;
-            }
-        }
-
-        private void enrichPreferredForkSourceProof(TargetConfig target, String source, GithubRepo repo) {
-            try {
-                ForkLineage lineage = githubForkLineage(repo, target);
-                if (lineage.isFork()) {
-                    enrichSourceProof(target, source, lineage,
-                        "preferred-owner fork lineage; " + firstNonBlank(lineage.describe(), repo.owner + "/" + repo.name));
-                }
-            } catch (Exception ex) {
-                if (isGithubPluginBudgetLimited(target) || githubRateLimited || config.githubRateLimit.isPaused() || githubAuthFailed) {
-                    Log.info("Preferred fork lineage enrichment skipped for " + target.displayName()
-                        + " because GitHub budget or rate limits prevented checking " + repo.owner + "/" + repo.name + ".");
-                } else if (!isExpectedMissingGithubProbe(ex)) {
-                    Log.info("Preferred fork lineage check failed for " + repo.owner + "/" + repo.name
-                        + ": " + ex.getMessage());
-                }
             }
         }
 
