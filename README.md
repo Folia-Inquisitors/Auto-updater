@@ -110,6 +110,7 @@ restart:
   interval: 7d
   stopCommand: stop
   gracefulStopSeconds: 60
+  startupRollbackPolicy: rollbackBatch
   warnings:
     - before: 2h
       command: "say Server restart in 2 hours for updates."

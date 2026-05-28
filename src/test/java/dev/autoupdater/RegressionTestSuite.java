@@ -1,0 +1,16 @@
+package dev.autoupdater;
+
+public final class RegressionTestSuite {
+    private RegressionTestSuite() {
+    }
+
+    public static void main(String[] args) throws Exception {
+        DiscoveryProofFlowRegressionTest.main(args);
+        ServerRollbackLockRegressionTest.main(args);
+        HostedFallbackGitFreshnessRegressionTest.main(args);
+        SourceOriginCleanupPersistenceRegressionTest.main(args);
+        UnverifiedDiscoveredSourceRegressionTest.main(args);
+        StartupRollbackPolicyRegressionTest.main(args);
+        Utf8BomConfigRegressionTest.main(args);
+    }
+}
