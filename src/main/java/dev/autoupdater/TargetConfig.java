@@ -26,6 +26,7 @@ final class TargetConfig {
     String javaArgs = "";
     String args = "";
     boolean autoDiscovered;
+    boolean prunedMissingThisRun;
     String detectedPluginId;
     String detectedVersion;
     String detectedWebsite;
@@ -34,6 +35,7 @@ final class TargetConfig {
     String sourceOrigin;
     boolean sourceOriginUpdatedThisRun;
     boolean sourceDiscoveredThisRun;
+    boolean manualCatalogUpdatedThisRun;
 
     TargetConfig(String name, boolean server) {
         this.name = name;
@@ -69,6 +71,7 @@ final class TargetConfig {
         copy.javaArgs = javaArgs;
         copy.args = args;
         copy.autoDiscovered = autoDiscovered;
+        copy.prunedMissingThisRun = prunedMissingThisRun;
         copy.detectedPluginId = detectedPluginId;
         copy.detectedVersion = detectedVersion;
         copy.detectedWebsite = detectedWebsite;
@@ -77,6 +80,7 @@ final class TargetConfig {
         copy.sourceOrigin = sourceOrigin;
         copy.sourceOriginUpdatedThisRun = sourceOriginUpdatedThisRun;
         copy.sourceDiscoveredThisRun = sourceDiscoveredThisRun;
+        copy.manualCatalogUpdatedThisRun = manualCatalogUpdatedThisRun;
         return copy;
     }
 }

@@ -32,6 +32,7 @@ import java.util.Comparator;
 import java.util.Enumeration;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -136,12 +137,15 @@ public final class AutoUpdater {
         switch (cli.command) {
             case "check":
                 updater.printPlan();
+                updater.pathTraceEnd("check", "plan printed");
                 return 0;
             case "discover":
                 updater.discover();
+                updater.pathTraceEnd("discover", "discovery command complete");
                 return 0;
             case "update":
-                updater.updateAll();
+                List<InstalledUpdate> updateOnly = updater.updateAll();
+                updater.pathTraceEnd("update", "installedUpdates=" + updateOnly.size());
                 return 0;
             case "run":
                 List<InstalledUpdate> startupUpdates = updater.updateAll();
@@ -229,6 +233,9 @@ public final class AutoUpdater {
         Path diagnosticsFile = Paths.get("updater.diagnostics.log");
         TargetConfig server = new TargetConfig(null, true);
         List<TargetConfig> plugins = new ArrayList<>();
+        List<TargetConfig> prunedMissingPlugins = new ArrayList<>();
+        List<String> newPluginLinks = new ArrayList<>();
+        List<String> consumedNewPluginLinks = new ArrayList<>();
         DiscoveryConfig discovery = new DiscoveryConfig();
         BuildFromSourceConfig buildFromSource = new BuildFromSourceConfig();
         FailureMemoryConfig failureMemory = new FailureMemoryConfig();
@@ -260,6 +267,7 @@ public final class AutoUpdater {
                 Log.warn("No server.source configured. The updater will only launch the existing " + server.installAs + ".");
             }
             autoAddInstalledPlugins();
+            processNewPluginLinks();
             for (TargetConfig plugin : plugins) {
                 if (plugin.changeVersion == null) {
                     plugin.changeVersion = true;
@@ -273,6 +281,7 @@ public final class AutoUpdater {
                 }
                 enrichPluginFromInstalledJar(plugin);
             }
+            pruneMissingInstalledPluginEntries();
             restart.warnings.sort(Comparator.comparing((RestartWarning w) -> w.before).reversed());
             String rollbackPolicy = lower(restart.startupRollbackPolicy);
             if (!rollbackPolicy.equals("rollbackbatch") && !rollbackPolicy.equals("rollbackmatchedonly")) {
@@ -399,6 +408,44 @@ public final class AutoUpdater {
             }
         }
 
+        private void pruneMissingInstalledPluginEntries() {
+            if (!discovery.enabled || !discovery.scanInstalledPlugins || !discovery.pruneMissingInstalledPlugins) {
+                return;
+            }
+            if (!Files.isDirectory(resolve(Paths.get("plugins")))) {
+                return;
+            }
+            Iterator<TargetConfig> iterator = plugins.iterator();
+            while (iterator.hasNext()) {
+                TargetConfig plugin = iterator.next();
+                if (!shouldPruneMissingInstalledPlugin(plugin)) {
+                    continue;
+                }
+                plugin.prunedMissingThisRun = true;
+                prunedMissingPlugins.add(plugin);
+                iterator.remove();
+                Log.info("Removed missing auto-managed plugin entry from active config: "
+                    + plugin.displayName() + " -> " + plugin.installAs);
+            }
+        }
+
+        private boolean shouldPruneMissingInstalledPlugin(TargetConfig plugin) {
+            if (plugin == null || plugin.server || plugin.installAs == null || plugin.installAs.isBlank()) {
+                return false;
+            }
+            String installAs = normalizedConfigPath(plugin.installAs);
+            if (!installAs.startsWith("plugins/")) {
+                return false;
+            }
+            if (Files.isRegularFile(resolve(Paths.get(plugin.installAs)))) {
+                return false;
+            }
+            String origin = lower(firstNonBlank(plugin.sourceOrigin, ""));
+            return origin.equals(SOURCE_ORIGIN_DISCOVERED)
+                || origin.equals(SOURCE_ORIGIN_DISCOVERED_UNVERIFIED)
+                || origin.equals(SOURCE_ORIGIN_UNRESOLVED);
+        }
+
         private TargetConfig firstConfiguredPluginByIdentity(Map<String, TargetConfig> configuredByIdentity, PluginJarInfo info) {
             for (String identity : pluginIdentityKeys(info)) {
                 TargetConfig configured = configuredByIdentity.get(identity);
@@ -482,6 +529,240 @@ public final class AutoUpdater {
         private String cleanSimpleGithubPart(String value) {
             return firstNonBlank(value, "").replaceAll("[^A-Za-z0-9_.-]", "");
         }
+        private void processNewPluginLinks() {
+            if (newPluginLinks.isEmpty()) {
+                return;
+            }
+            Set<String> consumedKeys = new HashSet<>();
+            for (String rawLink : newPluginLinks) {
+                String link = cleanNewPluginLink(rawLink);
+                if (link.isBlank()) {
+                    continue;
+                }
+                String consumedKey = lower(link);
+                if (!consumedKeys.add(consumedKey)) {
+                    consumedNewPluginLinks.add(rawLink);
+                    continue;
+                }
+                TargetConfig incoming = targetFromNewPluginLink(link);
+                TargetConfig existing = findExistingPluginForNewPluginLink(incoming);
+                if (existing == null) {
+                    incoming.name = uniquePluginName(incoming.name);
+                    incoming.installAs = "plugins/" + safeName(incoming.name) + ".jar";
+                    incoming.platform = inferredPluginPlatform(server);
+                    incoming.manualCatalogUpdatedThisRun = true;
+                    plugins.add(incoming);
+                    Log.info("Added manual plugin catalog entry from newPluginLinks: "
+                        + incoming.displayName() + " -> " + incoming.source + ".");
+                } else {
+                    applyNewPluginLink(existing, incoming);
+                    Log.info("Updated manual plugin catalog entry from newPluginLinks: "
+                        + existing.displayName() + " -> " + existing.source + ".");
+                }
+                consumedNewPluginLinks.add(rawLink);
+            }
+        }
+
+        private String cleanNewPluginLink(String rawLink) {
+            String link = ConfigParser.unquote(firstNonBlank(rawLink, "").trim());
+            link = link.replaceFirst("^\\d+[.)]\\s+", "").trim();
+            return link;
+        }
+
+        private TargetConfig targetFromNewPluginLink(String link) {
+            String source = canonicalNewPluginSource(link);
+            String type = newPluginLinkType(source);
+            String project = newPluginLinkProject(type, source);
+            String name = inferredNewPluginName(type, source, project);
+            if (name.isBlank()) {
+                name = nextUnknownPluginName();
+            }
+            TargetConfig target = new TargetConfig(name, false);
+            target.source = source;
+            target.sourceOrigin = SOURCE_ORIGIN_MANUAL;
+            target.type = type;
+            target.project = project;
+            target.githubRepo = type.equals("github-source") || type.equals("github-release") ? project : "";
+            target.required = false;
+            target.autoUpdate = true;
+            return target;
+        }
+
+        private void applyNewPluginLink(TargetConfig existing, TargetConfig incoming) {
+            existing.source = incoming.source;
+            existing.sourceOrigin = SOURCE_ORIGIN_MANUAL;
+            existing.type = incoming.type;
+            existing.project = incoming.project;
+            existing.githubRepo = incoming.githubRepo;
+            if ((existing.name == null || existing.name.isBlank() || isAutoValue(existing.name))
+                && incoming.name != null && !incoming.name.isBlank()) {
+                existing.name = incoming.name;
+            }
+            if ((existing.platform == null || existing.platform.isBlank()) && !firstNonBlank(incoming.platform, "").isBlank()) {
+                existing.platform = incoming.platform;
+            }
+            existing.manualCatalogUpdatedThisRun = true;
+            existing.sourceOriginUpdatedThisRun = false;
+            existing.sourceDiscoveredThisRun = false;
+        }
+
+        private TargetConfig findExistingPluginForNewPluginLink(TargetConfig incoming) {
+            String incomingSourceKey = canonicalSourceMatchKey(incoming.source);
+            String incomingGithubRepo = firstNonBlank(incoming.githubRepo, githubRepoFromSourceText(incoming.source));
+            String incomingName = normalizeIdentity(incoming.name);
+            boolean incomingUnknown = incomingName.isBlank() || incomingName.startsWith("unknownplugin");
+            for (TargetConfig plugin : plugins) {
+                if (plugin.server) {
+                    continue;
+                }
+                if (!incomingSourceKey.isBlank() && sourcesMatchLoosely(plugin.source, incoming.source)) {
+                    return plugin;
+                }
+                for (String fallback : plugin.fallbackSources) {
+                    if (!incomingSourceKey.isBlank() && sourcesMatchLoosely(fallback, incoming.source)) {
+                        return plugin;
+                    }
+                }
+                String pluginGithubRepo = firstNonBlank(plugin.githubRepo, githubRepoFromSourceText(plugin.source));
+                if (!incomingGithubRepo.isBlank() && incomingGithubRepo.equalsIgnoreCase(pluginGithubRepo)) {
+                    return plugin;
+                }
+                if (!incomingUnknown && incomingName.equals(normalizeIdentity(plugin.displayName()))) {
+                    return plugin;
+                }
+            }
+            return null;
+        }
+
+        private String canonicalNewPluginSource(String link) {
+            String value = firstNonBlank(link, "").trim();
+            try {
+                URI uri = URI.create(value);
+                String host = lower(firstNonBlank(uri.getHost(), "")).replaceFirst("^www\\.", "");
+                List<String> parts = pathParts(uri);
+                if (host.equals("github.com") && parts.size() >= 2) {
+                    String owner = cleanSimpleGithubPart(parts.get(0));
+                    String repo = cleanSimpleGithubPart(parts.get(1).replace(".git", ""));
+                    if (lower(value).contains("/releases/download/") || lower(value).endsWith(".jar")) {
+                        return value.split("[?#]", 2)[0];
+                    }
+                    return "https://github.com/" + owner + "/" + repo;
+                }
+                if (host.equals("modrinth.com") && parts.size() >= 2
+                    && (parts.get(0).equalsIgnoreCase("plugin") || parts.get(0).equalsIgnoreCase("mod"))) {
+                    return "https://modrinth.com/plugin/" + parts.get(1) + "/versions";
+                }
+                if (host.equals("hangar.papermc.io") && parts.size() >= 2) {
+                    return "https://hangar.papermc.io/" + cleanSimpleGithubPart(parts.get(0))
+                        + "/" + cleanSimpleGithubPart(parts.get(1)) + "/versions";
+                }
+            } catch (RuntimeException ignored) {
+                // Keep the user's text as the manual source when it is not a normal URL.
+            }
+            if (value.matches("[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")) {
+                String[] parts = value.split("/", 2);
+                return "https://github.com/" + cleanSimpleGithubPart(parts[0])
+                    + "/" + cleanSimpleGithubPart(parts[1].replace(".git", ""));
+            }
+            return value;
+        }
+
+        private String newPluginLinkType(String source) {
+            String lowerSource = lower(source);
+            if (lowerSource.contains("github.com/")
+                && !lowerSource.contains("/releases/download/")
+                && !lowerSource.endsWith(".jar")) {
+                return "github-source";
+            }
+            if (lowerSource.contains("modrinth.com/")) {
+                return "modrinth";
+            }
+            if (lowerSource.contains("hangar.papermc.io/")) {
+                return "hangar";
+            }
+            if (lowerSource.contains("spigotmc.org/resources") || lowerSource.contains("api.spiget.org/")) {
+                return "spigot";
+            }
+            if (lowerSource.contains("/job/") && !lowerSource.endsWith(".jar")) {
+                return "jenkins";
+            }
+            return "direct";
+        }
+
+        private String newPluginLinkProject(String type, String source) {
+            if (type.equals("github-source") || type.equals("github-release")) {
+                return githubRepoFromSourceText(source);
+            }
+            try {
+                URI uri = URI.create(source);
+                List<String> parts = pathParts(uri);
+                if (type.equals("modrinth") && parts.size() >= 2) {
+                    return parts.get(1);
+                }
+                if (type.equals("hangar") && parts.size() >= 2) {
+                    return cleanSimpleGithubPart(parts.get(0)) + "/" + cleanSimpleGithubPart(parts.get(1));
+                }
+            } catch (RuntimeException ignored) {
+                // Unknown project is acceptable for manual catalog entries.
+            }
+            return "";
+        }
+
+        private String inferredNewPluginName(String type, String source, String project) {
+            if (type.equals("github-source") || type.equals("github-release")) {
+                String repo = githubRepoFromSourceText(source);
+                if (!repo.isBlank()) {
+                    return humanPluginName(repo.substring(repo.indexOf('/') + 1));
+                }
+            }
+            if (type.equals("modrinth") && !project.isBlank()) {
+                return humanPluginName(project);
+            }
+            if (type.equals("hangar") && project.contains("/")) {
+                return humanPluginName(project.substring(project.indexOf('/') + 1));
+            }
+            try {
+                URI uri = URI.create(source);
+                List<String> parts = pathParts(uri);
+                if (!parts.isEmpty() && lower(parts.get(parts.size() - 1)).endsWith(".jar")) {
+                    return humanPluginName(parts.get(parts.size() - 1).replaceFirst("(?i)\\.jar$", ""));
+                }
+            } catch (RuntimeException ignored) {
+                // Fall through to UnknownPlugin.
+            }
+            return "";
+        }
+
+        private String humanPluginName(String value) {
+            String cleaned = firstNonBlank(value, "")
+                .replace(".git", "")
+                .replaceAll("(?i)-?folia$", "")
+                .replaceAll("[^A-Za-z0-9_.-]+", "")
+                .trim();
+            return cleaned.isBlank() ? "" : cleaned;
+        }
+
+        private String nextUnknownPluginName() {
+            return uniquePluginName("UnknownPlugin");
+        }
+
+        private String uniquePluginName(String wanted) {
+            String base = firstNonBlank(wanted, "UnknownPlugin");
+            Set<String> used = plugins.stream()
+                .map(TargetConfig::displayName)
+                .map(AutoUpdater::normalizeIdentity)
+                .collect(Collectors.toSet());
+            if (!used.contains(normalizeIdentity(base))) {
+                return base;
+            }
+            for (int i = 2; i < 10_000; i++) {
+                String candidate = base + i;
+                if (!used.contains(normalizeIdentity(candidate))) {
+                    return candidate;
+                }
+            }
+            return base + System.currentTimeMillis();
+        }
 
         Path resolve(Path path) {
             if (path.isAbsolute()) {
@@ -500,7 +781,12 @@ public final class AutoUpdater {
         boolean autoSwitchSource = true;
         boolean saveDiscoveredSources = true;
         boolean scanInstalledPlugins = true;
+        boolean pruneMissingInstalledPlugins = true;
+        boolean retryDeferredAfterStartup = true;
         List<String> preferredOwners = new ArrayList<>();
+        boolean pathfindingDebug = false;
+        String pathfindingDebugPlugin = "";
+        String pathfindingDebugFile = "architecture-pathfinding.debug";
     }
 
     private static final class GithubRateLimitState {
@@ -548,6 +834,14 @@ public final class AutoUpdater {
 
         void beginPlugin(TargetConfig target) {
             pluginBudgets.put(pluginKey(target), new GithubPluginBudget());
+        }
+
+        void reset() {
+            searchUsed = 0;
+            coreUsed = 0;
+            pluginBudgets.clear();
+            warnedRunSearch = false;
+            warnedRunCore = false;
         }
 
         boolean tryUse(TargetConfig target, String resource) {
@@ -1060,6 +1354,19 @@ public final class AutoUpdater {
                     case "self_update":
                         applySelfUpdate(config.selfUpdate, keyValue(line, lineNo));
                         break;
+                    case "newpluginlinks":
+                    case "new_plugin_links":
+                    case "pluginlinkinbox":
+                    case "plugin_link_inbox":
+                        if (line.startsWith("- ")) {
+                            String link = parseNewPluginLinkItem(line.substring(2).trim(), lineNo);
+                            if (!link.isBlank()) {
+                                config.newPluginLinks.add(link);
+                            }
+                        } else {
+                            throw new IllegalArgumentException("newPluginLinks entry before '-' at line " + lineNo);
+                        }
+                        break;
                     case "plugins":
                         if (line.startsWith("- ")) {
                             currentPlugin = new TargetConfig(null, false);
@@ -1131,6 +1438,23 @@ public final class AutoUpdater {
             }
         }
 
+
+        private static String parseNewPluginLinkItem(String item, int lineNo) {
+            String value = item.trim();
+            if (value.isBlank()) {
+                return "";
+            }
+            try {
+                KeyValue kv = keyValue(value, lineNo);
+                String key = lower(kv.key);
+                if (key.equals("url") || key.equals("link") || key.equals("source")) {
+                    return ConfigParser.unquote(kv.value.trim());
+                }
+            } catch (IllegalArgumentException ignored) {
+                // Plain list items are the common path.
+            }
+            return ConfigParser.unquote(value);
+        }
         private static void applyTopLevel(AppConfig config, KeyValue kv) {
             switch (lower(kv.key)) {
                 case "mode":
@@ -1164,6 +1488,12 @@ public final class AutoUpdater {
                 case "discoversources":
                 case "discover_sources":
                     config.discovery.enabled = parseBooleanStrict(kv.key, kv.value);
+                    break;
+                case "newpluginlinks":
+                case "new_plugin_links":
+                case "pluginlinkinbox":
+                case "plugin_link_inbox":
+                    config.newPluginLinks.addAll(parseList(kv.value));
                     break;
                 default:
                     throw new IllegalArgumentException("Unknown config key: " + kv.key);
@@ -1283,9 +1613,37 @@ public final class AutoUpdater {
                 case "scan_installed_plugins":
                     discovery.scanInstalledPlugins = parseBooleanStrict(kv.key, kv.value);
                     break;
+                case "prunemissinginstalledplugins":
+                case "prune_missing_installed_plugins":
+                    discovery.pruneMissingInstalledPlugins = parseBooleanStrict(kv.key, kv.value);
+                    break;
+                case "retrydeferredafterstartup":
+                case "retry_deferred_after_startup":
+                    discovery.retryDeferredAfterStartup = parseBooleanStrict(kv.key, kv.value);
+                    break;
                 case "preferredowners":
                 case "preferred_owners":
                     discovery.preferredOwners = parseList(kv.value);
+                    break;
+                case "pathfindingdebug":
+                case "pathfinding_debug":
+                case "architecturepathfindingdebug":
+                case "architecture_pathfinding_debug":
+                case "archestecturepathfindingdebug":
+                case "archestecture_pathfinding_debug":
+                    discovery.pathfindingDebug = parseBooleanStrict(kv.key, kv.value);
+                    break;
+                case "pathfindingdebugplugin":
+                case "pathfinding_debug_plugin":
+                case "architecturepathfindingdebugplugin":
+                case "architecture_pathfinding_debug_plugin":
+                    discovery.pathfindingDebugPlugin = kv.value;
+                    break;
+                case "pathfindingdebugfile":
+                case "pathfinding_debug_file":
+                case "architecturepathfindingdebugfile":
+                case "architecture_pathfinding_debug_file":
+                    discovery.pathfindingDebugFile = kv.value;
                     break;
                 case "allowspigotdiscovery":
                 case "allow_spigot_discovery":
@@ -1592,8 +1950,19 @@ public final class AutoUpdater {
             boolean changed = false;
             boolean settingsChanged = normalizeEditableConfigSettings(lines, config);
             changed |= settingsChanged;
+            int consumedNewPluginLinks = removeConsumedNewPluginLinks(lines, config);
+            changed |= consumedNewPluginLinks > 0;
             int savedDiscoveredSources = 0;
             int savedSourceOriginCleanups = 0;
+            int prunedMissingPlugins = 0;
+            for (TargetConfig target : config.prunedMissingPlugins) {
+                PluginBlock block = findPluginBlock(lines, target);
+                if (block != null) {
+                    lines.subList(block.start, block.end).clear();
+                    changed = true;
+                    prunedMissingPlugins++;
+                }
+            }
             for (TargetConfig target : targets) {
                 PluginBlock block = findPluginBlock(lines, target);
                 if (block == null) {
@@ -1631,7 +2000,14 @@ public final class AutoUpdater {
             } catch (AtomicMoveNotSupportedException ex) {
                 Files.move(temp, config.configPath, StandardCopyOption.REPLACE_EXISTING);
             }
-            if (savedDiscoveredSources > 0 && savedSourceOriginCleanups > 0) {
+            if (consumedNewPluginLinks > 0) {
+                Log.info("Imported " + consumedNewPluginLinks + " newPluginLinks item"
+                    + (consumedNewPluginLinks == 1 ? "" : "s") + " into the manual plugin catalog in "
+                    + config.configPath.getFileName() + ".");
+            } else if (prunedMissingPlugins > 0) {
+                Log.info("Pruned missing auto-managed plugin entr"
+                    + (prunedMissingPlugins == 1 ? "y" : "ies") + " from " + config.configPath.getFileName() + ".");
+            } else if (savedDiscoveredSources > 0 && savedSourceOriginCleanups > 0) {
                 Log.info("Saved discovered source" + (savedDiscoveredSources == 1 ? "" : "s")
                     + " and manual source-origin cleanup" + (savedSourceOriginCleanups == 1 ? "" : "s")
                     + " to " + config.configPath.getFileName() + ".");
@@ -1648,6 +2024,99 @@ public final class AutoUpdater {
             }
         }
 
+        private static int removeConsumedNewPluginLinks(List<String> lines, AppConfig config) {
+            if (config.consumedNewPluginLinks.isEmpty()) {
+                return 0;
+            }
+            Set<String> consumed = config.consumedNewPluginLinks.stream()
+                .map(ConfigRewriter::normalizedNewPluginInboxLink)
+                .filter(value -> !value.isBlank())
+                .collect(Collectors.toSet());
+            if (consumed.isEmpty()) {
+                return 0;
+            }
+            int sectionStart = findTopLevelSectionByNormalized(lines, Set.of("newpluginlinks", "pluginlinkinbox"));
+            if (sectionStart < 0) {
+                return 0;
+            }
+            String noComment = ConfigParser.stripComment(lines.get(sectionStart));
+            KeyValue header = ConfigParser.keyValue(noComment.trim(), sectionStart + 1);
+            String renderedKey = firstNonBlank(header.key, "newPluginLinks");
+            if (!header.value.isBlank()) {
+                List<String> kept = new ArrayList<>();
+                int removed = 0;
+                for (String item : parseList(header.value)) {
+                    if (consumed.contains(normalizedNewPluginInboxLink(item))) {
+                        removed++;
+                    } else if (!item.isBlank()) {
+                        kept.add(item);
+                    }
+                }
+                if (removed > 0) {
+                    lines.set(sectionStart, renderedKey + ": " + (kept.isEmpty() ? "[]" : quoteYaml(String.join(", ", kept))));
+                }
+                return removed;
+            }
+            int sectionEnd = findNextTopLevel(lines, sectionStart + 1);
+            int removed = 0;
+            for (int i = sectionStart + 1; i < sectionEnd;) {
+                String itemNoComment = ConfigParser.stripComment(lines.get(i));
+                String item = itemNoComment.trim();
+                if (item.startsWith("- ")) {
+                    String link = ConfigParser.parseNewPluginLinkItem(item.substring(2).trim(), i + 1);
+                    if (consumed.contains(normalizedNewPluginInboxLink(link))) {
+                        lines.remove(i);
+                        sectionEnd--;
+                        removed++;
+                        continue;
+                    }
+                }
+                i++;
+            }
+            if (removed > 0 && !hasListItems(lines, sectionStart + 1, sectionEnd)) {
+                lines.subList(sectionStart + 1, sectionEnd).clear();
+                lines.set(sectionStart, renderedKey + ": []");
+            }
+            return removed;
+        }
+
+        private static boolean hasListItems(List<String> lines, int start, int end) {
+            for (int i = start; i < end; i++) {
+                String noComment = ConfigParser.stripComment(lines.get(i));
+                if (noComment.trim().startsWith("- ")) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private static int findTopLevelSectionByNormalized(List<String> lines, Set<String> normalizedNames) {
+            for (int i = 0; i < lines.size(); i++) {
+                String noComment = ConfigParser.stripComment(lines.get(i));
+                if (noComment.trim().isEmpty() || ConfigParser.countIndent(noComment) != 0) {
+                    continue;
+                }
+                try {
+                    KeyValue kv = ConfigParser.keyValue(noComment.trim(), i + 1);
+                    if (kv.value.isEmpty() && normalizedNames.contains(normalizedKey(kv.key))) {
+                        return i;
+                    }
+                    if (!kv.value.isEmpty() && normalizedNames.contains(normalizedKey(kv.key))) {
+                        return i;
+                    }
+                } catch (IllegalArgumentException ignored) {
+                    // Ignore lines that are not key/value entries.
+                }
+            }
+            return -1;
+        }
+
+        private static String normalizedNewPluginInboxLink(String value) {
+            String link = ConfigParser.unquote(firstNonBlank(value, "").trim())
+                .replaceFirst("^\\d+[.)]\\s+", "")
+                .trim();
+            return lower(link);
+        }
         private static boolean normalizeEditableConfigSettings(List<String> lines, AppConfig config) {
             boolean changed = false;
             changed |= ensureTopLevelGithubToken(lines, config);
@@ -3660,22 +4129,211 @@ public final class AutoUpdater {
         private boolean githubRateLimited = false;
         private boolean githubAuthFailed = false;
         private boolean githubAuthFailureLogged = false;
+        private boolean configPathTraceWritten = false;
+        private final String pathTraceRunId;
+        private boolean pathTraceStartWritten = false;
+        private final Set<String> pathTraceTargetMarkers = new HashSet<>();
+        private final Set<String> pathTracePhaseMarkers = new HashSet<>();
 
         Updater(AppConfig config) {
             this.config = config;
             this.lockState = LockState.read(config);
             this.lockState.applyGithubRetryPause(config);
+            this.pathTraceRunId = buildPathTraceRunId(config);
             this.client = HttpClient.newBuilder()
                 .followRedirects(HttpClient.Redirect.ALWAYS)
                 .connectTimeout(Duration.ofSeconds(30))
                 .build();
         }
 
+        private String buildPathTraceRunId(AppConfig config) {
+            String stamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"));
+            String target = firstNonBlank(config.discovery.pathfindingDebugPlugin, "all")
+                .replaceAll("[^A-Za-z0-9_.-]+", "-");
+            return stamp + "-" + firstNonBlank(target, "all");
+        }
+
+        private boolean pathfindingDebugEnabled(TargetConfig target) {
+            if (!config.discovery.pathfindingDebug) {
+                return false;
+            }
+            String filter = lower(firstNonBlank(config.discovery.pathfindingDebugPlugin, ""));
+            if (filter.isBlank() || filter.equals("*") || target == null) {
+                return true;
+            }
+            return lower(target.displayName()).contains(filter)
+                || lower(firstNonBlank(target.name, "")).contains(filter)
+                || lower(firstNonBlank(target.installAs, "")).contains(filter);
+        }
+
+        private synchronized void pathDebug(TargetConfig target, String stage, String message) {
+            if (!pathfindingDebugEnabled(target)) {
+                return;
+            }
+            String targetName = target == null ? "global" : target.displayName();
+            String line = Instant.now() + " [" + targetName + "] " + stage + " - " + message + System.lineSeparator();
+            StringBuilder output = new StringBuilder();
+            if (!pathTraceStartWritten) {
+                pathTraceStartWritten = true;
+                output.append(System.lineSeparator())
+                    .append("========== PATHFINDING TRACE START ==========").append(System.lineSeparator())
+                    .append("runId=").append(pathTraceRunId).append(System.lineSeparator())
+                    .append("run=").append(Instant.now()).append(System.lineSeparator())
+                    .append("targetFilter=").append(firstNonBlank(config.discovery.pathfindingDebugPlugin, "*")).append(System.lineSeparator())
+                    .append("traceFile=").append(config.resolve(Paths.get(firstNonBlank(
+                        config.discovery.pathfindingDebugFile,
+                        "architecture-pathfinding.debug"
+                    )))).append(System.lineSeparator())
+                    .append("sourcePriority=").append(String.join(" -> ", normalizedDiscoveryPriority())).append(System.lineSeparator())
+                    .append("==============================================").append(System.lineSeparator());
+            }
+            if (target != null && pathTraceTargetMarkers.add(pathTraceTargetKey(target))) {
+                output.append(System.lineSeparator())
+                    .append("----- TARGET ").append(targetName).append(" -----").append(System.lineSeparator());
+            }
+            String phase = pathTracePhase(stage);
+            String phaseKey = (target == null ? "global" : pathTraceTargetKey(target)) + "|" + phase;
+            if (pathTracePhaseMarkers.add(phaseKey)) {
+                output.append("[PHASE ").append(phase).append("]").append(System.lineSeparator());
+            }
+            output.append(line);
+            try {
+                writePathTrace(output.toString());
+            } catch (IOException ex) {
+                Log.warn("Could not write pathfinding debug trace: " + ex.getMessage());
+                config.discovery.pathfindingDebug = false;
+            }
+        }
+
+        private synchronized void pathTraceEnd(String entrypoint, String result) {
+            if (!config.discovery.pathfindingDebug || !pathTraceStartWritten) {
+                return;
+            }
+            try {
+                writePathTrace("========== PATHFINDING TRACE END ==========" + System.lineSeparator()
+                    + "runId=" + pathTraceRunId + System.lineSeparator()
+                    + "entrypoint=" + entrypoint + System.lineSeparator()
+                    + "finished=" + Instant.now() + System.lineSeparator()
+                    + "result=" + result + System.lineSeparator()
+                    + "============================================" + System.lineSeparator());
+            } catch (IOException ex) {
+                Log.warn("Could not write pathfinding debug trace end marker: " + ex.getMessage());
+                config.discovery.pathfindingDebug = false;
+            }
+        }
+
+        private void writePathTrace(String text) throws IOException {
+            Path path = config.resolve(Paths.get(firstNonBlank(
+                config.discovery.pathfindingDebugFile,
+                "architecture-pathfinding.debug"
+            )));
+            Path parent = path.getParent();
+            if (parent != null) {
+                Files.createDirectories(parent);
+            }
+            Files.writeString(path, text, StandardCharsets.UTF_8,
+                StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+        }
+
+        private String pathTraceTargetKey(TargetConfig target) {
+            return lower(firstNonBlank(target.installAs, target.displayName(), target.name, "unknown"));
+        }
+
+        private String pathTracePhase(String stage) {
+            String value = lower(firstNonBlank(stage, "general"));
+            if (value.startsWith("config.")) {
+                return "config";
+            }
+            if (value.startsWith("lock.") || value.startsWith("sourceproof.") || value.startsWith("proof-refresh")) {
+                return "lock-memory";
+            }
+            if (value.startsWith("provider.github")) {
+                return "provider:github";
+            }
+            if (value.startsWith("provider.modrinth")) {
+                return "provider:modrinth";
+            }
+            if (value.startsWith("provider.hangar")) {
+                return "provider:hangar";
+            }
+            if (value.startsWith("candidate.score")
+                || value.startsWith("discovery.candidate")
+                || value.startsWith("discovery.candidates")) {
+                return "candidate-ranking";
+            }
+            if (value.startsWith("source.") || value.startsWith("manual-protection") || value.startsWith("fallback.")) {
+                return "source-apply";
+            }
+            if (value.startsWith("validation.")) {
+                return "validation";
+            }
+            if (value.startsWith("startup.") || value.startsWith("restart.")) {
+                return "startup-rollback";
+            }
+            if (value.startsWith("update.") || value.startsWith("resolve.") || value.startsWith("install.") || value.startsWith("git-preference.")) {
+                return "update";
+            }
+            if (value.startsWith("discover.") || value.startsWith("discovery.") || value.startsWith("autoswitch.") || value.equals("startup")) {
+                return "discovery";
+            }
+            return "general";
+        }
+
+        private void traceConfigPathOnce(String entrypoint) {
+            if (configPathTraceWritten || !config.discovery.pathfindingDebug) {
+                return;
+            }
+            configPathTraceWritten = true;
+            pathDebug(null, "config.entry", "entrypoint=" + entrypoint
+                + "; mode=" + config.mode
+                + "; onFailure=" + config.onFailure
+                + "; discovery.enabled=" + config.discovery.enabled
+                + "; discovery.mode=" + config.discovery.mode);
+            pathDebug(null, "config.discovery.normalized", "sourcePriority="
+                + String.join(" -> ", normalizedDiscoveryPriority())
+                + "; preferredOwners=" + (config.discovery.preferredOwners.isEmpty()
+                    ? "none"
+                    : String.join(", ", config.discovery.preferredOwners))
+                + "; autoSwitchSource=" + config.discovery.autoSwitchSource
+                + "; saveDiscoveredSources=" + config.discovery.saveDiscoveredSources
+                + "; scanInstalledPlugins=" + config.discovery.scanInstalledPlugins
+                + "; pruneMissingInstalledPlugins=" + config.discovery.pruneMissingInstalledPlugins
+                + "; retryDeferredAfterStartup=" + config.discovery.retryDeferredAfterStartup);
+            long manual = config.plugins.stream().filter(this::isManualConfiguredSource).count();
+            long discovered = config.plugins.stream()
+                .filter(target -> lower(firstNonBlank(target.sourceOrigin, "")).equals(SOURCE_ORIGIN_DISCOVERED))
+                .count();
+            long unverified = config.plugins.stream()
+                .filter(target -> lower(firstNonBlank(target.sourceOrigin, "")).equals(SOURCE_ORIGIN_DISCOVERED_UNVERIFIED))
+                .count();
+            long unresolved = config.plugins.stream()
+                .filter(target -> lower(firstNonBlank(target.sourceOrigin, "")).equals(SOURCE_ORIGIN_UNRESOLVED)
+                    || isMissingSourceValue(target.source))
+                .count();
+            pathDebug(null, "config.sources.grouping", "plugins=" + config.plugins.size()
+                + "; manual=" + manual
+                + "; discovered=" + discovered
+                + "; discoveredUnverified=" + unverified
+                + "; unresolvedOrMissing=" + unresolved);
+            for (TargetConfig target : config.plugins) {
+                pathDebug(target, "config.plugin", "source=" + firstNonBlank(target.source, "<blank>")
+                    + "; sourceOrigin=" + firstNonBlank(target.sourceOrigin, "<blank>")
+                    + "; type=" + firstNonBlank(target.type, "<blank>")
+                    + "; autoUpdate=" + target.autoUpdate
+                    + "; githubRepo=" + firstNonBlank(target.githubRepo, "<blank>")
+                    + "; fallbackCount=" + target.fallbackSources.size()
+                    + "; installAs=" + firstNonBlank(target.installAs, "<blank>"));
+            }
+        }
+
         void printPlan() {
+            traceConfigPathOnce("plan");
             Log.info("Mode: " + config.mode);
             Log.info("Failure behavior: " + config.onFailure);
             Log.info("Discovery: " + (config.discovery.enabled ? "enabled (" + config.discovery.mode + ")" : "disabled"));
             Log.info("Installed plugin scan: " + (config.discovery.scanInstalledPlugins ? "enabled" : "disabled"));
+            Log.info("Prune missing auto-managed plugins: " + (config.discovery.pruneMissingInstalledPlugins ? "enabled" : "disabled"));
+            Log.info("Retry deferred discovery after startup: " + (config.discovery.retryDeferredAfterStartup ? "enabled" : "disabled"));
             Log.info("Build from source: " + config.buildFromSource.enabled
                 + ", preferHostedIfSameVersion=" + config.buildFromSource.preferHostedIfSameVersion);
             Log.info("Jar validation: " + (config.validation.enabled ? "enabled" : "disabled")
@@ -3724,9 +4382,23 @@ public final class AutoUpdater {
             Log.info("Auto-switch source: " + config.discovery.autoSwitchSource);
             Log.info("Save discovered sources: " + config.discovery.saveDiscoveredSources);
             Log.info("Scan installed plugins: " + config.discovery.scanInstalledPlugins);
+            Log.info("Prune missing auto-managed plugins: " + config.discovery.pruneMissingInstalledPlugins);
+            Log.info("Retry deferred discovery after startup: " + config.discovery.retryDeferredAfterStartup);
             Log.info("Preferred fork owners: " + (config.discovery.preferredOwners.isEmpty()
                 ? "none"
                 : String.join(", ", config.discovery.preferredOwners)));
+            if (config.discovery.pathfindingDebug) {
+                Log.info("Pathfinding debug: enabled -> "
+                    + config.resolve(Paths.get(firstNonBlank(config.discovery.pathfindingDebugFile, "architecture-pathfinding.debug")))
+                    + (firstNonBlank(config.discovery.pathfindingDebugPlugin, "").isBlank()
+                        ? ""
+                        : " (plugin filter: " + config.discovery.pathfindingDebugPlugin + ")"));
+                pathDebug(null, "startup", "discover command; sourcePriority=" + String.join(" -> ", normalizedDiscoveryPriority())
+                    + "; autoSwitchSource=" + config.discovery.autoSwitchSource
+                    + "; saveDiscoveredSources=" + config.discovery.saveDiscoveredSources
+                    + "; pruneMissingInstalledPlugins=" + config.discovery.pruneMissingInstalledPlugins
+                + "; retryDeferredAfterStartup=" + config.discovery.retryDeferredAfterStartup);
+            }
             Log.info("Spigot/Spiget/Jenkins sources: manual download only; never discovered automatically");
             Log.info("Build from source: " + config.buildFromSource.enabled
                 + ", onlyTrusted=" + config.buildFromSource.onlyTrusted
@@ -3759,12 +4431,19 @@ public final class AutoUpdater {
                 }
                 Log.info("");
                 Log.info("Discovery target: " + target.displayName());
+                pathDebug(target, "discover.target", "source=" + firstNonBlank(target.source, "<blank>")
+                    + "; origin=" + firstNonBlank(target.sourceOrigin, "<blank>")
+                    + "; type=" + firstNonBlank(target.type, "<blank>")
+                    + "; githubRepo=" + firstNonBlank(target.githubRepo, "<blank>")
+                    + "; fallbacks=" + target.fallbackSources.size());
                 if (!isMissingSourceValue(target.source)) {
                     try {
                         SourcePlan plan = resolveSource(target);
                         Log.info("Current source: " + plan.type + " -> " + plan.description);
+                        pathDebug(target, "discover.current-source", "resolved type=" + plan.type + "; description=" + plan.description);
                         if (isManualConfiguredSource(target)) {
                             Log.info("Current source is marked manual; skipping replacement discovery for " + target.displayName() + ".");
+                            pathDebug(target, "discover.skip", "manual configured source protected from replacement discovery");
                             continue;
                         }
                         Optional<SourceProof> proof = lockState.activeSourceProof(target);
@@ -3775,24 +4454,30 @@ public final class AutoUpdater {
                             } else {
                                 Log.info("Current source is already descriptor-proven for " + target.displayName()
                                     + "; skipping network discovery.");
+                                pathDebug(target, "discover.skip", "active sourceProof matches current source; proof=" + proof.get().proof);
                                 continue;
                             }
                         }
                     } catch (IllegalArgumentException ex) {
                         Log.warn("Current source is unsupported for " + target.displayName() + ": " + ex.getMessage());
+                        pathDebug(target, "discover.current-source", "unsupported source: " + ex.getMessage());
                     }
                 } else if (isNotFoundSourceValue(target.source)) {
                     Log.info("Current source: " + SOURCE_NOT_FOUND + " (will retry discovery)");
+                    pathDebug(target, "discover.current-source", "source is Not Found; retry discovery path");
                 } else {
                     Log.info("Current source: none");
+                    pathDebug(target, "discover.current-source", "source is blank; discovery required");
                 }
                 boolean restoredFromProof = applyRememberedSourceProof(target);
                 boolean refreshingStaleProof = false;
                 if (restoredFromProof) {
                     Log.info("Using remembered source proof for " + target.displayName() + ": " + target.source);
+                    pathDebug(target, "discover.sourceProof", "restored remembered proof source=" + target.source);
                     if (!needsDiscoveredSource(target)) {
                         Log.info("Skipping network discovery for " + target.displayName()
                             + " because the remembered source proof is still usable.");
+                        pathDebug(target, "discover.skip", "restored source proof satisfied source");
                         continue;
                     }
                 }
@@ -3811,12 +4496,17 @@ public final class AutoUpdater {
                     Log.info("Best discovered source: " + best.type + " -> " + best.source
                         + " (score " + best.score + ", latest=" + firstNonBlank(best.latestVersion, "unknown") + ")");
                     Log.info("Why: " + best.reason);
+                    pathDebug(target, "discover.best", best.type + " score=" + best.score
+                        + "; source=" + best.source + "; latest=" + firstNonBlank(best.latestVersion, "unknown")
+                        + "; reason=" + best.reason);
                 } else if (needsDiscoveredSource(target) && githubRateLimited) {
                     Log.warn("Discovery for " + target.displayName()
                         + " was incomplete because " + githubUnavailableReason() + "; leaving source unchanged for now.");
+                    pathDebug(target, "discover.deferred", "no best candidate because " + githubUnavailableReason());
                     rememberDiscoveryDeferred(target, githubDeferredReason(), discoveryRetryAfter());
                 } else if (needsDiscoveredSource(target)) {
                     Log.warn("No reliable hosted source found. Marking source as " + SOURCE_NOT_FOUND + ".");
+                    pathDebug(target, "discover.unresolved", "no candidates met reliability threshold");
                     markSourceNotFound(target);
                 }
                 if (discovered.size() > 1) {
@@ -3985,8 +4675,11 @@ public final class AutoUpdater {
 
         private void autoSwitchMissingPluginSources() {
             if (!config.discovery.enabled || !config.discovery.autoSwitchSource) {
+                pathDebug(null, "autoswitch.skip", "discovery.enabled=" + config.discovery.enabled
+                    + "; autoSwitchSource=" + config.discovery.autoSwitchSource);
                 return;
             }
+            pathDebug(null, "autoswitch.start", "pre-update source cleanup and missing-source discovery");
             markManualSourceOrigins();
             migrateUnsupportedSpigotPrimarySources();
             migrateMismatchedPrimarySources();
@@ -3998,22 +4691,27 @@ public final class AutoUpdater {
                 config.githubBudget.beginPlugin(target);
                 if (applyRememberedSourceProof(target)) {
                     Log.info("Filled " + target.displayName() + " source from remembered proof -> " + target.source + ".");
+                    pathDebug(target, "autoswitch.sourceProof", "filled missing source from remembered proof=" + target.source);
                     continue;
                 }
                 if (shouldDeferMissingSourceDiscovery(target)) {
+                    pathDebug(target, "autoswitch.deferred", "active discovery deferral is still in force");
                     continue;
                 }
                 Log.info("Auto-switch discovery for " + target.displayName() + ".");
+                pathDebug(target, "autoswitch.discover", "source missing; running discovery candidates");
                 List<DiscoveryCandidate> discovered = discoverSourceCandidates(target);
                 if (discovered.isEmpty()) {
                     if (githubRateLimited) {
                         Log.warn("Discovery deferred for " + target.displayName()
                             + " because " + githubUnavailableReason() + " prevented a complete search; leaving the current source unchanged.");
+                        pathDebug(target, "autoswitch.deferred", "empty candidates because " + githubUnavailableReason());
                         rememberDiscoveryDeferred(target, githubDeferredReason(), discoveryRetryAfter());
                         continue;
                     }
                     Log.warn("No reliable hosted source found for " + target.displayName()
                         + "; marking source as " + SOURCE_NOT_FOUND + " and keeping existing jar.");
+                    pathDebug(target, "autoswitch.unresolved", "empty candidates; mark Not Found");
                     markSourceNotFound(target);
                     continue;
                 }
@@ -4022,6 +4720,100 @@ public final class AutoUpdater {
             refreshStaleRememberedSourceProofs();
             saveDiscoveredSourcesIfRequested();
             printDiscoverySummary("Auto-switch discovery");
+        }
+
+        synchronized Optional<Instant> nextDeferredDiscoveryRetryAfter() {
+            if (!config.discovery.enabled || !config.discovery.autoSwitchSource || !config.discovery.retryDeferredAfterStartup) {
+                return Optional.empty();
+            }
+            Instant now = Instant.now();
+            return allTargets().stream()
+                .filter(target -> target.enabled && !target.server && target.autoUpdate && needsDiscoveredSource(target))
+                .map(this::deferredDiscoveryRetryInstant)
+                .flatMap(Optional::stream)
+                .map(retry -> retry.isBefore(now) ? now : retry)
+                .min(Comparator.naturalOrder());
+        }
+
+        synchronized void retryDeferredDiscoverySourcesAfterStartup() {
+            if (!config.discovery.enabled || !config.discovery.autoSwitchSource || !config.discovery.retryDeferredAfterStartup) {
+                pathDebug(null, "startup.deferred-discovery.skip", "retryDeferredAfterStartup disabled or discovery unavailable");
+                return;
+            }
+            config.githubRateLimit.isPaused();
+            Instant now = Instant.now();
+            List<TargetConfig> dueTargets = allTargets().stream()
+                .filter(target -> target.enabled && !target.server && target.autoUpdate && needsDiscoveredSource(target))
+                .filter(target -> deferredDiscoveryRetryInstant(target)
+                    .map(retry -> !retry.isAfter(now))
+                    .orElse(false))
+                .toList();
+            if (dueTargets.isEmpty()) {
+                pathDebug(null, "startup.deferred-discovery.skip", "no deferred source discovery entries are due");
+                return;
+            }
+            clearDiscoverySummary();
+            if (!githubAuthFailed) {
+                githubRateLimited = false;
+                githubBudgetLimitedPlugins.clear();
+                githubBudgetWarnings.clear();
+                config.githubBudget.reset();
+            }
+            Log.info("Retrying deferred source discovery after startup for " + dueTargets.size()
+                + " plugin(s). Found sources will be saved for a future update; no jars will be installed now.");
+            pathDebug(null, "startup.deferred-discovery.retry", "dueTargets=" + dueTargets.stream()
+                .map(TargetConfig::displayName)
+                .collect(Collectors.joining(", ")));
+            for (TargetConfig target : dueTargets) {
+                config.githubBudget.beginPlugin(target);
+                if (applyRememberedSourceProof(target)) {
+                    Log.info("Filled " + target.displayName() + " source from remembered proof -> " + target.source + ".");
+                    pathDebug(target, "startup.deferred-discovery.sourceProof", "filled source from remembered proof=" + target.source);
+                    continue;
+                }
+                if (shouldDeferMissingSourceDiscovery(target)) {
+                    pathDebug(target, "startup.deferred-discovery.deferred", "deferral is still active after retry check");
+                    continue;
+                }
+                Log.info("Post-startup discovery retry for " + target.displayName() + ".");
+                pathDebug(target, "startup.deferred-discovery.discover", "retrying due missing source after startup");
+                List<DiscoveryCandidate> discovered = discoverSourceCandidates(target);
+                if (discovered.isEmpty()) {
+                    if (githubRateLimited) {
+                        Log.warn("Discovery deferred for " + target.displayName()
+                            + " because " + githubUnavailableReason() + " prevented a complete search; leaving the current source unchanged.");
+                        pathDebug(target, "startup.deferred-discovery.deferred", "empty candidates because " + githubUnavailableReason());
+                        rememberDiscoveryDeferred(target, githubDeferredReason(), discoveryRetryAfter());
+                        continue;
+                    }
+                    Log.warn("No reliable hosted source found for " + target.displayName()
+                        + "; keeping it unresolved for a later retry.");
+                    pathDebug(target, "startup.deferred-discovery.unresolved", "empty candidates; keep unresolved with backoff");
+                    markSourceNotFound(target);
+                    continue;
+                }
+                applyDiscoveredSource(target, discovered);
+            }
+            saveDiscoveredSourcesIfRequested();
+            printDiscoverySummary("Post-startup deferred discovery");
+        }
+
+        private Optional<Instant> deferredDiscoveryRetryInstant(TargetConfig target) {
+            if (target == null) {
+                return Optional.empty();
+            }
+            DiscoveryState state = lockState.discoveryStates.get(LockState.lockKey(target.installAs));
+            if (state == null || state.nextRetryAfter.isBlank()) {
+                return Optional.empty();
+            }
+            return parseInstantOptional(state.nextRetryAfter);
+        }
+
+        private void clearDiscoverySummary() {
+            discoveryFound.clear();
+            discoveryDeferred.clear();
+            discoveryUnresolved.clear();
+            discoveryProviderFailures.clear();
         }
 
         private boolean shouldDeferMissingSourceDiscovery(TargetConfig target) {
@@ -4036,10 +4828,14 @@ public final class AutoUpdater {
             if (lower(firstNonBlank(state.reason, "")).contains("github")) {
                 Log.info("Retrying non-GitHub discovery for " + target.displayName()
                     + " even though GitHub discovery is deferred until " + state.nextRetryAfter + ".");
+                pathDebug(target, "discovery.deferral", "GitHub-related deferral exists until "
+                    + state.nextRetryAfter + ", but non-GitHub retry is allowed");
                 return false;
             }
             Log.info("Discovery for " + target.displayName() + " is deferred until "
                 + state.nextRetryAfter + " (" + firstNonBlank(state.reason, "waiting before retry") + ").");
+            pathDebug(target, "discovery.deferral", "deferred until " + state.nextRetryAfter
+                + "; reason=" + firstNonBlank(state.reason, "waiting before retry"));
             return true;
         }
 
@@ -4061,6 +4857,8 @@ public final class AutoUpdater {
 
         private void rememberDiscoveryDeferred(TargetConfig target, String reason, Instant nextRetryAfter) {
             discoveryDeferred.add(target.displayName() + " (" + firstNonBlank(reason, "deferred") + ")");
+            pathDebug(target, "lock.discovery.defer", "reason=" + firstNonBlank(reason, "deferred")
+                + "; retryAfter=" + nextRetryAfter);
             lockState.rememberDiscoveryDeferred(target, reason, nextRetryAfter);
             writeLockQuietly();
         }
@@ -4074,6 +4872,7 @@ public final class AutoUpdater {
         }
 
         private void rememberDiscoveryNotFound(TargetConfig target, String reason) {
+            pathDebug(target, "lock.discovery.not-found", "reason=" + firstNonBlank(reason, "no reliable source found"));
             lockState.rememberDiscoveryNotFound(target, reason);
             writeLockQuietly();
         }
@@ -4090,6 +4889,7 @@ public final class AutoUpdater {
                     target.sourceOriginUpdatedThisRun = true;
                     Log.info("Marked configured source for " + target.displayName()
                         + " as manual because it already has a source URL.");
+                    pathDebug(target, "manual-protection", "origin unresolved but source is real; promote to manual");
                     continue;
                 }
                 if (origin.equals(SOURCE_ORIGIN_DISCOVERED)) {
@@ -4099,12 +4899,15 @@ public final class AutoUpdater {
                         target.sourceOriginUpdatedThisRun = true;
                         Log.info("Marked configured source for " + target.displayName()
                             + " as manual because it is marked discovered but no matching source proof exists.");
+                        pathDebug(target, "manual-protection", "origin discovered but no active sourceProof; promote to manual");
                     } else if (!sourcesMatchLoosely(proof.get().source, target.source)) {
                         // The lock remembers what discovery wrote last time; a different configured URL is a user edit.
                         target.sourceOrigin = SOURCE_ORIGIN_MANUAL;
                         target.sourceOriginUpdatedThisRun = true;
                         Log.info("Marked configured source for " + target.displayName()
                             + " as manual because it differs from the remembered discovered source.");
+                        pathDebug(target, "manual-protection", "current source differs from remembered sourceProof="
+                            + proof.get().source + "; promote to manual");
                     }
                     continue;
                 }
@@ -4117,10 +4920,12 @@ public final class AutoUpdater {
                 target.sourceOrigin = SOURCE_ORIGIN_MANUAL;
                 target.sourceOriginUpdatedThisRun = true;
                 Log.info("Marked configured source for " + target.displayName() + " as manual.");
+                pathDebug(target, "manual-protection", "blank sourceOrigin with real source; promote to manual");
             }
         }
 
         private void clearDiscoveryState(TargetConfig target) {
+            pathDebug(target, "lock.discovery.clear", "clearing discovery retry/not-found state");
             lockState.clearDiscoveryState(target);
             writeLockQuietly();
         }
@@ -4128,9 +4933,13 @@ public final class AutoUpdater {
         private void rememberSourceProof(TargetConfig target, String source, String type, GithubRepo repo,
                                          PluginJarInfo descriptor, String proofKind) {
             if (capturingSourceProofs()) {
+                pathDebug(target, "lock.sourceProof.capture", "pending proof source=" + source
+                    + "; type=" + type + "; kind=" + proofKind);
                 captureSourceProof(target, source, type, repo == null ? "" : repo.owner + "/" + repo.name, descriptor, proofKind);
                 return;
             }
+            pathDebug(target, "lock.sourceProof.remember", "source=" + source + "; type=" + type
+                + "; repo=" + (repo == null ? "" : repo.owner + "/" + repo.name) + "; kind=" + proofKind);
             lockState.rememberSourceProof(target, source, type, repo, descriptor, proofKind);
             writeLockQuietly();
         }
@@ -4138,9 +4947,13 @@ public final class AutoUpdater {
         private void rememberSourceProof(TargetConfig target, String source, String type, String project,
                                          PluginJarInfo descriptor, String proofKind) {
             if (capturingSourceProofs()) {
+                pathDebug(target, "lock.sourceProof.capture", "pending proof source=" + source
+                    + "; type=" + type + "; project=" + project + "; kind=" + proofKind);
                 captureSourceProof(target, source, type, project, descriptor, proofKind);
                 return;
             }
+            pathDebug(target, "lock.sourceProof.remember", "source=" + source + "; type=" + type
+                + "; project=" + project + "; kind=" + proofKind);
             lockState.rememberSourceProof(target, source, type, project, descriptor, proofKind);
             writeLockQuietly();
         }
@@ -4148,9 +4961,13 @@ public final class AutoUpdater {
         private void rememberRejectedSourceProof(TargetConfig target, String source, String type, String project,
                                                  PluginJarInfo descriptor, String reason) {
             if (capturingSourceProofs()) {
+                pathDebug(target, "lock.sourceProof.reject.capture", "pending rejected proof source=" + source
+                    + "; reason=" + reason);
                 pendingRejectedSourceProofs.add(new PendingRejectedSourceProof(target, source, type, project, descriptor, reason));
                 return;
             }
+            pathDebug(target, "lock.sourceProof.reject", "source=" + source + "; type=" + type
+                + "; project=" + project + "; reason=" + reason);
             lockState.rememberRejectedSourceProof(target, source, type, project, descriptor, reason);
             writeLockQuietly();
         }
@@ -4167,6 +4984,9 @@ public final class AutoUpdater {
             PendingSourceProof pending = new PendingSourceProof(target, source, type, project, descriptor, proofKind);
             pendingSourceProofs.removeIf(existing -> existing.matches(target, source));
             pendingSourceProofs.add(pending);
+            pathDebug(target, "lock.sourceProof.pending", "stored pending proof source=" + source
+                + "; descriptor=" + firstNonBlank(descriptor.name, descriptor.id, "unknown")
+                + "; foliaSupported=" + descriptor.foliaSupported);
         }
 
         private void enrichSourceProof(TargetConfig target, String source, ForkLineage lineage, String reason) {
@@ -4178,8 +4998,12 @@ public final class AutoUpdater {
                     proof.lineage = lineage;
                     proof.lineageReason = firstNonBlank(reason, lineage.describe());
                 });
+                pathDebug(target, "lock.sourceProof.lineage.capture", "pending lineage=" + lineage.describe()
+                    + "; reason=" + firstNonBlank(reason, lineage.describe()));
                 return;
             }
+            pathDebug(target, "lock.sourceProof.lineage", "lineage=" + lineage.describe()
+                + "; reason=" + firstNonBlank(reason, lineage.describe()));
             lockState.enrichSourceProof(target, lineage, reason);
             writeLockQuietly();
         }
@@ -4207,6 +5031,8 @@ public final class AutoUpdater {
             }
             boolean wrote = false;
             for (PendingRejectedSourceProof proof : pendingRejectedSourceProofs) {
+                pathDebug(proof.target, "lock.sourceProof.reject.flush", "source=" + proof.source
+                    + "; reason=" + proof.reason);
                 lockState.rememberRejectedSourceProof(proof.target, proof.source, proof.type, proof.project,
                     proof.descriptor, proof.reason);
                 wrote = true;
@@ -4229,6 +5055,7 @@ public final class AutoUpdater {
             if (shouldRefreshRememberedSourceProof(target, remembered)) {
                 Log.info("Not restoring remembered source proof for " + target.displayName()
                     + " because the installed jar is Folia-compatible but the old proof did not record Folia support.");
+                pathDebug(target, "sourceProof.restore.skip", "proof needs Folia support refresh before reuse");
                 return false;
             }
             target.source = remembered.source;
@@ -4242,6 +5069,8 @@ public final class AutoUpdater {
             }
             target.sourceDiscoveredThisRun = true;
             clearDiscoveryState(target);
+            pathDebug(target, "sourceProof.restore", "source=" + target.source + "; type=" + target.type
+                + "; repo=" + firstNonBlank(target.githubRepo, "<blank>"));
             return true;
         }
 
@@ -4251,6 +5080,8 @@ public final class AutoUpdater {
             }
             if (githubAuthFailed || githubRateLimited || config.githubRateLimit.isPaused()) {
                 Log.info("Skipping stale Folia source proof refresh because GitHub discovery is currently limited; unresolved plugins keep priority.");
+                pathDebug(null, "proof-refresh.skip", "GitHub unavailable; authFailed=" + githubAuthFailed
+                    + "; rateLimited=" + githubRateLimited + "; paused=" + config.githubRateLimit.isPaused());
                 return;
             }
             for (TargetConfig target : allTargets()) {
@@ -4446,17 +5277,22 @@ public final class AutoUpdater {
 
         private boolean maybeMigrateConfiguredSource(TargetConfig target, DiscoveryCandidate best, List<DiscoveryCandidate> discovered) {
             if (needsDiscoveredSource(target)) {
+                pathDebug(target, "source.migration.skip", "current source is missing, so discovery will fill it instead of migrating it");
                 return false;
             }
             if (shouldProtectConfiguredSource(target, "alternate source migration")) {
+                pathDebug(target, "source.migration.skip", "configured source is protected by manual/sourceProof rules");
                 return false;
             }
             SourceOwnerSignal currentOwner = configuredSourceOwnerSignal(target);
             if (currentOwner.conflict) {
                 if (sameDiscoverySource(target.source, best.source)
                     && best.reason.contains("source descriptor matches installed plugin")) {
+                    pathDebug(target, "source.migration.skip", "configured source has an owner warning, but the best candidate is the same descriptor-proven source");
                     return false;
                 }
+                pathDebug(target, "source.migration", "configured source owner conflict: " + currentOwner.reason
+                    + "; selected " + best.type + " -> " + best.source + " because " + best.reason);
                 Log.warn("Configured primary source for " + target.displayName()
                     + " appears to belong to a different author (" + currentOwner.reason + ").");
                 migratePrimarySource(target, best, discovered,
@@ -4464,9 +5300,12 @@ public final class AutoUpdater {
                 return true;
             }
             if (isSpigotConfiguredSource(target) && !isSpigotType(best.type)) {
+                pathDebug(target, "source.migration", "configured source is Spigot/manual-only; selected " + best.type
+                    + " -> " + best.source + " because " + best.reason);
                 migratePrimarySource(target, best, discovered, "Spigot", "removed unsupported Spigot primary", false);
                 return true;
             }
+            pathDebug(target, "source.migration.skip", "configured source stays primary; no owner conflict or manual-only migration reason");
             return false;
         }
 
@@ -4482,6 +5321,8 @@ public final class AutoUpdater {
         private void migratePrimarySource(TargetConfig target, DiscoveryCandidate best, List<DiscoveryCandidate> discovered,
                                           String oldLabel, String action, boolean keepOldAsFallback) {
             String oldSource = target.source;
+            pathDebug(target, "source.migrate.apply", action + "; old=" + firstNonBlank(oldSource, "blank")
+                + "; new=" + best.source + "; candidate=" + best.type + "; reason=" + best.reason);
             target.source = best.source;
             target.sourceOrigin = SOURCE_ORIGIN_DISCOVERED_UNVERIFIED;
             target.type = best.type.equals("github-source") ? "github-source" : "auto";
@@ -4525,13 +5366,18 @@ public final class AutoUpdater {
             target.sourceDiscoveredThisRun = true;
             if (commitSelectedSourceProof(target, best)) {
                 target.sourceOrigin = SOURCE_ORIGIN_DISCOVERED;
+                pathDebug(target, "source.migrate.proof", "selected source matched remembered/captured proof; sourceOrigin=discovered");
             } else {
+                pathDebug(target, "source.migrate.proof", "selected source has no descriptor proof yet; sourceOrigin=discovered-unverified");
                 Log.info("Marked " + target.displayName()
                     + " source as discovered-unverified because the selected source is machine-written but not descriptor-proven.");
             }
             clearDiscoveryState(target);
             Log.info("Migrated " + target.displayName() + " primary source from " + oldLabel + " to "
                 + best.type + " -> " + best.source + "; " + action + ".");
+            pathDebug(target, "source.migrate.fallbacks", "persisted " + target.fallbackSources.size() + " fallback source(s)");
+            pathDebug(target, "fallback.order", "primary=" + target.source
+                + "; fallbacks=" + (target.fallbackSources.isEmpty() ? "none" : String.join(" -> ", target.fallbackSources)));
         }
 
         private boolean needsDiscoveredSource(TargetConfig target) {
@@ -4542,6 +5388,7 @@ public final class AutoUpdater {
             if (!isManualConfiguredSource(target)) {
                 return false;
             }
+            pathDebug(target, "manual-protection.keep", "keeping configured source during " + action);
             Log.warn("Keeping configured source for " + target.displayName() + " during " + action
                 + " because it appears to be manually supplied. The updater will validate it before installing jars.");
             return true;
@@ -4576,6 +5423,8 @@ public final class AutoUpdater {
 
         private void applyDiscoveredSource(TargetConfig target, List<DiscoveryCandidate> discovered) {
             DiscoveryCandidate best = discovered.get(0);
+            pathDebug(target, "source.apply", "selected " + best.type + " -> " + best.source
+                + "; score=" + best.score + "; reason=" + best.reason);
             target.source = best.source;
             target.sourceOrigin = SOURCE_ORIGIN_DISCOVERED_UNVERIFIED;
             target.type = best.type.equals("github-source") ? "github-source" : "auto";
@@ -4592,7 +5441,9 @@ public final class AutoUpdater {
             discoveryFound.add(target.displayName() + " -> " + best.type);
             if (commitSelectedSourceProof(target, best)) {
                 target.sourceOrigin = SOURCE_ORIGIN_DISCOVERED;
+                pathDebug(target, "source.apply.proof", "selected source matched remembered/captured proof; sourceOrigin=discovered");
             } else {
+                pathDebug(target, "source.apply.proof", "selected source has no descriptor proof yet; sourceOrigin=discovered-unverified");
                 Log.info("Marked " + target.displayName()
                     + " source as discovered-unverified because the selected source is machine-written but not descriptor-proven.");
             }
@@ -4615,6 +5466,9 @@ public final class AutoUpdater {
             }
             Log.info("Auto-switched " + target.displayName() + " source -> " + best.source
                 + (target.fallbackSources.isEmpty() ? "" : " with " + target.fallbackSources.size() + " fallback(s)"));
+            pathDebug(target, "source.apply.fallbacks", "persisted " + target.fallbackSources.size() + " fallback source(s)");
+            pathDebug(target, "fallback.order", "primary=" + target.source
+                + "; fallbacks=" + (target.fallbackSources.isEmpty() ? "none" : String.join(" -> ", target.fallbackSources)));
         }
 
         private boolean commitSelectedSourceProof(TargetConfig target, DiscoveryCandidate selected) {
@@ -4652,18 +5506,22 @@ public final class AutoUpdater {
 
         private boolean shouldPersistFallback(TargetConfig target, DiscoveryCandidate candidate) {
             if (candidate == null || candidate.source == null || candidate.source.isBlank()) {
+                pathDebug(target, "fallback.reject", "candidate is blank");
                 return false;
             }
             if (isManualOnlySourceType(candidate.type)) {
+                pathDebug(target, "fallback.reject", candidate.source + " is " + candidate.type + ", and that source type is manual-only");
                 Log.info("Not persisting fallback for " + target.displayName() + " from " + candidate.source
                     + " because " + candidate.type + " sources are manual-only.");
                 return false;
             }
             if (candidate.reason.contains("source descriptor matches installed plugin")) {
+                pathDebug(target, "fallback.keep", candidate.source + " has descriptor proof from candidate inspection");
                 return true;
             }
             Optional<SourceProof> proof = lockState.activeSourceProof(target);
             if (proof.isPresent() && sourcesMatchLoosely(proof.get().source, candidate.source)) {
+                pathDebug(target, "fallback.keep", candidate.source + " matches the active remembered sourceProof");
                 return true;
             }
             SourceOwnerSignal owner = sourceOwnerSignal(
@@ -4674,8 +5532,10 @@ public final class AutoUpdater {
                 candidate.label
             );
             if (owner.conflict) {
+                pathDebug(target, "fallback.reject", candidate.source + " owner conflict: " + owner.reason);
                 return false;
             }
+            pathDebug(target, "fallback.reject", candidate.source + " was not descriptor-proven");
             Log.info("Not persisting fallback for " + target.displayName() + " from " + candidate.source
                 + " because it has not been descriptor-proven.");
             return false;
@@ -4686,18 +5546,41 @@ public final class AutoUpdater {
             for (TargetConfig target : config.plugins) {
                 boolean persistDiscoveredSource = config.discovery.saveDiscoveredSources && target.sourceDiscoveredThisRun;
                 boolean persistManualProtection = target.sourceOriginUpdatedThisRun && !target.sourceDiscoveredThisRun;
-                if ((persistDiscoveredSource || persistManualProtection)
+                boolean persistManualCatalog = target.manualCatalogUpdatedThisRun;
+                if ((persistDiscoveredSource || persistManualProtection || persistManualCatalog)
                     && target.source != null && !target.source.isBlank()) {
                     changed.add(target);
                 }
             }
-            if (changed.isEmpty()) {
+            boolean persistPrunedMissing = config.discovery.saveDiscoveredSources && !config.prunedMissingPlugins.isEmpty();
+            boolean persistNewPluginLinks = !config.consumedNewPluginLinks.isEmpty();
+            if (changed.isEmpty() && !persistPrunedMissing && !persistNewPluginLinks) {
+                pathDebug(null, "config.rewrite.skip", "no discovered/manual-catalog/manual-protection/pruned source changes need saving");
                 return;
             }
             try {
+                pathDebug(null, "config.rewrite", "saving " + changed.size()
+                    + " source change(s), pruning " + config.prunedMissingPlugins.size()
+                    + " missing plugin entr" + (config.prunedMissingPlugins.size() == 1 ? "y" : "ies")
+                    + ", consuming " + config.consumedNewPluginLinks.size()
+                    + " newPluginLinks item" + (config.consumedNewPluginLinks.size() == 1 ? "" : "s")
+                    + " to updater.yml and normalizing editable settings");
+                for (TargetConfig target : config.prunedMissingPlugins) {
+                    pathDebug(target, "config.rewrite.prune", "missing installAs=" + firstNonBlank(target.installAs, "<blank>")
+                        + "; origin=" + firstNonBlank(target.sourceOrigin, "<blank>"));
+                }
+                for (TargetConfig target : changed) {
+                    pathDebug(target, "config.rewrite.target", "source=" + firstNonBlank(target.source, "<blank>")
+                        + "; origin=" + firstNonBlank(target.sourceOrigin, "<blank>")
+                        + "; type=" + firstNonBlank(target.type, "<blank>")
+                        + "; manualCatalog=" + target.manualCatalogUpdatedThisRun
+                        + "; fallbacks=" + target.fallbackSources.size());
+                }
                 ConfigRewriter.saveDiscoveredPluginSources(config, changed);
                 sortPluginTargetsInMemory();
+                pathDebug(null, "config.rewrite.sorted", "plugin targets sorted into manual/discovered/unresolved groups");
             } catch (IOException ex) {
+                pathDebug(null, "config.rewrite.failed", ex.getMessage());
                 Log.warn("Could not save discovered sources to config: " + ex.getMessage());
             }
         }
@@ -4838,6 +5721,16 @@ public final class AutoUpdater {
                     .comparingInt((DiscoveryCandidate c) -> c.score).reversed()
                     .thenComparingInt((DiscoveryCandidate c) -> discoverySortPriority(c))
                     .thenComparing(c -> c.type));
+                pathDebug(target, "discovery.candidates", "ranked " + candidates.size() + " candidate(s)");
+                for (int i = 0; i < Math.min(5, candidates.size()); i++) {
+                    DiscoveryCandidate candidate = candidates.get(i);
+                    pathDebug(target, "discovery.candidate#" + (i + 1),
+                        candidate.type + " score=" + candidate.score
+                            + "; priority=" + candidate.priority
+                            + "; source=" + candidate.source
+                            + "; latest=" + firstNonBlank(candidate.latestVersion, "unknown")
+                            + "; reason=" + candidate.reason);
+                }
                 return candidates;
             } finally {
                 sourceProofCaptureDepth--;
@@ -5087,26 +5980,41 @@ public final class AutoUpdater {
 
         private List<DiscoveryCandidate> discoverGithubSources(TargetConfig target, int priority) throws Exception {
             List<DiscoveryCandidate> candidates = new ArrayList<>();
+            pathDebug(target, "provider.github.start", "priority=" + priority
+                + "; githubRepo=" + firstNonBlank(target.githubRepo, "<blank>")
+                + "; searchTerms=" + String.join(", ", discoverySearchTerms(target)));
             if (target.githubRepo != null && !target.githubRepo.isBlank()) {
+                pathDebug(target, "provider.github.configuredRepo", "probing configured githubRepo=" + target.githubRepo);
                 latestGithubCandidate(target, repoFromGithubValue(target.githubRepo), priority, "configured githubRepo").ifPresent(candidates::add);
                 boolean refreshNeedsForkSearch = lockState.activeSourceProof(target)
                     .map(proof -> shouldRefreshRememberedSourceProof(target, proof))
                     .orElse(false);
                 if (!candidates.isEmpty() && !refreshNeedsForkSearch) {
+                    pathDebug(target, "provider.github.done", "configured githubRepo produced " + candidates.size()
+                        + " candidate(s); skipping targeted/broad search");
                     return candidates;
+                }
+                if (refreshNeedsForkSearch) {
+                    pathDebug(target, "provider.github.continue", "configured repo found candidates, but stale Folia proof requires fork/source search");
                 }
             }
             candidates.addAll(discoverTargetedGithubSources(target, priority, true));
             if (!candidates.isEmpty()) {
+                pathDebug(target, "provider.github.done", "targeted GitHub discovery produced " + candidates.size()
+                    + " candidate(s); skipping broad search");
                 return candidates;
             }
             if (githubRateLimited || config.githubRateLimit.isPaused()) {
+                pathDebug(target, "provider.github.defer", "GitHub broad search skipped because rate limit/auth pause is active");
                 return candidates;
             }
             for (String term : discoverySearchTerms(target)) {
                 if (githubRateLimited || config.githubRateLimit.isPaused()) {
+                    pathDebug(target, "provider.github.defer", "GitHub broad search stopped during term=" + term
+                        + " because rate limit/auth pause became active");
                     return candidates;
                 }
+                pathDebug(target, "provider.github.search", "broad repository search term=" + term);
                 URI uri = URI.create("https://api.github.com/search/repositories?q="
                     + urlEncode(term + " minecraft plugin")
                     + "&per_page=8");
@@ -5118,6 +6026,8 @@ public final class AutoUpdater {
                 for (Object item : items) {
                     Map<String, Object> repoMap = asMap(item);
                     if (Boolean.TRUE.equals(repoMap.get("archived")) || Boolean.TRUE.equals(repoMap.get("disabled"))) {
+                        pathDebug(target, "provider.github.archived.skip", "broad search skipped archived/disabled repo "
+                            + firstNonBlank(stringValue(repoMap.get("full_name")), stringValue(repoMap.get("name")), "unknown"));
                         continue;
                     }
                     String fullName = stringValue(repoMap.get("full_name"));
@@ -5145,14 +6055,23 @@ public final class AutoUpdater {
                     latestGithubCandidate(target, repo, priority, reason).ifPresent(candidates::add);
                 }
             }
+            pathDebug(target, "provider.github.done", "broad GitHub search produced " + candidates.size() + " candidate(s)");
             return candidates;
         }
 
         private List<DiscoveryCandidate> discoverTargetedGithubSources(TargetConfig target, int priority, boolean allowReleaseLookup) {
             List<DiscoveryCandidate> candidates = new ArrayList<>();
+            pathDebug(target, "provider.github.targeted.start", "allowReleaseLookup=" + allowReleaseLookup
+                + "; likelyRepos=" + likelyGithubRepos(target).stream()
+                    .map(repo -> repo.owner + "/" + repo.name)
+                    .collect(Collectors.joining(", ")));
             if (shouldProbePreferredGithubForkSources(target)) {
+                pathDebug(target, "provider.github.preferredOwners", "probing preferred owners="
+                    + String.join(", ", config.discovery.preferredOwners));
                 candidates.addAll(discoverPreferredGithubForkSources(target, priority, allowReleaseLookup));
                 if (!candidates.isEmpty() || isGithubPluginBudgetLimited(target)) {
+                    pathDebug(target, "provider.github.targeted.done", "preferred-owner probes produced "
+                        + candidates.size() + " candidate(s); budgetLimited=" + isGithubPluginBudgetLimited(target));
                     return candidates;
                 }
             }
@@ -5163,9 +6082,12 @@ public final class AutoUpdater {
                 }
                 String repoKey = lower(repo.owner + "/" + repo.name);
                 if (forkNeighborhoods.add(repoKey)) {
+                    pathDebug(target, "provider.github.forks", "probing fork neighborhood for " + repo.owner + "/" + repo.name);
                     candidates.addAll(discoverGithubForkNeighborhood(target, repo, priority, allowReleaseLookup));
                 }
                 List<GithubRepo> matchedRepos = matchingGithubRepoVariants(target, repo, allowReleaseLookup);
+                pathDebug(target, "provider.github.variants", repo.owner + "/" + repo.name + " produced "
+                    + matchedRepos.size() + " descriptor-matched variant(s)");
                 for (GithubRepo matchedRepo : matchedRepos) {
                     if (isGithubPluginBudgetLimited(target)) {
                         break;
@@ -5174,6 +6096,8 @@ public final class AutoUpdater {
                     String repoName = matchedRepo.owner + "/" + matchedRepo.name;
                     String matchedKey = lower(matchedRepo.owner + "/" + matchedRepo.name);
                     if (forkNeighborhoods.add(matchedKey)) {
+                        pathDebug(target, "provider.github.forks", "probing fork neighborhood for matched repo "
+                            + matchedRepo.owner + "/" + matchedRepo.name);
                         candidates.addAll(discoverGithubForkNeighborhood(target, matchedRepo, priority, allowReleaseLookup));
                     }
                     Optional<DiscoveryCandidate> latest = allowReleaseLookup
@@ -5197,6 +6121,7 @@ public final class AutoUpdater {
                     }
                 }
             }
+            pathDebug(target, "provider.github.targeted.done", "targeted probes produced " + candidates.size() + " candidate(s)");
             return candidates;
         }
 
@@ -5426,7 +6351,15 @@ public final class AutoUpdater {
                 URI uri = URI.create("https://api.github.com/repos/" + urlEncode(repo.owner) + "/" + urlEncode(repo.name));
                 Object json = getJson(uri, "GitHub preferred fork repo metadata", target);
                 Map<String, Object> root = asMap(json);
-                return !Boolean.TRUE.equals(root.get("archived")) && !Boolean.TRUE.equals(root.get("disabled"));
+                boolean archived = Boolean.TRUE.equals(root.get("archived"));
+                boolean disabled = Boolean.TRUE.equals(root.get("disabled"));
+                if (archived || disabled) {
+                    pathDebug(target, "provider.github.archived.skip", "preferred-owner repo skipped "
+                        + repo.owner + "/" + repo.name + "; archived=" + archived + "; disabled=" + disabled);
+                    return false;
+                }
+                pathDebug(target, "provider.github.preferred.metadata", repo.owner + "/" + repo.name + " is selectable");
+                return true;
             } catch (Exception ex) {
                 if (isGithubPluginBudgetLimited(target) || githubRateLimited || config.githubRateLimit.isPaused() || githubAuthFailed) {
                     Log.warn("Preferred fork discovery deferred for " + target.displayName()
@@ -5436,6 +6369,8 @@ public final class AutoUpdater {
                     Log.info("Preferred fork metadata check failed for " + repo.owner + "/" + repo.name
                         + ": " + ex.getMessage());
                 }
+                pathDebug(target, "provider.github.preferred.metadata.failed", repo.owner + "/" + repo.name
+                    + " -> " + ex.getMessage());
                 return false;
             }
         }
@@ -5445,9 +6380,17 @@ public final class AutoUpdater {
             testDiscoveryTrace.add("forks:" + upstreamRepo.owner + "/" + upstreamRepo.name);
             if (!allowApiInspection || githubAuthFailed || githubRateLimited || config.githubRateLimit.isPaused()
                 || isGithubPluginBudgetLimited(target)) {
+                pathDebug(target, "provider.github.forks.skip", upstreamRepo.owner + "/" + upstreamRepo.name
+                    + "; allowApiInspection=" + allowApiInspection
+                    + "; authFailed=" + githubAuthFailed
+                    + "; rateLimited=" + githubRateLimited
+                    + "; paused=" + config.githubRateLimit.isPaused()
+                    + "; budgetLimited=" + isGithubPluginBudgetLimited(target));
                 return Collections.emptyList();
             }
             if (!shouldSearchGithubForkNeighborhood(target)) {
+                pathDebug(target, "provider.github.forks.skip", upstreamRepo.owner + "/" + upstreamRepo.name
+                    + "; installed/plugin identity does not suggest Folia fork neighborhood search");
                 return Collections.emptyList();
             }
             List<DiscoveryCandidate> candidates = new ArrayList<>();
@@ -5461,11 +6404,15 @@ public final class AutoUpdater {
                 for (Object item : forks) {
                     Map<String, Object> fork = asMap(item);
                     if (Boolean.TRUE.equals(fork.get("archived")) || Boolean.TRUE.equals(fork.get("disabled"))) {
+                        pathDebug(target, "provider.github.archived.skip", "fork search skipped archived/disabled repo "
+                            + firstNonBlank(stringValue(fork.get("full_name")), stringValue(fork.get("name")), "unknown"));
                         continue;
                     }
                     String fullName = stringValue(fork.get("full_name"));
                     GithubRepo forkRepo = repoFromGithubValue(fullName);
                     if (forkRepo == null || !looksLikeUsefulForkCandidate(target, forkRepo, fork)) {
+                        pathDebug(target, "provider.github.fork.reject", firstNonBlank(fullName, "unknown")
+                            + " did not pass useful-fork heuristic");
                         continue;
                     }
                     Optional<GithubRepo> matchedFork = githubCommonRawDescriptorMatch(target, forkRepo);
@@ -5481,6 +6428,8 @@ public final class AutoUpdater {
                         matchedFork = Optional.of(forkRepo);
                     }
                     if (matchedFork.isEmpty()) {
+                        pathDebug(target, "provider.github.fork.reject", fullName
+                            + " had no matching raw/archive/source descriptor");
                         continue;
                     }
                     GithubRepo repo = matchedFork.get();
@@ -5502,28 +6451,43 @@ public final class AutoUpdater {
                     Log.info("GitHub fork neighborhood lookup failed for " + upstreamRepo.owner + "/" + upstreamRepo.name
                         + ": " + ex.getMessage());
                 }
+                pathDebug(target, "provider.github.forks.failed", upstreamRepo.owner + "/" + upstreamRepo.name
+                    + " -> " + ex.getMessage());
             }
+            pathDebug(target, "provider.github.forks.done", upstreamRepo.owner + "/" + upstreamRepo.name
+                + " produced " + candidates.size() + " candidate(s)");
             return candidates;
         }
 
         private Optional<GithubRepo> githubArchiveDescriptorMatch(TargetConfig target, GithubRepo repo) {
             try {
+                pathDebug(target, "provider.github.archive.inspect", "checking source archive descriptors for "
+                    + repo.owner + "/" + repo.name);
                 List<PluginJarInfo> descriptors = githubRepoArchiveDescriptors(repo);
                 if (descriptors.isEmpty()) {
+                    pathDebug(target, "provider.github.archive.reject", repo.owner + "/" + repo.name
+                        + " archive had no plugin descriptors");
                     return Optional.empty();
                 }
                 PluginJarInfo installed = installedPluginInfo(target);
                 for (PluginJarInfo descriptor : descriptors) {
                     if (pluginDescriptorMatchesTarget(installed, target, descriptor)) {
+                        pathDebug(target, "provider.github.archive.match", repo.owner + "/" + repo.name
+                            + " descriptor=" + firstNonBlank(descriptor.name, descriptor.id, "unknown")
+                            + "; foliaSupported=" + descriptor.foliaSupported);
                         rememberSourceProof(target, githubSourceUrl(repo), "github-source", repo, descriptor, "archive-descriptor-match");
                         return Optional.of(repo);
                     }
                 }
+                pathDebug(target, "provider.github.archive.reject", repo.owner + "/" + repo.name
+                    + " descriptors did not match installed plugin");
             } catch (Exception ex) {
                 if (!isGithubPluginBudgetLimited(target) && !isExpectedMissingGithubProbe(ex)) {
                     Log.info("Could not inspect GitHub fork source archive for " + repo.owner + "/" + repo.name
                         + ": " + ex.getMessage());
                 }
+                pathDebug(target, "provider.github.archive.failed", repo.owner + "/" + repo.name
+                    + " -> " + ex.getMessage());
             }
             return Optional.empty();
         }
@@ -5832,23 +6796,34 @@ public final class AutoUpdater {
 
         private Optional<DiscoveryCandidate> latestGithubCandidate(TargetConfig target, GithubRepo repo, int priority, String reason) {
             try {
+                pathDebug(target, "provider.github.release.lookup", repo.owner + "/" + repo.name
+                    + "; reason=" + reason);
                 URI uri = URI.create("https://api.github.com/repos/" + urlEncode(repo.owner) + "/" + urlEncode(repo.name) + "/releases?per_page=10");
                 Object json = getJson(uri, "GitHub releases", target);
                 if (!(json instanceof List<?> releases)) {
+                    pathDebug(target, "provider.github.release.reject", repo.owner + "/" + repo.name
+                        + " response was not a release list");
                     return Optional.empty();
                 }
                 for (Object item : releases) {
                     Map<String, Object> release = asMap(item);
                     if (Boolean.TRUE.equals(release.get("draft"))) {
+                        pathDebug(target, "provider.github.release.skip", repo.owner + "/" + repo.name
+                            + " skipped draft release " + firstNonBlank(stringValue(release.get("tag_name")), stringValue(release.get("name")), "unknown"));
                         continue;
                     }
                     if (target.versionType == null || target.versionType.isBlank()) {
                         if (Boolean.TRUE.equals(release.get("prerelease"))) {
+                            pathDebug(target, "provider.github.release.skip", repo.owner + "/" + repo.name
+                                + " skipped prerelease " + firstNonBlank(stringValue(release.get("tag_name")), stringValue(release.get("name")), "unknown"));
                             continue;
                         }
                     }
                     Optional<Map<String, Object>> asset = githubJarAsset(release);
                     if (asset.isEmpty()) {
+                        pathDebug(target, "provider.github.release.skip", repo.owner + "/" + repo.name
+                            + " release had no usable jar asset "
+                            + firstNonBlank(stringValue(release.get("tag_name")), stringValue(release.get("name")), "unknown"));
                         continue;
                     }
                     String version = firstNonBlank(stringValue(release.get("tag_name")), stringValue(release.get("name")));
@@ -5862,6 +6837,8 @@ public final class AutoUpdater {
                         && sourceBuildAllowed
                         && !releaseAssetNameMatchesTarget(target, assetName)
                         && !repoNameMatchesTarget(target, repo)) {
+                        pathDebug(target, "provider.github.release.source-build", repoName
+                            + " descriptor matches source tree, but release asset " + assetName + " looks like another module");
                         return Optional.of(candidateFromResolved(target, "github-source", source, repoName, "", repoName,
                             sourceBuildFallbackPriority(priority), reason + "; source tree contains this plugin but release jar appears to be another module"));
                     }
@@ -5875,23 +6852,32 @@ public final class AutoUpdater {
                         && publishedAt != null) {
                         Optional<Instant> latestCommit = latestGitHubCommitTime(repo, target, repoName);
                         if (latestCommit.isPresent() && latestCommit.get().isAfter(publishedAt.plus(Duration.ofMinutes(5)))) {
+                            pathDebug(target, "provider.github.release.source-build", repoName
+                                + " latest commit " + latestCommit.get() + " is newer than release " + publishedAt);
                             return Optional.of(candidateFromResolved(target, "github-source", source, repoName, "", repoName,
                                 sourceBuildFallbackPriority(priority), reason + "; latest commit is newer than release jar"));
                         }
                     }
+                    pathDebug(target, "provider.github.release.match", repoName + " release="
+                        + firstNonBlank(version, "unknown") + "; asset=" + assetName);
                     return Optional.of(candidateFromResolved(target, "github-release", source, repo.owner + "/" + repo.name, version, label, priority, reason));
                 }
             } catch (Exception ex) {
+                pathDebug(target, "provider.github.release.failed", repo.owner + "/" + repo.name + " -> " + ex.getMessage());
                 Log.warn("GitHub releases lookup failed for " + repo.owner + "/" + repo.name + ": " + ex.getMessage());
             }
             if (config.buildFromSource.allowsBuild()) {
                 String source = githubSourceUrl(repo);
                 String repoName = repo.owner + "/" + repo.name;
                 if (sourceBuildAllowedForRepo(repoName, githubSourceDescriptorEvidence(target, "github-source", source, repoName))) {
+                    pathDebug(target, "provider.github.source-build.fallback", repoName
+                        + " has no release jar candidate, but trusted/descriptor source build is allowed");
                     return Optional.of(candidateFromResolved(target, "github-source", source, repoName, "", repoName,
                         sourceBuildFallbackPriority(priority), reason + "; no release jar found, trusted source build fallback"));
                 }
             }
+            pathDebug(target, "provider.github.release.reject", repo.owner + "/" + repo.name
+                + " produced no release/source-build candidate");
             return Optional.empty();
         }
 
@@ -5957,6 +6943,9 @@ public final class AutoUpdater {
         private List<DiscoveryCandidate> discoverModrinthSources(TargetConfig target, int priority) throws Exception {
             List<DiscoveryCandidate> candidates = new ArrayList<>();
             Set<String> triedSlugs = new HashSet<>();
+            pathDebug(target, "provider.modrinth.start", "priority=" + priority
+                + "; exactSlugs=" + String.join(", ", exactModrinthSlugs(target))
+                + "; searchTerms=" + String.join(", ", discoverySearchTerms(target)));
             for (String slug : exactModrinthSlugs(target)) {
                 if (!triedSlugs.add(lower(slug))) {
                     continue;
@@ -5972,10 +6961,12 @@ public final class AutoUpdater {
                     candidates.add(candidateFromResolved(target, "modrinth", candidateTarget.source, slug, latest, slug, priority,
                         "Modrinth exact slug probe: " + slug, download));
                 } catch (Exception ignored) {
+                    pathDebug(target, "provider.modrinth.exact.failed", "slug=" + slug);
                     // Exact slug probes are intentionally quiet; broad search below will report useful failures.
                 }
             }
             for (String term : discoverySearchTerms(target)) {
+                pathDebug(target, "provider.modrinth.search", "term=" + term);
                 URI uri = URI.create("https://api.modrinth.com/v2/search?query="
                     + urlEncode(term)
                     + "&facets=" + urlEncode("[[\"project_type:plugin\",\"project_type:mod\"]]")
@@ -5998,6 +6989,7 @@ public final class AutoUpdater {
                     }
                     int match = nameMatchScore(target, title, slug, projectId);
                     if (match < 35) {
+                        pathDebug(target, "provider.modrinth.reject", slug + " name match " + match + " < 35");
                         continue;
                     }
                     TargetConfig candidateTarget = target.copyWithSource("https://modrinth.com/plugin/" + slug + "/versions");
@@ -6011,16 +7003,24 @@ public final class AutoUpdater {
                         candidates.add(candidateFromResolved(target, "modrinth", candidateTarget.source, slug, latest, title, priority,
                             "Modrinth search match: " + title, download));
                     } catch (Exception ex) {
+                        pathDebug(target, "provider.modrinth.resolve.failed", slug + " -> " + ex.getMessage());
                         Log.warn("Modrinth candidate did not resolve for " + slug + ": " + ex.getMessage());
                     }
                 }
             }
+            pathDebug(target, "provider.modrinth.done", "tried " + triedSlugs.size()
+                + " slug(s); produced " + candidates.size() + " candidate(s)");
             return candidates;
         }
 
         private List<DiscoveryCandidate> discoverHangarSources(TargetConfig target, int priority) throws Exception {
             List<DiscoveryCandidate> candidates = new ArrayList<>();
             Set<String> triedProjects = new HashSet<>();
+            pathDebug(target, "provider.hangar.start", "priority=" + priority
+                + "; exactProjects=" + exactHangarProjects(target).stream()
+                    .map(project -> project.owner + "/" + project.slug)
+                    .collect(Collectors.joining(", "))
+                + "; searchTerms=" + String.join(", ", discoverySearchTerms(target)));
             for (HangarProject project : exactHangarProjects(target)) {
                 String key = lower(project.owner + "/" + project.slug);
                 if (!triedProjects.add(key)) {
@@ -6035,10 +7035,12 @@ public final class AutoUpdater {
                     candidates.add(candidateFromResolved(target, "hangar", source, candidateTarget.project, latest, project.slug, priority,
                         "Hangar exact project probe: " + project.owner + "/" + project.slug, download));
                 } catch (Exception ignored) {
+                    pathDebug(target, "provider.hangar.exact.failed", "project=" + project.owner + "/" + project.slug);
                     // Exact project probes are intentionally quiet; broad search below will report useful failures.
                 }
             }
             for (String term : discoverySearchTerms(target)) {
+                pathDebug(target, "provider.hangar.search", "term=" + term);
                 URI uri = URI.create("https://hangar.papermc.io/api/v1/projects?limit=8&offset=0&q=" + urlEncode(term));
                 Object json = getJson(uri, "Hangar search");
                 Object resultObj = asMap(json).get("result");
@@ -6055,6 +7057,8 @@ public final class AutoUpdater {
                     String name = firstNonBlank(stringValue(project.get("name")), hangarProject.slug);
                     int match = nameMatchScore(target, name, hangarProject.slug, hangarProject.owner + "/" + hangarProject.slug);
                     if (match < 35) {
+                        pathDebug(target, "provider.hangar.reject", hangarProject.owner + "/" + hangarProject.slug
+                            + " name match " + match + " < 35");
                         continue;
                     }
                     String source = "https://hangar.papermc.io/" + hangarProject.owner + "/" + hangarProject.slug + "/versions";
@@ -6066,10 +7070,14 @@ public final class AutoUpdater {
                         candidates.add(candidateFromResolved(target, "hangar", source, candidateTarget.project, latest, name, priority,
                             "Hangar search match: " + name, download));
                     } catch (Exception ex) {
+                        pathDebug(target, "provider.hangar.resolve.failed", hangarProject.owner + "/" + hangarProject.slug
+                            + " -> " + ex.getMessage());
                         Log.warn("Hangar candidate did not resolve for " + hangarProject.owner + "/" + hangarProject.slug + ": " + ex.getMessage());
                     }
                 }
             }
+            pathDebug(target, "provider.hangar.done", "tried " + triedProjects.size()
+                + " project(s); produced " + candidates.size() + " candidate(s)");
             return candidates;
         }
 
@@ -6229,6 +7237,10 @@ public final class AutoUpdater {
                                                          String label, int priority, String reason, ResolvedDownload download) {
             int match = nameMatchScore(target, label, source, projectHint);
             int score = 35 + match - (priority * 3);
+            List<String> scoreParts = new ArrayList<>();
+            scoreParts.add("base=35");
+            scoreParts.add("nameMatch=+" + match);
+            scoreParts.add("priorityPenalty=-" + (priority * 3));
             SourceOwnerSignal ownerSignal = sourceOwnerSignal(target.detectedAuthors, type, source, projectHint, label);
             SourceDescriptorEvidence descriptorEvidence = reason.contains("targeted GitHub repo descriptor match")
                 || reason.contains("preferred-owner GitHub repo descriptor match")
@@ -6239,15 +7251,20 @@ public final class AutoUpdater {
             String descriptorReason = "";
             if (descriptorEvidence == SourceDescriptorEvidence.MATCH) {
                 score += 45;
+                scoreParts.add("descriptorMatch=+45");
                 ownerSignal = new SourceOwnerSignal(0, false, "");
                 descriptorReason = "; source descriptor matches installed plugin";
                 Optional<PluginJarInfo> matchingDescriptor = matchingCandidateDescriptor(target, type, source, projectHint, download);
                 DescriptorRankingSignal foliaSignal = foliaDescriptorRankingSignal(target, matchingDescriptor);
                 score += foliaSignal.scoreDelta;
+                if (foliaSignal.scoreDelta != 0) {
+                    scoreParts.add("foliaSignal=" + signedScore(foliaSignal.scoreDelta));
+                }
                 descriptorReason += foliaSignal.reason;
                 Optional<ForkLineage> forkLineage = forkLineageForCandidate(target, type, source, projectHint, download);
                 if (forkLineage.isPresent()) {
                     score += 10;
+                    scoreParts.add("forkLineage=+10");
                     String lineage = forkLineage.get().describe();
                     descriptorReason += "; accepted as descriptor-proven fork"
                         + (lineage.isBlank() ? "" : " (" + lineage + ")");
@@ -6256,25 +7273,33 @@ public final class AutoUpdater {
                 }
             } else if (descriptorEvidence == SourceDescriptorEvidence.MISMATCH) {
                 score -= 100;
+                scoreParts.add("descriptorMismatch=-100");
                 descriptorReason = "; source descriptors did not match installed plugin";
             } else if ((type.equals("modrinth") || type.equals("hangar")) && download != null) {
                 score -= 55;
+                scoreParts.add("hostedDescriptorUnverified=-55");
                 descriptorReason = "; source descriptor could not be verified from candidate jar";
             }
             score += ownerSignal.scoreDelta;
+            if (ownerSignal.scoreDelta != 0) {
+                scoreParts.add("ownerSignal=" + signedScore(ownerSignal.scoreDelta));
+            }
             String localVersion = target.detectedVersion == null ? "" : target.detectedVersion;
             String versionReason = "";
             if (!localVersion.isBlank() && !latestVersion.isBlank()) {
                 if (isClearlyOlderVersion(latestVersion, localVersion)) {
                     score -= 100;
+                    scoreParts.add("olderThanLocal=-100");
                     versionReason = "; rejected-looking version: latest " + latestVersion + " appears older than local " + localVersion;
                 } else {
                     int cmp = compareVersionValues(cleanVersion(latestVersion), cleanVersion(localVersion));
                     if (cmp == 0) {
                         score += 25;
+                        scoreParts.add("versionMatch=+25");
                         versionReason = "; version matches local " + localVersion;
                     } else if (cmp > 0) {
                         score += 15;
+                        scoreParts.add("newerThanLocal=+15");
                         versionReason = "; latest " + latestVersion + " appears newer than local " + localVersion;
                     } else {
                         versionReason = "; latest " + latestVersion + " is not clearly newer than local " + localVersion;
@@ -6284,11 +7309,22 @@ public final class AutoUpdater {
                 versionReason = "; source build candidate has no release version to compare with local " + localVersion;
             } else if (!localVersion.isBlank()) {
                 score -= 25;
+                scoreParts.add("noComparableVersion=-25");
                 versionReason = "; no comparable latest version found while local version is " + localVersion;
             }
             String ownerReason = ownerSignal.reason.isBlank() ? "" : "; " + ownerSignal.reason;
             String fullReason = reason + "; name match score " + match + ownerReason + descriptorReason + versionReason;
+            pathDebug(target, "candidate.score", type + " -> " + source
+                + "; total=" + score
+                + "; parts=" + String.join(", ", scoreParts)
+                + "; descriptorEvidence=" + descriptorEvidence
+                + "; latest=" + firstNonBlank(latestVersion, "unknown")
+                + "; local=" + firstNonBlank(localVersion, "unknown"));
             return new DiscoveryCandidate(type, source, projectHint, latestVersion, label, fullReason, score, priority);
+        }
+
+        private String signedScore(int value) {
+            return value >= 0 ? "+" + value : Integer.toString(value);
         }
 
         private Optional<PluginJarInfo> matchingCandidateDescriptor(TargetConfig target, String type, String source,
@@ -7474,21 +8510,29 @@ public final class AutoUpdater {
         }
 
         List<InstalledUpdate> updateAll() throws Exception {
+            traceConfigPathOnce("updateAll");
             List<InstalledUpdate> installed = new ArrayList<>();
             Files.createDirectories(config.resolve(config.cacheDir));
             Files.createDirectories(config.resolve(config.backupDir));
             autoSwitchMissingPluginSources();
             for (TargetConfig target : allTargets()) {
+                pathDebug(target, "update.target", "begin update pass; enabled=" + target.enabled
+                    + "; autoUpdate=" + target.autoUpdate + "; source=" + firstNonBlank(target.source, "blank")
+                    + "; origin=" + firstNonBlank(target.sourceOrigin, "blank")
+                    + "; type=" + firstNonBlank(target.type, "blank"));
                 if (!target.enabled) {
+                    pathDebug(target, "update.skip", "target disabled");
                     Log.info("Skipping disabled target: " + target.displayName());
                     continue;
                 }
                 if (!target.server && !target.autoUpdate) {
+                    pathDebug(target, "update.skip", "plugin autoUpdate is false");
                     Log.info("Skipping " + target.displayName() + " because autoUpdate is false.");
                     continue;
                 }
                 if (isMissingSourceValue(target.source)
                     && !canBuildFromSource(target)) {
+                    pathDebug(target, "update.skip", "no source configured and no trusted source build target is available");
                     Log.info("No source configured for " + target.displayName()
                         + (isNotFoundSourceValue(target.source) ? " (discovery marked Not Found)" : "")
                         + "; keeping existing jar.");
@@ -7504,9 +8548,11 @@ public final class AutoUpdater {
                         mayContinue = true;
                     }
                     if (mayContinue) {
+                        pathDebug(target, "update.failure.keep-current", safeExceptionMessage(ex));
                         Log.warn("Update failed for " + target.displayName() + ": " + safeExceptionMessage(ex));
                         Log.warn("Keeping current jar for " + target.displayName() + ".");
                     } else {
+                        pathDebug(target, "update.failure.throw", safeExceptionMessage(ex));
                         throw ex;
                     }
                 }
@@ -7524,10 +8570,12 @@ public final class AutoUpdater {
         private Optional<InstalledUpdate> updateOne(TargetConfig target) throws Exception {
             if (isMissingSourceValue(target.source)) {
                 if (canBuildFromSource(target)) {
+                    pathDebug(target, "update.source", "no hosted source configured; using trusted Git source build");
                     Log.info("Decision for " + target.displayName()
                         + ": no hosted source is configured, so building from trusted Git source.");
                     return updateOneFromSource(sourceBuildTarget(target));
                 }
+                pathDebug(target, "update.skip", "no source configured");
                 Log.info("No source configured for " + target.displayName()
                     + (isNotFoundSourceValue(target.source) ? " (discovery marked Not Found)" : "")
                     + "; keeping existing jar.");
@@ -7536,6 +8584,7 @@ public final class AutoUpdater {
             List<String> sources = new ArrayList<>();
             sources.add(target.source);
             sources.addAll(target.fallbackSources);
+            pathDebug(target, "update.sources", "source order=" + String.join(" -> ", sources));
             Exception last = null;
             Set<String> attemptedSources = new HashSet<>();
             boolean gitBuildAttempted = false;
@@ -7543,16 +8592,22 @@ public final class AutoUpdater {
                 attemptedSources.add(canonicalSourceMatchKey(target.source));
                 gitBuildAttempted = true;
                 try {
+                    pathDebug(target, "update.source-build.primary", "explicit primary source type " + lower(target.type));
                     Log.info("Decision for " + target.displayName()
                         + ": primary source is explicitly configured as " + lower(target.type) + ", so building it before hosted fallbacks.");
                     return updateOneFromSource(target);
                 } catch (Exception ex) {
                     last = ex;
+                    pathDebug(target, "update.source-build.primary.failed", safeExceptionMessage(ex));
                     Log.warn("Primary Git source failed for " + target.displayName()
                         + "; trying configured fallback source(s): " + safeExceptionMessage(ex));
                 }
             }
             List<HostedCandidate> hostedCandidates = resolveFreshestHostedCandidates(target, sources);
+            pathDebug(target, "update.hosted-candidates", "resolved " + hostedCandidates.size() + " hosted candidate(s)"
+                + (hostedCandidates.isEmpty() ? "" : ": " + hostedCandidates.stream()
+                    .map(this::sourceLabel)
+                    .collect(Collectors.joining(", "))));
             if (!hostedCandidates.isEmpty()) {
                 Optional<Instant> latestCommit = latestGitHubCommitTime(target);
                 for (int i = 0; i < hostedCandidates.size(); i++) {
@@ -7561,9 +8616,11 @@ public final class AutoUpdater {
                     if (!gitBuildAttempted && shouldBuildFromNewerGitSource(target, candidate, latestCommit)) {
                         gitBuildAttempted = true;
                         try {
+                            pathDebug(target, "update.source-build.newer-git", "latest Git commit is preferred over " + sourceLabel(candidate));
                             return updateOneFromSource(sourceBuildTarget(target));
                         } catch (Exception ex) {
                             last = ex;
+                            pathDebug(target, "update.source-build.newer-git.failed", safeExceptionMessage(ex));
                             Log.warn("Git source build failed for " + target.displayName()
                                 + "; falling back to hosted jar " + sourceLabel(candidate) + ": " + ex.getMessage());
                         }
@@ -7572,6 +8629,8 @@ public final class AutoUpdater {
                         if (i == 0) {
                             logHostedDecision(target, candidate, latestCommit);
                         } else {
+                            pathDebug(target, "update.hosted.alternate", "trying alternate hosted source " + (i + 1)
+                                + " of " + hostedCandidates.size() + ": " + sourceLabel(candidate));
                             Log.warn("Trying alternate hosted source " + (i + 1) + " of "
                                 + hostedCandidates.size() + " for " + target.displayName()
                                 + ": " + sourceLabel(candidate) + ".");
@@ -7579,6 +8638,7 @@ public final class AutoUpdater {
                         return installResolvedDownload(candidate.target, candidate.plan, candidate.download);
                     } catch (Exception ex) {
                         last = ex;
+                        pathDebug(target, "update.hosted.failed", sourceLabel(candidate) + " -> " + safeExceptionMessage(ex));
                         if (i + 1 < hostedCandidates.size()) {
                             Log.warn("Hosted source failed for " + target.displayName() + ": " + safeExceptionMessage(ex));
                         }
@@ -7588,12 +8648,15 @@ public final class AutoUpdater {
             for (int i = 0; i < sources.size(); i++) {
                 TargetConfig candidate = i == 0 ? target : target.copyWithSource(sources.get(i));
                 if (attemptedSources.contains(canonicalSourceMatchKey(candidate.source))) {
+                    pathDebug(target, "update.source.skip", "already attempted " + candidate.source);
                     continue;
                 }
                 try {
+                    pathDebug(target, "update.source.try", "trying source " + (i + 1) + " of " + sources.size() + ": " + candidate.source);
                     return updateOneFromSource(candidate);
                 } catch (Exception ex) {
                     last = ex;
+                    pathDebug(target, "update.source.failed", candidate.source + " -> " + safeExceptionMessage(ex));
                     if (i + 1 < sources.size()) {
                         Log.warn("Source failed for " + target.displayName() + ": " + safeExceptionMessage(ex));
                         Log.warn("Trying fallback source " + (i + 2) + " of " + sources.size() + ".");
@@ -7602,14 +8665,17 @@ public final class AutoUpdater {
             }
             if (!gitBuildAttempted && shouldTrySourceBuildFallback(target, sources)) {
                 try {
+                    pathDebug(target, "update.source-build.fallback", "hosted sources failed; trying trusted Git source build");
                     Log.warn("Decision for " + target.displayName()
                         + ": hosted sources failed to resolve, so trying trusted Git source build.");
                     return updateOneFromSource(sourceBuildTarget(target));
                 } catch (Exception ex) {
                     last = ex;
+                    pathDebug(target, "update.source-build.fallback.failed", safeExceptionMessage(ex));
                 }
             }
             if (last instanceof KnownBadPluginUpdateException) {
+                pathDebug(target, "update.known-bad", last.getMessage());
                 Log.warn(last.getMessage() + "; keeping current jar.");
                 return Optional.empty();
             }
@@ -7714,26 +8780,33 @@ public final class AutoUpdater {
             if (!config.buildFromSource.autoFallback()
                 || !config.buildFromSource.preferHostedIfSameVersion
                 || !canBuildFromSource(target)) {
+                pathDebug(target, "git-preference.skip", "source build fallback disabled, preferHostedIfSameVersion disabled, or no trusted Git source available");
                 return false;
             }
             if (hosted.plan.type.equals("git") || hosted.plan.type.equals("github-source")) {
+                pathDebug(target, "git-preference.skip", "candidate is already a Git/source build plan");
                 return false;
             }
             if (isManualConfiguredSource(target) && !lower(firstNonBlank(target.type, "")).equals("github-source")) {
+                pathDebug(target, "git-preference.skip", "configured source is manual; Git commits are not preferred unless type=github-source");
                 Log.info("Decision for " + target.displayName() + ": using hosted jar because the configured source is manual; "
                     + "newer Git commits are not built unless the entry explicitly uses type=github-source.");
                 return false;
             }
             if (hosted.download.publishedAt == null || latestCommit.isEmpty()) {
+                pathDebug(target, "git-preference.skip", "missing hosted publish time or latest Git commit time");
                 return false;
             }
             Instant hostedTime = hosted.download.publishedAt;
             Instant commitTime = latestCommit.get();
             if (commitTime.isAfter(hostedTime.plus(Duration.ofMinutes(5)))) {
+                pathDebug(target, "git-preference.use-git", "latest commit " + commitTime
+                    + " is newer than hosted " + sourceLabel(hosted));
                 Log.warn("Decision for " + target.displayName() + ": building from Git because latest commit "
                     + commitTime + " is newer than freshest hosted source " + sourceLabel(hosted) + ".");
                 return true;
             }
+            pathDebug(target, "git-preference.use-hosted", "hosted source is fresh enough compared with latest commit " + commitTime);
             return false;
         }
 
@@ -7903,12 +8976,18 @@ public final class AutoUpdater {
 
         private Optional<InstalledUpdate> updateOneFromSource(TargetConfig target) throws Exception {
             SourcePlan plan = resolveSource(target);
+            pathDebug(target, "resolve.source", "resolved " + firstNonBlank(target.source, "blank") + " as " + plan.type);
             ResolvedDownload download = plan.resolver.resolve(target);
+            pathDebug(target, "resolve.download", "resolved download uri=" + download.uri
+                + "; version=" + firstNonBlank(download.version, "unknown")
+                + "; publishedAt=" + (download.publishedAt == null ? "unknown" : download.publishedAt.toString()));
             if (!plan.type.equals("git") && !plan.type.equals("github-source")
                 && shouldBuildFromNewerGitSource(target, new HostedCandidate(target, plan, download), latestGitHubCommitTime(target))) {
                 try {
+                    pathDebug(target, "update.source-build.newer-git", "hosted plan resolved, but newer Git source is preferred");
                     return updateOneFromSource(sourceBuildTarget(target));
                 } catch (Exception ex) {
+                    pathDebug(target, "update.source-build.newer-git.failed", safeExceptionMessage(ex));
                     Log.warn("Git source build failed for " + target.displayName()
                         + "; falling back to hosted jar: " + ex.getMessage());
                 }
@@ -7918,17 +8997,22 @@ public final class AutoUpdater {
 
         private Optional<InstalledUpdate> installResolvedDownload(TargetConfig target, SourcePlan plan, ResolvedDownload download) throws Exception {
             Log.info("Checking " + target.displayName() + " (" + plan.type + ")");
+            pathDebug(target, "install.check", "plan=" + plan.type + "; uri=" + download.uri
+                + "; version=" + firstNonBlank(download.version, "unknown")
+                + "; project=" + firstNonBlank(download.project, "unknown"));
             Path targetPath = config.resolve(Paths.get(target.installAs));
             Path stagingDir = config.resolve(config.cacheDir).resolve("staging");
             Files.createDirectories(stagingDir);
             Path staging = stagingDir.resolve(safeName(target.displayName()) + "-" + System.currentTimeMillis() + ".jar");
 
             download(download.uri, staging);
+            pathDebug(target, "install.downloaded", "staged at " + staging);
             try {
                 validateJar(staging);
                 validateDownloadedJar(target, plan, download, staging, targetPath);
             } catch (Exception ex) {
                 Files.deleteIfExists(staging);
+                pathDebug(target, "install.validation.failed", safeExceptionMessage(ex));
                 throw ex;
             }
 
@@ -7937,6 +9021,8 @@ public final class AutoUpdater {
             if (knownBad.isPresent()) {
                 Files.deleteIfExists(staging);
                 BadPluginVersion bad = knownBad.get();
+                pathDebug(target, "install.known-bad", "version=" + firstNonBlank(bad.version, "unknown")
+                    + "; sha256=" + firstNonBlank(bad.sha256, newHash));
                 throw new KnownBadPluginUpdateException("Skipping known-bad update for " + target.displayName()
                     + " (" + firstNonBlank(bad.version, shortHash(bad.sha256)) + ")");
             }
@@ -7945,6 +9031,7 @@ public final class AutoUpdater {
                 if (oldHash.equalsIgnoreCase(newHash)) {
                     Files.deleteIfExists(staging);
                     Log.info(target.displayName() + " is already current (" + shortHash(newHash) + ").");
+                    pathDebug(target, "install.current", "candidate hash matches installed jar " + shortHash(newHash));
                     quarantineDuplicatePluginJars(target, targetPath);
                     updateLockIfNeeded(target, download);
                     return Optional.empty();
@@ -7959,6 +9046,8 @@ public final class AutoUpdater {
             }
             moveReplace(staging, targetPath);
             Log.info("Installed " + target.displayName() + " -> " + targetPath + " (" + shortHash(newHash) + ")");
+            pathDebug(target, "install.installed", "installed " + targetPath + "; backup="
+                + (backupPath == null ? "none" : backupPath.toString()) + "; hash=" + shortHash(newHash));
             quarantineDuplicatePluginJars(target, targetPath);
             updateLockIfNeeded(target, download);
             String installedVersion = downloadVersion(download);
@@ -7984,15 +9073,26 @@ public final class AutoUpdater {
 
         private void validateDownloadedJar(TargetConfig target, SourcePlan plan, ResolvedDownload download, Path staging, Path targetPath) throws IOException {
             if (!config.validation.enabled || target.server) {
+                pathDebug(target, "validation.skip", target.server ? "server target" : "validation disabled");
                 return;
             }
             PluginJarInfo incoming = readPluginJarInfo(staging);
+            pathDebug(target, "validation.incoming", "descriptor=" + incoming.descriptorSummary()
+                + "; name=" + firstNonBlank(incoming.name, incoming.id, "unknown")
+                + "; version=" + firstNonBlank(incoming.version, "unknown")
+                + "; foliaSupported=" + incoming.foliaSupported);
             if (!incoming.hasDescriptor) {
                 throw new IOException("Downloaded jar for " + target.displayName()
                     + " has no plugin descriptor (plugin.yml, paper-plugin.yml, velocity-plugin.json, or bungee.yml)");
             }
 
             PluginJarInfo current = Files.exists(targetPath) ? readPluginJarInfo(targetPath) : null;
+            if (current != null && current.hasDescriptor) {
+                pathDebug(target, "validation.current", "descriptor=" + current.descriptorSummary()
+                    + "; name=" + firstNonBlank(current.name, current.id, "unknown")
+                    + "; version=" + firstNonBlank(current.version, "unknown")
+                    + "; foliaSupported=" + current.foliaSupported);
+            }
             String actualServerProject = inferPaperMcProject(config.server);
             String expectedPlatform = firstNonBlank(inferredPluginPlatform(config.server), lower(target.platform), lower(target.loader));
             if (current != null && current.hasDescriptor) {
@@ -8046,6 +9146,10 @@ public final class AutoUpdater {
 
             int score = validationScore(target, current, incoming, download);
             int minimum = validationMinimum(target, plan);
+            pathDebug(target, "validation.score", "score=" + score + "; minimum=" + minimum
+                + "; parts=" + validationScoreBreakdown(target, current, incoming, download)
+                + "; expectedPlatform=" + firstNonBlank(expectedPlatform, "unknown")
+                + "; actualServerProject=" + firstNonBlank(actualServerProject, "unknown"));
             if (score < minimum) {
                 throw new IOException("Downloaded jar for " + target.displayName()
                     + " failed validation score " + score + "/" + minimum
@@ -8173,6 +9277,47 @@ public final class AutoUpdater {
             return Math.min(100, score);
         }
 
+        private String validationScoreBreakdown(TargetConfig target, PluginJarInfo current, PluginJarInfo incoming, ResolvedDownload download) {
+            List<String> parts = new ArrayList<>();
+            if (current != null && current.hasDescriptor) {
+                int identity = maxIdentitySimilarity(current, incoming);
+                parts.add("installedIdentity=" + identity + "%=>" + signedScore(Math.round(identity * 0.60f)));
+                if (!current.mainClass.isBlank() && !incoming.mainClass.isBlank()) {
+                    int packageScore = current.mainClass.equalsIgnoreCase(incoming.mainClass) ? 15 : packageSimilarityScore(current.mainClass, incoming.mainClass);
+                    parts.add("mainClass=" + signedScore(packageScore));
+                }
+                if (incoming.supportsPlatform(inferredPluginPlatform(config.server))) {
+                    parts.add("platform=+10");
+                }
+                if (!current.authors.isBlank() && !incoming.authors.isBlank() && normalizedAuthorTokensOverlap(current.authors, incoming.authors)) {
+                    parts.add("authors=+5");
+                }
+                if (!current.website.isBlank() && !incoming.website.isBlank() && sameHost(current.website, incoming.website)) {
+                    parts.add("website=+5");
+                }
+                if (!current.dependencies.isBlank() && !incoming.dependencies.isBlank() && normalizedTokensOverlap(current.dependencies, incoming.dependencies)) {
+                    parts.add("dependencies=+3");
+                }
+            } else {
+                int identity = maxIdentitySimilarity(target, incoming);
+                parts.add("targetIdentity=" + identity + "%=>" + signedScore(Math.round(identity * 0.65f)));
+                if (incoming.supportsPlatform(inferredPluginPlatform(config.server))) {
+                    parts.add("platform=+20");
+                }
+                if (incoming.hasDescriptor) {
+                    parts.add("descriptor=+10");
+                }
+            }
+            if (download != null && !download.version.isBlank() && !incoming.version.isBlank()
+                && cleanVersion(download.version).equalsIgnoreCase(cleanVersion(incoming.version))) {
+                parts.add("resolverVersionMatchesDescriptor=+3");
+            }
+            if (sourceTextMatchesPlugin(target, incoming)) {
+                parts.add("sourceTextMatchesPlugin=+7");
+            }
+            return String.join(", ", parts);
+        }
+
         private void quarantineDuplicatePluginJars(TargetConfig target, Path targetPath) throws IOException {
             if (!config.duplicates.enabled || target.server || !Files.isRegularFile(targetPath)) {
                 return;
@@ -8289,6 +9434,8 @@ public final class AutoUpdater {
 
         void rememberStartupFailures(List<InstalledUpdate> updates, String reason) {
             if (!config.failureMemory.enabled || updates.isEmpty()) {
+                pathDebug(null, "lock.failureMemory.skip", "enabled=" + config.failureMemory.enabled
+                    + "; updates=" + updates.size() + "; reason=" + reason);
                 return;
             }
             try {
@@ -8297,9 +9444,15 @@ public final class AutoUpdater {
                 int rememberedServers = 0;
                 for (InstalledUpdate update : updates) {
                     if (update != null && update.target.server) {
+                        pathDebug(update.target, "lock.failureMemory.server", "remember known-bad server build; reason=" + reason
+                            + "; version=" + firstNonBlank(update.serverGameVersion, update.version, "unknown")
+                            + "; build=" + firstNonBlank(update.serverBuild, "unknown"));
                         lock.rememberBadServerBuild(update, reason);
                         rememberedServers++;
                     } else if (update != null) {
+                        pathDebug(update.target, "lock.failureMemory.plugin", "remember known-bad plugin update; reason=" + reason
+                            + "; version=" + firstNonBlank(update.version, "unknown")
+                            + "; hash=" + shortHash(update.sha256));
                         lock.rememberBadPlugin(update, reason);
                         remembered++;
                     }
@@ -8314,12 +9467,14 @@ public final class AutoUpdater {
                     }
                 }
             } catch (IOException ex) {
+                pathDebug(null, "lock.failureMemory.write.failed", ex.getMessage());
                 Log.warn("Could not write failure memory to updater.lock.yml: " + ex.getMessage());
             }
         }
 
         void restoreServerLockAfterRollback(InstalledUpdate update) {
             if (update == null || !update.target.server || update.previousServerLock == null) {
+                pathDebug(update == null ? null : update.target, "lock.server.restore.skip", "not a server rollback or no previous lock snapshot");
                 return;
             }
             try {
@@ -8332,7 +9487,11 @@ public final class AutoUpdater {
                     + firstNonBlank(state.serverProject, "server") + " "
                     + firstNonBlank(state.serverGameVersion, "unlocked")
                     + (state.serverBuild.isBlank() ? "" : " build " + state.serverBuild) + ".");
+                pathDebug(update.target, "lock.server.restore", "project=" + firstNonBlank(state.serverProject, "server")
+                    + "; gameVersion=" + firstNonBlank(state.serverGameVersion, "unlocked")
+                    + "; build=" + firstNonBlank(state.serverBuild, "unlocked"));
             } catch (IOException ex) {
+                pathDebug(update.target, "lock.server.restore.failed", ex.getMessage());
                 Log.warn("Could not restore updater.lock.yml server version after rollback: " + ex.getMessage());
             }
         }
@@ -8356,6 +9515,9 @@ public final class AutoUpdater {
 
         private void updateLockIfNeeded(TargetConfig target, ResolvedDownload download) {
             if (!target.server || !"papermc".equals(download.sourceType) || download.gameVersion == null || download.gameVersion.isBlank()) {
+                pathDebug(target, "lock.server.update.skip", "target.server=" + target.server
+                    + "; sourceType=" + firstNonBlank(download.sourceType, "unknown")
+                    + "; gameVersion=" + firstNonBlank(download.gameVersion, "blank"));
                 return;
             }
             try {
@@ -8366,7 +9528,11 @@ public final class AutoUpdater {
                 state.serverBuild = download.build;
                 state.write(config);
                 Log.info("Updated version lock -> " + lock.getFileName() + " (" + download.project + " " + download.gameVersion + ")");
+                pathDebug(target, "lock.server.update", "project=" + download.project
+                    + "; gameVersion=" + download.gameVersion
+                    + "; build=" + firstNonBlank(download.build, "unknown"));
             } catch (IOException ex) {
+                pathDebug(target, "lock.server.update.failed", ex.getMessage());
                 Log.warn("Could not write updater.lock.yml: " + ex.getMessage());
             }
         }
@@ -11929,15 +13095,21 @@ public final class AutoUpdater {
             }
 
             List<InstalledUpdate> pendingStartupUpdates = new ArrayList<>(startupUpdates);
+            updater.pathDebug(null, "startup.loop", "pending startup updates=" + pendingStartupUpdates.size());
             while (true) {
                 updater.quarantineAllDuplicatePluginJars();
                 Process process = startServer(serverJar);
                 StartupHealthMonitor startupHealth = new StartupHealthMonitor(pendingStartupUpdates);
+                updater.pathDebug(null, "startup.monitor", "health monitor enabled=" + startupHealth.enabled()
+                    + "; watchedUpdates=" + pendingStartupUpdates.size());
                 Thread outputThread = pipeOutput(process, startupHealth);
                 Thread inputThread = pipeInput(process);
 
                 StartupResult startupResult = monitorStartupHealth(process, startupHealth);
                 if (startupResult.rollbackAndRestart) {
+                    updater.pathDebug(null, "startup.rollback", "reason=" + startupResult.reason
+                        + "; rollbackUpdates=" + startupResult.rollbackUpdates.size()
+                        + "; failureMemoryUpdates=" + startupResult.failureMemoryUpdates.size());
                     outputThread.join(TimeUnit.SECONDS.toMillis(5));
                     inputThread.interrupt();
                     updater.rememberStartupFailures(startupResult.failureMemoryUpdates, startupResult.reason);
@@ -11950,22 +13122,28 @@ public final class AutoUpdater {
                     outputThread.join(TimeUnit.SECONDS.toMillis(5));
                     inputThread.interrupt();
                     Log.info("Server exited with code " + startupResult.exitCode + ".");
+                    updater.pathDebug(null, "startup.exit", "server exited with code " + startupResult.exitCode);
+                    updater.pathTraceEnd("run", "serverExited=" + startupResult.exitCode);
                     return startupResult.exitCode;
                 }
 
+                Thread deferredDiscoveryThread = startDeferredDiscoveryRetryWorker(process);
                 RunResult result = config.restart.enabled
                     ? monitorWithRestart(process)
                     : waitForExit(process);
 
+                stopDeferredDiscoveryRetryWorker(deferredDiscoveryThread);
                 outputThread.join(TimeUnit.SECONDS.toMillis(5));
                 inputThread.interrupt();
 
                 if (!result.scheduledRestart) {
                     Log.info("Server exited with code " + result.exitCode + ".");
+                    updater.pathTraceEnd("run", "serverExited=" + result.exitCode);
                     return result.exitCode;
                 }
 
                 Log.info("Scheduled restart completed. Updating before next start.");
+                updater.pathDebug(null, "restart.update", "scheduled restart complete; running updateAll before next start");
                 pendingStartupUpdates = updater.updateAll();
             }
         }
@@ -11982,6 +13160,7 @@ public final class AutoUpdater {
             builder.directory(serverJar.getParent() == null ? config.baseDir.toFile() : serverJar.getParent().toFile());
             builder.redirectErrorStream(true);
             Log.info("Starting server: " + String.join(" ", command));
+            updater.pathDebug(config.server, "startup.start-server", "command=" + String.join(" ", command));
             return builder.start();
         }
 
@@ -12024,14 +13203,84 @@ public final class AutoUpdater {
             return new RunResult(false, exitCode);
         }
 
+        private Thread startDeferredDiscoveryRetryWorker(Process process) {
+            Optional<Instant> next = updater.nextDeferredDiscoveryRetryAfter();
+            if (next.isEmpty()) {
+                updater.pathDebug(null, "startup.deferred-discovery.schedule", "no deferred source discovery retry is pending");
+                return null;
+            }
+            Thread thread = new Thread(() -> runDeferredDiscoveryRetryWorker(process), "auto-updater-deferred-discovery");
+            thread.setDaemon(true);
+            thread.start();
+            Log.info("Deferred source discovery will retry after startup at " + next.get() + ".");
+            updater.pathDebug(null, "startup.deferred-discovery.schedule", "firstRetry=" + next.get());
+            return thread;
+        }
+
+        private void runDeferredDiscoveryRetryWorker(Process process) {
+            while (process.isAlive() && !Thread.currentThread().isInterrupted()) {
+                Optional<Instant> next = updater.nextDeferredDiscoveryRetryAfter();
+                if (next.isEmpty()) {
+                    return;
+                }
+                if (!sleepUntilDeferredDiscoveryRetry(process, next.get())) {
+                    return;
+                }
+                if (!process.isAlive() || Thread.currentThread().isInterrupted()) {
+                    return;
+                }
+                try {
+                    updater.retryDeferredDiscoverySourcesAfterStartup();
+                } catch (Exception ex) {
+                    Log.warn("Deferred source discovery retry failed: " + safeExceptionMessage(ex));
+                    updater.pathDebug(null, "startup.deferred-discovery.failed", safeExceptionMessage(ex));
+                    return;
+                }
+            }
+        }
+
+        private boolean sleepUntilDeferredDiscoveryRetry(Process process, Instant retryAt) {
+            while (process.isAlive() && !Thread.currentThread().isInterrupted()) {
+                long millis = Duration.between(Instant.now(), retryAt).toMillis();
+                if (millis <= 0) {
+                    return true;
+                }
+                try {
+                    Thread.sleep(Math.min(millis, TimeUnit.MINUTES.toMillis(1)));
+                } catch (InterruptedException ex) {
+                    Thread.currentThread().interrupt();
+                    return false;
+                }
+            }
+            return false;
+        }
+
+        private void stopDeferredDiscoveryRetryWorker(Thread thread) {
+            if (thread == null) {
+                return;
+            }
+            thread.interrupt();
+            try {
+                thread.join(TimeUnit.SECONDS.toMillis(5));
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+            }
+        }
+
         private StartupResult monitorStartupHealth(Process process, StartupHealthMonitor startupHealth) throws Exception {
             if (!startupHealth.enabled()) {
+                updater.pathDebug(null, "startup.health.skip", "no updated jars to monitor");
                 return StartupResult.continueRunning();
             }
             Instant deadline = Instant.now().plusSeconds(120);
+            updater.pathDebug(null, "startup.health.window", "monitoring updated jars until " + deadline);
             while (process.isAlive() && Instant.now().isBefore(deadline)) {
                 if (startupHealth.hasFailures()) {
                     Log.warn("Detected plugin load failure after update; stopping server to roll back.");
+                    updater.pathDebug(null, "startup.health.failure", "matched plugin load failure while process alive; failedUpdates="
+                        + startupHealth.failedUpdates().stream()
+                            .map(update -> update.target.displayName())
+                            .collect(Collectors.joining(", ")));
                     stopProcess(process);
                     return StartupResult.rollback(
                         startupRollbackTargets(startupHealth, true),
@@ -12045,6 +13294,10 @@ public final class AutoUpdater {
                 int exitCode = process.exitValue();
                 if (startupHealth.hasFailures()) {
                     Log.warn("Detected plugin load failure during startup; rolling back recent updated jar(s).");
+                    updater.pathDebug(null, "startup.health.failure", "process exited with matched plugin load failure; exitCode=" + exitCode
+                        + "; failedUpdates=" + startupHealth.failedUpdates().stream()
+                            .map(update -> update.target.displayName())
+                            .collect(Collectors.joining(", ")));
                     return StartupResult.rollback(
                         startupRollbackTargets(startupHealth, true),
                         startupHealth.failedUpdates(),
@@ -12053,20 +13306,31 @@ public final class AutoUpdater {
                 }
                 if (exitCode != 0 && startupHealth.hasUpdatedJars()) {
                     Log.warn("Server exited during startup after updates; rolling back recent updated jar(s).");
+                    updater.pathDebug(null, "startup.health.exit-failed", "exitCode=" + exitCode
+                        + "; rolling back all updated jars=" + startupHealth.allUpdatedJars().size());
                     return StartupResult.rollback(startupHealth.allUpdatedJars(), startupHealth.allUpdatedJars(), "startup-exit-failed");
                 }
                 return StartupResult.exited(exitCode);
             }
             Log.info("Startup health window passed for updated jar(s).");
+            updater.pathDebug(null, "startup.health.pass", "no matched startup failures within health window");
             return StartupResult.continueRunning();
         }
 
         private List<InstalledUpdate> startupRollbackTargets(StartupHealthMonitor startupHealth, boolean matchedPluginFailure) {
             if (matchedPluginFailure && lower(config.restart.startupRollbackPolicy).equals("rollbackmatchedonly")) {
+                updater.pathDebug(null, "startup.rollback.policy", "rollbackMatchedOnly -> "
+                    + startupHealth.failedUpdates().stream()
+                        .map(update -> update.target.displayName())
+                        .collect(Collectors.joining(", ")));
                 return startupHealth.failedUpdates();
             }
             if (matchedPluginFailure) {
                 Log.warn("Startup rollback policy is rollbackBatch; rolling back every jar updated in this startup batch.");
+                updater.pathDebug(null, "startup.rollback.policy", "rollbackBatch -> "
+                    + startupHealth.allUpdatedJars().stream()
+                        .map(update -> update.target.displayName())
+                        .collect(Collectors.joining(", ")));
             }
             return startupHealth.allUpdatedJars();
         }
@@ -12077,15 +13341,20 @@ public final class AutoUpdater {
             }
             try {
                 sendCommand(process, config.restart.stopCommand);
+                updater.pathDebug(null, "startup.rollback.stop", "sent command=" + config.restart.stopCommand);
             } catch (IOException ex) {
+                updater.pathDebug(null, "startup.rollback.stop.failed", ex.getMessage());
                 Log.warn("Could not send stop command before rollback: " + ex.getMessage());
             }
             boolean stopped = process.waitFor(config.restart.gracefulStopSeconds, TimeUnit.SECONDS);
             if (!stopped) {
                 Log.warn("Server did not stop before rollback; terminating process.");
+                updater.pathDebug(null, "startup.rollback.kill", "process did not stop after "
+                    + config.restart.gracefulStopSeconds + " seconds");
                 process.destroy();
                 stopped = process.waitFor(15, TimeUnit.SECONDS);
                 if (!stopped) {
+                    updater.pathDebug(null, "startup.rollback.kill-forcibly", "process ignored normal destroy");
                     process.destroyForcibly();
                     process.waitFor();
                 }
@@ -12093,13 +13362,17 @@ public final class AutoUpdater {
         }
 
         private void rollbackUpdates(List<InstalledUpdate> updates) throws IOException {
+            updater.pathDebug(null, "startup.rollback.apply", "applying rollback for " + updates.size() + " update(s)");
             for (InstalledUpdate update : updates) {
                 if (update.hasBackup()) {
                     Files.copy(update.backupPath, update.targetPath, StandardCopyOption.REPLACE_EXISTING);
                     Log.warn("Rolled back " + update.target.displayName() + " -> " + update.targetPath.getFileName());
+                    updater.pathDebug(update.target, "startup.rollback.restore", "restored backup=" + update.backupPath
+                        + " -> " + update.targetPath);
                 } else {
                     Files.deleteIfExists(update.targetPath);
                     Log.warn("Removed failed new jar for " + update.target.displayName() + " because no previous jar existed.");
+                    updater.pathDebug(update.target, "startup.rollback.remove", "removed failed new jar=" + update.targetPath);
                 }
                 updater.restoreServerLockAfterRollback(update);
             }

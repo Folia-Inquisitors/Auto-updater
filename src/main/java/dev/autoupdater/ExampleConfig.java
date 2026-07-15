@@ -23,6 +23,14 @@ final class ExampleConfig {
               githubRepo: Folia-Inquisitors/Auto-updater
               installAs: auto
 
+            newPluginLinks: []
+            # Paste plugin links here, then run the updater. Consumed links are
+            # imported as manual plugin catalog entries and removed from this inbox.
+            # newPluginLinks:
+            #   - https://github.com/Folia-Inquisitors/ExamplePlugin
+            #   - https://modrinth.com/plugin/example/versions
+            #   - https://hangar.papermc.io/Owner/Example/versions
+
             discovery:
               enabled: true
               mode: suggest
@@ -32,6 +40,8 @@ final class ExampleConfig {
               autoSwitchSource: true
               saveDiscoveredSources: true
               scanInstalledPlugins: true
+              pruneMissingInstalledPlugins: true
+              retryDeferredAfterStartup: true
               # Optional search hints for Folia/custom fork ecosystems. The generic
               # updater defaults this list to empty; uncomment example owners if wanted.
               # preferredOwners:
@@ -191,6 +201,11 @@ final class ExampleConfig {
             #   missing sources, rewrite stale discovered sources, or refresh source
             #   proofs. The explicit discover command can still run discovery.
             #
+            # newPluginLinks
+            #   Paste URLs for manually found plugins here. The updater imports each
+            #   consumed link as a manual catalog source, updates matching existing
+            #   plugin entries, and leaves unknown URLs as UnknownPlugin entries.
+            #
             # discovery.mode
             #   suggest:
             #     Report suggestions without rewriting your config.
@@ -202,6 +217,11 @@ final class ExampleConfig {
             #   Supported source families: github-release, hangar, modrinth.
             #   Spigot/Spiget is intentionally unsupported because its metadata is too
             #   weak for reliable authorship, jar identity, and Folia compatibility checks.
+            #
+            # discovery.retryDeferredAfterStartup
+            #   In run mode, retry due deferred source discovery after the server has
+            #   started. This is source-only: it may save newly found URLs, but it does
+            #   not install jars or restart the live server.
             #
             # discovery.preferredOwners
             #   Optional GitHub owners to probe before broad GitHub search when a Folia

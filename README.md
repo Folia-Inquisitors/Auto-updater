@@ -41,7 +41,12 @@ plugins/
 - `server.pinBuild` is optional. Leave it blank for normal PaperMC behavior: `updater.lock.yml` remembers the last installed build for rollback, but newer builds within the locked `gameVersion` can still install. Set `pinBuild` only when you intentionally want one exact Paper/Folia/Velocity build.
 - `type: github-source` on a plugin primary source means "build this Git repo first." Hosted fallback sources are only tried after that primary Git build fails or is skipped.
 - `sourceOrigin` records ownership of plugin sources: `manual` means user-owned, `discovered` means machine-selected with an active matching source proof, `discovered-unverified` means machine-selected without descriptor proof, and `unresolved` means discovery has not found a reliable source yet.
+- `newPluginLinks` is a paste-here inbox for plugin URLs you find manually. On the next update/discovery run, each link becomes a manual plugin catalog entry, matching entries are updated instead of duplicated, unknown links become `UnknownPlugin` entries, and consumed links are removed from the inbox.
+- `discovery.pruneMissingInstalledPlugins: true` removes auto-managed plugin entries from `updater.yml` when their `installAs` jar no longer exists under `plugins/`. Manual sources are never pruned by this cleanup. Set it to `false` if you want deleted plugin entries to stay listed.
+- `discovery.retryDeferredAfterStartup: true` lets `run` mode retry source-only discovery after the server has started when earlier discovery was deferred by GitHub rate limits or source backoff. This can save newly found URLs to `updater.yml`, but it does not install jars or restart the live server.
 - `discovery.preferredOwners` defaults to empty. Add GitHub owners such as `Folia-Inquisitors` or `Inquisitors-transfers` when you intentionally use a Folia/custom fork ecosystem. Preferred owners are search hints only: they are probed before broad GitHub search for missing or weak sources, but they do not override manual sources or bypass descriptor validation, Folia proof, or downgrade protection.
+- `discovery.pathfindingDebug: true` writes a linear decision trace to `architecture-pathfinding.debug`. Use `pathfindingDebugPlugin: ChatFilter` to trace one plugin while debugging config normalization, lock-file memory, discovery skips, provider search order, archived GitHub decisions, fallback ordering, startup rollback, candidate scoring, update choices, and validation.
+- Pathfinding traces include a run id, `PATHFINDING TRACE START/END` markers, per-target headers, and `[PHASE ...]` markers so repeated updater runs are easier to scan.
 - Boolean config values are strict. Use `true/false`, `yes/no`, `on/off`, or `1/0`; typos stop parsing instead of silently disabling safety settings.
 - On Folia, auto-discovered plugin updates must prove Folia support with `folia-supported: true`. Manual sources may still install generic Paper/Bukkit jars, but the updater warns.
 
@@ -52,6 +57,13 @@ mode: hosted-safe
 onFailure: keep-current
 userAgent: "Auto-Updater/0.3.0 (contact: your-email@example.com)"
 
+newPluginLinks: []
+# Paste plugin links here, then run the updater. Examples:
+# newPluginLinks:
+#   - https://github.com/Folia-Inquisitors/ExamplePlugin
+#   - https://modrinth.com/plugin/example/versions
+#   - https://hangar.papermc.io/Owner/Example/versions
+
 discovery:
   enabled: true
   mode: suggest
@@ -61,6 +73,11 @@ discovery:
   autoSwitchSource: true
   saveDiscoveredSources: true
   scanInstalledPlugins: true
+  pruneMissingInstalledPlugins: true
+  retryDeferredAfterStartup: true
+  pathfindingDebug: false
+  pathfindingDebugPlugin: ""
+  pathfindingDebugFile: architecture-pathfinding.debug
   # preferredOwners:
   #   - Folia-Inquisitors
   #   - Inquisitors-transfers
